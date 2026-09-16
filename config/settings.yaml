@@ -1,0 +1,332 @@
+# =============================================================================
+# A股盘中实盘雷达 — 主配置
+# 字段名冻结（见 docs/DATA_CONTRACT.md 第 8 节），模块一律通过 arad.config 读取
+# =============================================================================
+
+app:
+  name: "A股盘中雷达"
+  timezone: "Asia/Shanghai"
+  log_level: "INFO"          # DEBUG / INFO / WARNING / ERROR
+  data_dir: "data"           # 相对项目根
+  # dry_run: true 时所有通知器只打印不真发（首次运行务必 true 观察）
+  dry_run: true
+  # replay: 用历史/合成数据跑，不需要开盘（用于任何时间点自测）
+  replay: false
+
+poll:
+  # 全市场快照间隔（秒）。腾讯实测全市场 8 请求约 2.1s，5s 很安全
+  universe_seconds: 5
+  # 自选股快照间隔（秒），更高频
+  watchlist_seconds: 3
+  # 股票池（代码列表）刷新间隔（秒），默认 30 分钟
+  universe_refresh_seconds: 1800
+  # 指数行情（供 rules/spirit_index.py 的"拉升指数/打压指数"使用）
+  # ⚠ 指数代码**必须带交易所前缀**：000001 既是上证指数(sh000001)也是
+  #   平安银行(sz000001)，只写 6 位数字会被当成个股拉成平安银行。
+  # 留空 = 不抓指数（spirit_index 即使 enabled 也拿不到数据）。
+  index_codes: ["sh000001", "sz399001", "sz399006", "sh000300", "sh000688"]
+  # 每只股票保留的历史点数（5s 一轮 -> 360 点约 30 分钟）
+  history_len: 360
+  # 单批代码数（腾讯硬上限 800，保守 600）
+  batch_size: 600
+  # 每批并发数
+  workers: 4
+  http_timeout: 10
+  retries: 3
+  # 非交易时段自动休眠
+  idle_when_closed: true
+
+session:
+  # 提前多久预热（秒）：开盘前预取股票池
+  warmup_seconds: 60
+  # 连续竞价外的时段是否仍记录快照（集合竞价观察用）
+  record_auction: true
+  # 节假日表文件（每年需更新）
+  holidays_file: "config/holidays.txt"
+
+sources:
+  primary: "tencent"         # tencent | eastmoney | sina
+  # 股票池来源。可以给**列表**：按顺序尝试，前一个拿不到就换下一个。
+  # 默认东财优先（一次请求 100 只、字段最全），失败自动退到新浪行情中心
+  # （实测能列全 5563 只，但慢一些、字段少）。东财对部分网络/IP 会
+  # RemoteDisconnected 限流，只写 "eastmoney" 会退化成只盯自选股那 10 只。
+  universe: ["eastmoney", "sina"]
+  fallback: ["sina"]         # 行情主通道连续失败时切换
+  tencent:
+    bulk_chunk: 600
+    timeout: 10
+    referer: "https://gu.qq.com/"
+  eastmoney:
+    page_size: 100
+    max_pages: 80
+    workers: 8
+    timeout: 15
+  sina:
+    bulk_chunk: 600
+    timeout: 10
+    referer: "https://finance.sina.com.cn"
+    # 股票池分页上限（100/页）。全 A 约 5563 只 -> 56 页，80 页留余量。
+    universe_max_pages: 80
+  # 数据源健康检查：连续失败次数达到阈值即切换
+  failover_threshold: 3
+
+filters:
+  # 全市场扫描时的粗筛（先过滤再进规则，降低开销）
+  min_price: 1.5             # 剔除低价/仙股
+  max_price: 2000.0
+  min_amount: 8000000        # 当日成交额（元），低于此不进规则
+  exclude_st: false          # 是否剔除 ST
+  exclude_boards: ["index"]  # 不参与告警的板块
+  exclude_codes: []          # 手工黑名单
+  # 上市天数少于该值的新股不告警（避免无涨跌幅限制的新股噪声）
+  min_list_days: 11
+
+rules:
+  # ---------------------------------------------------------------------------
+  # 急拉 / 急跌（核心）
+  # ---------------------------------------------------------------------------
+  tick_surge:
+    enabled: true
+    # 多窗口：任一窗口内涨幅达标即触发。pct 为正=急拉，负=急跌
+    windows:
+      - {seconds: 60,  pct: 2.0}
+      - {seconds: 180, pct: 3.0}
+      - {seconds: 300, pct: 4.0}
+    plunge_windows:
+      - {seconds: 60,  pct: -2.0}
+      - {seconds: 180, pct: -3.0}
+      - {seconds: 300, pct: -4.0}
+    # 急拉要求站上分时均价（过滤诱多），急跌要求跌破均价
+    require_above_vwap: true
+    require_below_vwap: true
+    # 窗口量能 / 前一等长窗口量能 的倍数门槛（0 = 不校验）
+    volume_confirm_ratio: 1.2
+    # 加速度：后半个窗口的涨幅 至少是 前半个窗口涨幅 的多少倍（急拉用）
+    accel_ratio: 1.0
+    # 单只股票触发后冷却（秒）
+    cooldown_seconds: 300
+    # 每轮最多推多少条（按幅度排序取前 N，防刷屏）
+    max_per_round: 15
+    # 只在连续竞价时段告警
+    only_continuous: true
+    severity: 2
+    # 强势加急：同窗口涨幅达到 pct*urgent_multiple 时 severity=3
+    urgent_multiple: 2.0
+
+  # ---------------------------------------------------------------------------
+  # 涨停 / 跌停 触板、封板、炸板
+  # ---------------------------------------------------------------------------
+  limit_board:
+    enabled: true
+    detect_touch: true         # 触及涨停
+    detect_seal: true          # 封住涨停（现价==涨停价）
+    detect_break: true         # 炸板（曾涨停后打开）
+    detect_limit_down: true
+    # 判定"触及"的价格容差（元）
+    touch_tolerance: 0.001
+    # 封单额门槛（万元），低于此不算有效封板
+    min_seal_amount_wan: 200
+    cooldown_seconds: 300
+    # 单轮最多推送条数（按 severity、|pct| 降序截断；0=不限量）
+    max_per_round: 20
+    only_continuous: true
+    severity: 2
+
+  # ---------------------------------------------------------------------------
+  # 放量异动
+  # ---------------------------------------------------------------------------
+  volume_burst:
+    enabled: true
+    # 量比门槛
+    volume_ratio_threshold: 3.0
+    # 近 N 秒成交量 / 当日已交易每分钟均量 的倍数门槛
+    speed_multiple: 4.0
+    speed_window_seconds: 60
+    # 换手率下限（%），小盘股放量才有意义
+    min_turnover: 0.5
+    # 当日成交额下限（元）
+    min_amount: 30000000
+    # 同时要求价格有波动才报（避免横盘对倒）
+    min_abs_pct: 0.5
+    # 单轮最多推送条数
+    max_per_round: 20
+    cooldown_seconds: 600
+    only_continuous: true
+    severity: 1
+
+  # ---------------------------------------------------------------------------
+  # 其他异动形态
+  # ---------------------------------------------------------------------------
+  unusual:
+    enabled: true
+    # 高开低走：开盘涨幅 >= 阈值 且 现价较开盘回落 >= 阈值
+    high_open_pct: 3.0
+    high_open_fade_pct: 3.0
+    # 低开高走
+    low_open_pct: -3.0
+    low_open_rise_pct: 3.0
+    # 巨震：振幅 >= 阈值 且 成交额达标
+    wide_amplitude_pct: 9.0
+    wide_amplitude_min_amount: 100000000
+    # 快速回封：炸板后 X 秒内重新封板（配合 limit_board 状态）
+    reseal_seconds: 600
+    # 尾盘异动：收盘前 X 分钟内的急拉急跌，阈值降低
+    late_session_minutes: 30
+    late_session_pct: 1.5
+    cooldown_seconds: 900
+    only_continuous: true
+    severity: 1
+
+  # ---------------------------------------------------------------------------
+  # 短线精灵 · 盘口/委托类信号（rules/spirit_order.py）
+  # 8 个信号：大笔买入/大笔卖出/机构买单/机构卖单/机构吃货/机构吐货/
+  #           有大买盘/有大卖盘
+  # ⚠ 默认关闭：成交类信号靠"相邻两轮快照增量"近似单笔成交，噪声高于既有规则，
+  #   建议先在真实行情里观察命中质量再打开。
+  # 注意：这里必须显式写 enabled: false。引擎的 config.rule_cfg() 会
+  # setdefault("enabled", True) 并把结果经 ctx.cfg 下发，规则自身 DEFAULTS
+  # 里的 false 拦不住它 —— 缺了这一节，模块会被默认启用。
+  # ---------------------------------------------------------------------------
+  spirit_order:
+    enabled: false
+    # --- 大笔买入 / 大笔卖出：外盘(内盘)增量占流通盘比例门槛（%）---
+    big_turnover_pct: 0.1
+    # --- 机构吃货 / 机构吐货（主动成交，「或」关系）---
+    institution_eat_shares: 500000       # 50 万股
+    institution_eat_amount: 1000000      # 100 万元
+    institution_eat_float_pct: 0.1       # 流通盘 0.1%
+    # --- 机构买单 / 机构卖单（单档挂单，「或」关系）---
+    institution_order_shares: 500000
+    institution_order_amount: 1000000
+    institution_order_float_pct: 0.25
+    # --- 有大买盘 / 有大卖盘（五档合计，「或」关系）---
+    wall_shares: 800000                  # 80 万股
+    wall_float_pct: 0.8
+    # --- 快照增量近似单笔的控制 ---
+    # 相邻两轮快照最大间隔（秒），超过则跳过（跨午休/断线会把整段量误判成一笔）
+    max_gap_seconds: 120
+    # 区间主动成交额归因的最小总增量（手），防除零/噪声
+    min_delta_lots: 0
+    # 分组开关：成交类 / 盘口类
+    detect_trade: true
+    detect_order: true
+    cooldown_seconds: 300
+    only_continuous: true
+    severity: 2
+    max_per_round: 20
+
+  # ---------------------------------------------------------------------------
+  # 短线精灵 · 价格形态类信号（rules/spirit_price.py）
+  # 4 个信号：火箭发射/快速反弹/高台跳水/加速下跌
+  # ⚠ 默认关闭（enabled: false）：tick_surge 已经覆盖"涨得快/跌得急"，
+  #   两个都开会把同一波行情报两遍。想用精灵口径的形态识别（先跌后拉、
+  #   先涨后跌）再打开，并考虑把 tick_surge.enabled 关掉。
+  # ---------------------------------------------------------------------------
+  spirit_price:
+    enabled: false
+    # 扫描窗口（秒）；任一窗口命中即触发
+    windows: [60, 180]
+    # --- 火箭发射：快速上涨且创出当日新高 ---
+    rocket_pct: 2.0                # 窗口涨幅门槛（%）
+    rocket_near_high_pct: 0.3      # 距当日最高价多少以内算"在新高上"
+    rocket_min_high_pct: 0.0       # 当日最高须高于昨收这么多（防下跌股小反弹）
+    # --- 快速反弹：由下跌状态转为快速上涨 ---
+    rebound_pct: 2.0               # 自窗口低点拉起的幅度门槛（%）
+    rebound_prior_drop_pct: 1.0    # 窗口内须先跌这么多（%）才承认"原来在跌"
+    rebound_off_low_pct: 2.0       # 旧配置名，等价于 rebound_pct（保留兼容）
+    # --- 高台跳水：由上涨状态转为快速下跌 ---
+    dive_prior_rise_pct: 2.0       # 窗口内峰值须较起点涨这么多（%）
+    dive_off_high_pct: 2.0         # 自峰值须回落这么多（%）
+    # --- 加速下跌：延续原下跌状态并且加速 ---
+    accel_down_pct: -2.0
+    accel_ratio: 1.5               # 后半段跌幅须达前半段的倍数
+    accel_min_range_ratio: 0.4     # 总跌幅须超当日振幅的比例（防横盘噪声）
+    cooldown_seconds: 300
+    only_continuous: true
+    severity: 2
+    max_per_round: 15
+    # 幅度达门槛这个倍数时 severity 提到 3（弹窗只看 3，所以这条决定"会不会响"）
+    urgent_multiple: 2.0
+
+  # ---------------------------------------------------------------------------
+  # 短线精灵 · 指数类信号（rules/spirit_index.py）
+  # 2 个信号：拉升指数/打压指数
+  # ⚠ 默认关闭（enabled: false）：需要 poll.index_codes 指数行情管道，
+  #   且大盘指数波动极小、极易刷屏。
+  # 官方口径是"5 分钟内涨跌 > 0.5 点"。但 0.5 点对上证（约 3900 点）只有
+  # 0.013%，几乎每轮都命中；所以这里同时提供 bp（万分之一）口径，两者取「或」。
+  # ---------------------------------------------------------------------------
+  spirit_index:
+    enabled: false
+    windows: [300]                 # 官方口径 5 分钟
+    min_points: 0.5                # 绝对点数口径
+    min_bp: 1.2                    # 相对幅度口径（bp）；0 = 禁用
+    min_index_level: 100.0         # 点位低于此值只按 bp 判定
+    require_direction_match: true  # 与当日涨跌方向一致才算
+    # 只监控这些指数（带交易所前缀）；留空则监控所有识别出的指数
+    codes: ["sh000001", "sz399001", "sz399006", "sh000300", "sh000688"]
+    cooldown_seconds: 300
+    only_continuous: true
+    severity: 1
+    urgent_multiple: 3.0
+    max_per_round: 10
+
+notify:
+  # 启用的通知器（可多选，按顺序调用）
+  enabled: ["console", "file"]
+  console:
+    color: true
+    show_detail: false
+    # 只推 severity >= 该值的
+    min_severity: 1
+    # 同一轮多条时的聚合方式：each=逐条  digest=合并成一条
+    mode: "each"
+    digest_max: 10
+  file:
+    path: "data/alerts.jsonl"
+    min_severity: 1
+  webhook:
+    enabled: false
+    url: ""
+    timeout: 5
+    min_severity: 2
+  serverchan:
+    enabled: false
+    sendkey: ""
+    timeout: 5
+    min_severity: 2
+  dingtalk:
+    enabled: false
+    webhook: ""
+    secret: ""
+    timeout: 5
+    min_severity: 2
+  feishu:
+    enabled: false
+    webhook: ""
+    timeout: 5
+    min_severity: 2
+  windows_toast:
+    enabled: false
+    min_severity: 3
+
+storage:
+  # 告警落盘（JSONL，追加写）
+  alerts_path: "data/alerts.jsonl"
+  # 快照落盘（可选，用于事后复盘；每 N 轮写一次，0=不写）
+  snapshot_every: 0
+  snapshot_path: "data/snapshots.jsonl"
+  # 榜单历史（用于前端画分时速度曲线）
+  series_len: 240
+
+web:
+  enabled: true
+  host: "127.0.0.1"
+  port: 8899
+  # SSE 推送间隔（秒）
+  sse_interval: 2
+  # 榜单条数
+  top_n: 30
+  # 前端最多保留多少条告警
+  max_alerts: 300
+  title: "A股盘中雷达 · 急拉急跌预警"

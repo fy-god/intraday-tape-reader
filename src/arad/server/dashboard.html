@@ -1,0 +1,1093 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=1280">
+<meta name="color-scheme" content="dark">
+<title>A股盘中雷达 · 急拉急跌预警</title>
+<style>
+:root{
+  --bg:#0b0e13; --bg2:#11151d; --bg3:#161b25; --line:#232a37; --line2:#2d3648;
+  --fg:#dfe6f2; --fg2:#8b98ae; --fg3:#5d6a80;
+  --up:#ff4d4f; --down:#12c46a; --flat:#8b98ae;
+  --k-surge:#ff4d4f; --k-plunge:#12c46a; --k-limitup:#ffcc33;
+  --k-limitdown:#22d3ee; --k-vol:#a855f7; --k-unusual:#8593a8;
+  --accent:#3b82f6; --warn:#f59e0b; --ok:#12c46a;
+  --mono:"Consolas","DejaVu Sans Mono","Noto Sans Mono CJK SC",monospace;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg);color:var(--fg);
+  font:13px/1.45 "Microsoft YaHei","PingFang SC","Noto Sans CJK SC",system-ui,sans-serif;
+  overflow:hidden;
+}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums;font-feature-settings:"tnum" 1}
+.up{color:var(--up)} .down{color:var(--down)} .flat{color:var(--flat)}
+.dim{color:var(--fg2)} .dim2{color:var(--fg3)}
+#app{display:flex;flex-direction:column;height:100vh}
+
+/* ---------------- 顶部状态条 ---------------- */
+.topbar{
+  display:flex;align-items:center;gap:14px;padding:7px 14px;
+  background:linear-gradient(180deg,#141924,#10141d);
+  border-bottom:1px solid var(--line);flex:0 0 auto;flex-wrap:nowrap;overflow:hidden;
+}
+.brand{font-size:15px;font-weight:700;letter-spacing:.5px;white-space:nowrap;color:#eaf1ff}
+.brand .sub{font-size:11px;font-weight:400;color:var(--fg3);margin-left:6px;letter-spacing:0}
+.chips{display:flex;align-items:center;gap:7px;flex:1 1 auto;overflow:hidden;flex-wrap:nowrap}
+.chip{
+  display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap;
+  background:var(--bg3);border:1px solid var(--line);border-radius:4px;padding:2px 7px;font-size:11.5px;
+}
+.chip b{font-family:var(--mono);font-size:12px;font-weight:600;color:#eaf1ff}
+.chip .lab{color:var(--fg3);font-size:10.5px}
+.srcs{display:inline-flex;gap:5px;align-items:center}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--fg3);box-shadow:0 0 6px rgba(0,0,0,.6)}
+.dot.ok{background:var(--ok);box-shadow:0 0 7px rgba(18,196,106,.75)}
+.dot.bad{background:var(--up);box-shadow:0 0 7px rgba(255,77,79,.75)}
+.dot.warn{background:var(--warn);box-shadow:0 0 7px rgba(245,158,11,.7)}
+.actions{display:flex;align-items:center;gap:8px;flex:0 0 auto}
+.btn{
+  background:var(--bg3);color:var(--fg);border:1px solid var(--line2);border-radius:4px;
+  padding:3px 9px;font-size:11.5px;cursor:pointer;font-family:inherit;white-space:nowrap;
+}
+.btn:hover{border-color:#43506b;background:#1c2330}
+.btn.on{background:#1d3a63;border-color:var(--accent);color:#cfe3ff}
+.btn.warn-on{background:#4a2d06;border-color:var(--warn);color:#ffd79a}
+.pill{border-radius:10px;padding:2px 9px;font-size:11px;border:1px solid transparent;white-space:nowrap}
+.pill.live{background:rgba(18,196,106,.14);color:#4ade80;border-color:rgba(18,196,106,.45)}
+.pill.dead{background:rgba(255,77,79,.14);color:#ff8082;border-color:rgba(255,77,79,.45)}
+.pill.idle{background:rgba(139,152,174,.14);color:#a9b4c7;border-color:rgba(139,152,174,.4)}
+
+/* ---------------- 三栏 ---------------- */
+/* 左栏内部再竖着叠两块（短线精灵 / 实时告警流），刻意**不加第四列**：
+   现有三列的 min-width 合计已 1098px，再加一列 minmax(268px,…) 需要 1369px，
+   在文件头部写死的 1280px 设计宽度下会横向溢出把看板挤坏。 */
+.grid{
+  flex:1 1 auto;display:grid;gap:1px;background:var(--line);min-height:0;
+  grid-template-columns:minmax(420px,30fr) minmax(520px,44fr) minmax(268px,26fr);
+}
+.col{
+  display:flex;flex-direction:column;gap:1px;background:var(--line);
+  min-height:0;min-width:0;
+}
+.col>.panel{min-height:0}
+.panel{background:var(--bg);display:flex;flex-direction:column;min-height:0;min-width:0}
+.phead{
+  display:flex;align-items:center;gap:8px;padding:5px 10px;background:var(--bg2);
+  border-bottom:1px solid var(--line);flex:0 0 auto;min-height:31px;
+}
+.ptitle{font-size:12.5px;font-weight:700;color:#cfd9ea;letter-spacing:.4px;white-space:nowrap}
+.ptitle::before{content:"";display:inline-block;width:3px;height:11px;background:var(--accent);
+  margin-right:6px;vertical-align:-1px;border-radius:1px}
+.pmeta{margin-left:auto;font-size:11px;color:var(--fg3);white-space:nowrap}
+.pbody{overflow:auto;flex:1 1 auto;min-height:0}
+
+/* ---------------- 告警流 ---------------- */
+.filters{display:flex;gap:4px;flex-wrap:wrap}
+.fbtn{
+  background:transparent;border:1px solid var(--line2);color:var(--fg2);border-radius:3px;
+  font-size:11px;padding:1px 7px;cursor:pointer;font-family:inherit;
+}
+.fbtn.on{color:#fff;border-color:#5b6b8c;background:#222b3b}
+.fbtn.on[data-kind=surge]{border-color:var(--k-surge);color:#ffb3b4}
+.fbtn.on[data-kind=plunge]{border-color:var(--k-plunge);color:#8ef0bd}
+.fbtn.on[data-kind=limit_up]{border-color:var(--k-limitup);color:#ffe28a}
+.fbtn.on[data-kind=limit_down]{border-color:var(--k-limitdown);color:#a5f0fb}
+.fbtn.on[data-kind=volume_burst]{border-color:var(--k-vol);color:#dcb4ff}
+.fbtn.on[data-kind=unusual]{border-color:var(--k-unusual);color:#c8d2e2}
+#alertList{display:flex;flex-direction:column}
+.al{
+  display:grid;grid-template-columns:52px 46px 1fr auto;gap:6px;align-items:baseline;
+  padding:5px 10px;border-bottom:1px solid #1a202b;font-size:12px;
+}
+.al:hover{background:#141a25}
+.al .tm{font-family:var(--mono);font-size:10.5px;color:var(--fg3)}
+.al .nm{color:#eaf1ff;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.al .cd{font-family:var(--mono);font-size:11px;color:var(--fg2);margin-left:4px;font-weight:400}
+.al .ttl{grid-column:3/5;color:var(--fg2);font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.al .px{font-family:var(--mono);font-size:12px;text-align:right;white-space:nowrap}
+.al .ack{
+  background:transparent;border:1px solid var(--line2);color:var(--fg3);border-radius:3px;
+  font-size:10px;padding:0 5px;cursor:pointer;font-family:inherit;margin-left:4px;
+}
+.al .ack:hover{color:#cfe3ff;border-color:#43506b}
+.al.acked{opacity:.45}
+.al.acked .ack{display:none}
+.al.sev3{border-left:2px solid var(--up);padding-left:8px}
+.al.sev1{border-left:2px solid #2b3446;padding-left:8px}
+@keyframes flashIn{
+  0%{background:rgba(255,204,51,.34);transform:translateY(-4px);opacity:.2}
+  45%{background:rgba(255,204,51,.16)}
+  100%{background:transparent;transform:none;opacity:1}
+}
+.al.flash{animation:flashIn .95s ease-out}
+.al.newest{border-bottom-color:#3a4560}
+.bd{
+  display:inline-block;min-width:34px;text-align:center;border-radius:3px;font-size:10.5px;
+  padding:1px 4px;font-weight:700;color:#0b0e13;line-height:1.35;
+}
+.bd.surge{background:var(--k-surge)} .bd.plunge{background:var(--k-plunge)}
+.bd.limit_up{background:var(--k-limitup)} .bd.limit_down{background:var(--k-limitdown)}
+.bd.volume_burst{background:var(--k-vol)} .bd.unusual{background:var(--k-unusual)}
+.empty{padding:14px 12px;color:var(--fg3);font-size:12px;text-align:center}
+.paused .pbody{opacity:.72}
+
+/* ---------------- 表格 ---------------- */
+table{width:100%;border-collapse:collapse;font-size:12px}
+thead th{
+  position:sticky;top:0;z-index:2;background:#151a24;color:var(--fg2);font-weight:600;
+  font-size:11px;text-align:right;padding:5px 7px;border-bottom:1px solid var(--line2);
+  white-space:nowrap;cursor:pointer;user-select:none;
+}
+thead th:first-child,thead th:nth-child(2){text-align:left}
+thead th.on{color:#cfe3ff;background:#1b2331}
+tbody td{padding:3px 7px;text-align:right;border-bottom:1px solid #171d27;white-space:nowrap}
+tbody td:first-child{text-align:left;font-family:var(--mono);color:var(--fg2)}
+tbody td:nth-child(2){text-align:left;max-width:110px;overflow:hidden;text-overflow:ellipsis}
+tbody tr.row{cursor:pointer}
+tbody tr.row:hover{background:#151c28}
+tbody tr.row.sel{background:#17243a}
+tr.chartRow td{padding:0;background:#0d1119;border-bottom:1px solid var(--line2)}
+.chartWrap{display:flex;gap:8px;padding:7px 10px;align-items:stretch}
+.chartWrap canvas{background:#0a0d13;border:1px solid var(--line);border-radius:3px;flex:1 1 auto}
+.chartInfo{width:148px;flex:0 0 auto;font-size:11px;color:var(--fg2);display:flex;flex-direction:column;gap:3px}
+.chartInfo .k{color:var(--fg3)}
+.chartInfo b{font-family:var(--mono);color:#eaf1ff;font-weight:600}
+.bar{height:4px;background:#1c2431;border-radius:2px;overflow:hidden;margin-top:2px}
+.bar i{display:block;height:100%;background:var(--accent)}
+.wl tr.wlrow td{font-size:11.5px}
+.tag{font-size:10px;padding:0 4px;border-radius:2px;border:1px solid var(--line2);color:var(--fg3)}
+
+/* ---------------- 短线精灵（滚动播报） ---------------- */
+.sp{
+  display:grid;grid-template-columns:50px 54px minmax(0,1fr) 54px 54px;gap:6px;
+  align-items:baseline;padding:2px 9px;border-bottom:1px solid #161c26;
+  font-size:11.5px;line-height:1.5;white-space:nowrap;
+}
+.sp>*{overflow:hidden;text-overflow:ellipsis}
+.sp .tm{font-family:var(--mono);font-size:10.5px;color:var(--fg3)}
+.sp .cd{font-family:var(--mono);font-size:10.5px;color:var(--fg2)}
+.sp .nm{color:#eaf1ff;font-weight:600}
+.sp .sg{font-weight:700}
+.sp .px{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.sp .pc{text-align:right;font-family:var(--mono);font-weight:600;font-variant-numeric:tabular-nums}
+/* 方向底色：红涨绿跌（--up/--down 与全站一致，不另造色板） */
+.sp.up{background:rgba(255,77,79,.06);border-left:2px solid rgba(255,77,79,.5)}
+.sp.down{background:rgba(18,196,106,.06);border-left:2px solid rgba(18,196,106,.5)}
+.sp.flat{background:transparent;border-left:2px solid #2b3446}
+/* severity 越高底色越重：封涨停/跌停这类必须一眼跳出来 */
+.sp.sev3{background:rgba(255,204,51,.15);box-shadow:inset 0 0 0 1px rgba(255,204,51,.28)}
+.sp.sev3.down{background:rgba(18,196,106,.20);box-shadow:inset 0 0 0 1px rgba(18,196,106,.34)}
+.sp.sev3.up{background:rgba(255,77,79,.20);box-shadow:inset 0 0 0 1px rgba(255,77,79,.34)}
+.sp.sev1{opacity:.72}
+.sp:hover{background:#1a2130}
+@keyframes spIn{
+  0%{background:rgba(255,204,51,.45);transform:translateY(-5px);opacity:.15}
+  100%{transform:none;opacity:1}
+}
+.sp.flash{animation:spIn .8s ease-out}
+#spiritBody{overflow:auto;flex:1 1 auto;min-height:0}
+#spiritList{display:flex;flex-direction:column}
+/* 左栏两块的分高：精灵固定高度（≈12 行），告警流吃掉剩下的空间。
+   注意 #alertsPanel 的 flex-basis 必须是 0（`flex:1 1 0`）而不是 auto：
+   basis:auto 会拿"53 张告警卡的总高"当基准，总高远超容器 -> 两块一起被压缩，
+   精灵被挤到 min-height，只剩三行可见。basis:0 时基准和 = 306 < 容器，无溢出，
+   精灵稳稳拿到 306px，剩余空间全给告警流。 */
+#spiritPanel{flex:0 0 306px;min-height:118px}
+#alertsPanel{flex:1 1 0;min-height:118px}
+.spfilters{display:flex;gap:4px;flex-wrap:wrap}
+.sfbtn{
+  background:transparent;border:1px solid var(--line2);color:var(--fg2);border-radius:3px;
+  font-size:11px;padding:1px 6px;cursor:pointer;font-family:inherit;
+}
+.sfbtn.on{color:#fff;border-color:#5b6b8c;background:#222b3b}
+
+/* ---------------- 滚动条 ---------------- */
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-track{background:#0d1117}
+::-webkit-scrollbar-thumb{background:#28313f;border-radius:4px;border:2px solid #0d1117}
+::-webkit-scrollbar-thumb:hover{background:#374357}
+#toast{
+  position:fixed;right:14px;bottom:12px;background:#1b2331;border:1px solid var(--line2);
+  color:var(--fg);border-radius:4px;padding:6px 11px;font-size:12px;opacity:0;
+  transition:opacity .2s;pointer-events:none;z-index:50;
+}
+#toast.show{opacity:.97}
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ================= 顶部状态条 ================= -->
+  <div class="topbar">
+    <div class="brand">A股盘中雷达<span class="sub" id="subTitle">盘中急拉急跌预警</span></div>
+    <div class="chips">
+      <span class="chip"><span class="lab">状态</span><b id="stPhase">--</b></span>
+      <span class="chip"><span class="lab">时段</span><b id="stSession">--</b></span>
+      <span class="chip"><span class="lab">股票池</span><b id="stUniverse" class="num">0</b></span>
+      <span class="chip"><span class="lab">告警</span><b id="stAlerts" class="num">0</b></span>
+      <span class="chip"><span class="lab">轮询</span><b id="stPolls" class="num">0</b></span>
+      <span class="chip"><span class="lab">耗时</span><b id="stPollMs" class="num">0</b><span class="lab">ms</span></span>
+      <span class="chip"><span class="lab">运行</span><b id="stUptime" class="num">0s</b></span>
+      <span class="chip"><span class="lab">数据源</span><span class="srcs" id="stSources"><span class="dot"></span><span class="dim">无</span></span></span>
+      <span class="chip"><span class="lab">更新</span><b id="stUpdated" class="num">--:--:--</b></span>
+      <span class="pill idle" id="connPill">连接中…</span>
+    </div>
+    <div class="actions">
+      <span class="chip"><span class="lab">自选</span><b id="stWatch" class="num">0</b></span>
+      <button class="btn" id="btnSound" title="severity=3 的紧急告警会额外提示音">声音提醒：关</button>
+      <button class="btn" id="btnPause">暂停滚动</button>
+    </div>
+  </div>
+
+  <!-- ================= 三栏 ================= -->
+  <div class="grid">
+
+    <!-- 左：短线精灵 + 实时告警流（竖着叠，见 .col 注释） -->
+    <div class="col" id="leftCol">
+      <section class="panel" id="spiritPanel">
+        <div class="phead">
+          <span class="ptitle">短线精灵</span>
+          <div class="spfilters" id="spFilters">
+            <button class="sfbtn on" data-group="all">全部</button>
+          </div>
+          <span class="pmeta" id="spiritMeta">0 条</span>
+        </div>
+        <div class="pbody" id="spiritBody">
+          <div id="spiritList"><div class="empty">等待信号…（休市时无推送）</div></div>
+        </div>
+      </section>
+
+      <section class="panel" id="alertsPanel">
+        <div class="phead">
+          <span class="ptitle">实时告警流</span>
+          <div class="filters" id="filters">
+            <button class="fbtn on" data-kind="all">全部</button>
+            <button class="fbtn" data-kind="surge">急拉</button>
+            <button class="fbtn" data-kind="plunge">急跌</button>
+            <button class="fbtn" data-kind="limit_up">涨停</button>
+            <button class="fbtn" data-kind="limit_down">跌停</button>
+            <button class="fbtn" data-kind="volume_burst">放量</button>
+            <button class="fbtn" data-kind="unusual">异动</button>
+          </div>
+          <span class="pmeta" id="alertMeta">0 条</span>
+        </div>
+        <div class="pbody" id="alertBody"><div class="alerts" id="alertList"></div></div>
+      </section>
+    </div>
+
+    <!-- 中：异动榜 -->
+    <section class="panel" id="quotesPanel">
+      <div class="phead">
+        <span class="ptitle">异动榜</span>
+        <span class="pmeta" id="quotesMeta">点击行展开分时图 · 共 0 只</span>
+      </div>
+      <div class="pbody">
+        <table id="quotesTable">
+          <thead><tr>
+            <th data-sort="code">代码</th>
+            <th data-sort="name">名称</th>
+            <th data-sort="price">现价</th>
+            <th data-sort="pct" class="on">涨跌幅</th>
+            <th data-sort="speed_1m">1分钟</th>
+            <th data-sort="speed_5m">5分钟</th>
+            <th data-sort="volume_ratio">量比</th>
+            <th data-sort="amount">成交额(亿)</th>
+            <th data-sort="turnover">换手</th>
+            <th data-sort="amplitude">振幅</th>
+          </tr></thead>
+          <tbody id="quotesBody"><tr><td colspan="10" class="empty">暂无数据</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- 右：自选股 -->
+    <section class="panel" id="wlPanel">
+      <div class="phead">
+        <span class="ptitle">自选股</span>
+        <span class="pmeta" id="wlMeta">0 只</span>
+      </div>
+      <div class="pbody">
+        <table>
+          <thead><tr>
+            <th>代码</th><th>名称</th><th>现价</th><th>涨跌幅</th><th>量比</th><th>5分钟</th>
+          </tr></thead>
+          <tbody id="wlBody" class="wl"><tr><td colspan="6" class="empty">暂无自选股</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+(function(){
+/* ===================== 工具 ===================== */
+var $ = function(id){ return document.getElementById(id); };
+var KIND = {
+  surge:{t:"急拉"}, plunge:{t:"急跌"}, limit_up:{t:"涨停"},
+  limit_down:{t:"跌停"}, volume_burst:{t:"放量"}, unusual:{t:"异动"}
+};
+var KIND_ORDER = ["surge","plunge","limit_up","limit_down","volume_burst","unusual"];
+var MAX_ALERTS = 300;
+var MAX_SPIRIT = 200;         /* 短线精灵 DOM 上限：一屏几十条，长会话也不能无限涨 */
+var STALE_MS = 10000;
+
+function esc(s){
+  return String(s==null?"":s).replace(/[&<>"']/g, function(c){
+    return {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c];
+  });
+}
+function num(v, d){
+  var n = Number(v);
+  if(!isFinite(n)) return "--";
+  return n.toFixed(d==null?2:d);
+}
+function signed(v, d){
+  var n = Number(v);
+  if(!isFinite(n)) return "--";
+  return (n>0?"+":"") + n.toFixed(d==null?2:d);
+}
+function cls(v){
+  var n = Number(v);
+  if(!isFinite(n) || n===0) return "flat";
+  return n>0 ? "up" : "down";
+}
+function hhmmss(ts){
+  if(!ts) return "--:--:--";
+  var s = String(ts);
+  var m = s.match(/(\d{2}:\d{2}:\d{2})/);
+  return m ? m[1] : s;
+}
+function toast(msg){
+  var el = $("toast");
+  el.textContent = msg;
+  el.className = "show";
+  clearTimeout(toast._t);
+  toast._t = setTimeout(function(){ el.className=""; }, 1800);
+}
+
+/* ===================== 状态 ===================== */
+var S = {
+  alerts: [], seen: {}, kind: "all", paused: false, sound: false,
+  pendingNew: 0, lastMsg: 0, quotes: [], sort: "pct", sortDir: -1,
+  watchlist: [], expanded: null, wlExpanded: null, byKind: null,
+  series: {}, seriesAt: {}, live: false,
+  spirit: [], spSeen: {}, spGroup: "all", spGroups: []
+};
+
+/* ===================== 顶部状态条 ===================== */
+var SESSION_CN = {
+  closed:"休市", pre_open:"集合竞价", auction:"开盘静默", morning:"早盘交易中",
+  lunch:"午间休市", afternoon:"午盘交易中", post:"已收盘"
+};
+function setConn(ok, text){
+  var p = $("connPill");
+  if(!ok){ p.className = "pill dead"; p.textContent = text || "连接异常"; }
+  else { p.className = "pill live"; p.textContent = text || "实时连接"; }
+}
+function renderStatus(st){
+  if(!st || typeof st !== "object") return;
+  var phase = st.phase || "closed";
+  if(st.title) $("subTitle").textContent = st.title;
+  $("stPhase").textContent = st.dry_run ? "演练模式" : "实盘运行";
+  /* session_desc 是引擎给的完整描述（含下次开盘时间），比自己拼更准 */
+  var ses = st.session_desc || SESSION_CN[phase] || st.session || phase;
+  if(st.is_open) ses += " ✓";
+  $("stSession").textContent = ses;
+  $("stUniverse").textContent = st.universe == null ? "--" : st.universe;
+  $("stAlerts").textContent = st.alerts_total == null ? "--" : st.alerts_total;
+  $("stPolls").textContent = st.poll_count == null ? "--" : st.poll_count;
+  $("stPollMs").textContent = st.last_poll_ms == null ? "--" : st.last_poll_ms;
+  var up = Number(st.uptime_s);
+  if(isFinite(up)){
+    $("stUptime").textContent = up >= 3600 ? (up/3600).toFixed(1)+"h"
+      : up >= 60 ? (up/60).toFixed(1)+"min" : up.toFixed(0)+"s";
+  }
+  if(st.watchlist != null) $("stWatch").textContent = st.watchlist;
+  if(st.last_poll_ts){ $("stUpdated").textContent = hhmmss(st.last_poll_ts); }
+  renderSources(st.sources);
+  if(st.by_kind) S.byKind = st.by_kind;
+  renderKindCounts();
+}
+/* 按类型筛选按钮上显示各类型条数，便于一眼看出今天什么异动最多 */
+function renderKindCounts(){
+  var btns = $("filters").querySelectorAll(".fbtn");
+  for(var i=0;i<btns.length;i++){
+    var k = btns[i].dataset.kind;
+    var base = btns[i].dataset.label || (btns[i].dataset.label = btns[i].textContent);
+    var n = (k === "all") ? null : (S.byKind ? S.byKind[k] : null);
+    btns[i].textContent = (n ? base + " " + n : base);
+  }
+}
+function renderSources(srcs){
+  var box = $("stSources");
+  if(!srcs || !srcs.length){ box.innerHTML = '<span class="dot"></span><span class="dim">无</span>'; return; }
+  var html = "";
+  for(var i=0;i<srcs.length;i++){
+    var s = srcs[i] || {};
+    var ok = s.ok !== false;
+    var dotCls = ok ? (Number(s.latency_ms) > 3000 ? "warn" : "ok") : "bad";
+    var label = esc(s.name || "源" + (i+1));
+    var title = label + (ok ? (" 正常 " + (s.latency_ms==null?"":s.latency_ms+"ms")) : (" 异常 " + (s.err||"")));
+    html += '<span class="dot '+dotCls+'" title="'+title+'"></span><span class="dim">'+label+'</span>';
+    if(i < srcs.length-1) html += '<span class="dim2">·</span>';
+  }
+  box.innerHTML = html;
+}
+
+/* ===================== 告警流 ===================== */
+function kindBadge(k){
+  var info = KIND[k] || {t:k||"?"};
+  return '<span class="bd '+esc(k)+'">'+esc(info.t)+'</span>';
+}
+function alertNode(a){
+  var el = document.createElement("div");
+  el.className = "al sev" + (a.severity || 2);
+  el.dataset.kind = a.kind || "";
+  el.dataset.key = a.key || "";
+  if(a.acked) el.classList.add("acked");
+  var px = num(a.price, 2), pct = signed(a.pct, 2) + "%";
+  el.title = a.detail || a.title || "";
+  el.innerHTML =
+    '<span class="tm">'+esc(hhmmss(a.ts))+'</span>' +
+    kindBadge(a.kind) +
+    '<span><span class="nm">'+esc(a.name||"")+'</span><span class="cd">'+esc(a.code||"")+'</span></span>' +
+    '<span class="px '+cls(a.pct)+'">'+px+' <span class="'+cls(a.pct)+'">'+pct+'</span>' +
+      '<button class="ack" title="标记已读">已读</button></span>' +
+    '<span class="ttl">'+esc(a.title||"")+'</span>';
+  el.querySelector(".ack").addEventListener("click", function(ev){
+    ev.stopPropagation();
+    ack(a.key, el);
+  });
+  return el;
+}
+function ack(key, el){
+  fetch("/api/ack", {
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({key:key})
+  }).then(function(r){
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  }).then(function(){
+    el.classList.add("acked");
+    /* 同步内存态，重渲染（切换筛选/暂停恢复）后不会又变回未读 */
+    for(var i=0;i<S.alerts.length;i++){
+      if(S.alerts[i].key === key){ S.alerts[i].acked = true; break; }
+    }
+    toast("已标记已读 " + key);
+  }).catch(function(){ toast("已读失败（服务不可达）"); });
+}
+function pushAlert(a){
+  if(!a || !a.key) return;
+  if(S.seen[a.key]) return;              /* 去重：SSE 重连会重放，靠 key 去重 */
+  S.seen[a.key] = 1;
+  S.alerts.unshift(a);
+  if(S.alerts.length > MAX_ALERTS){
+    var dropped = S.alerts.splice(MAX_ALERTS);
+    for(var i=0;i<dropped.length;i++){ delete S.seen[dropped[i].key]; }
+  }
+  if(S.paused){ S.pendingNew++; updateAlertMeta(); return; }
+  insertAlertNode(a);
+  updateAlertMeta();
+  if((a.severity || 2) >= 3) beep(true); else beep(false);
+}
+function insertAlertNode(a){
+  var list = $("alertList");
+  var placeholder = list.querySelector(".empty");
+  if(placeholder) placeholder.remove();
+  var el = alertNode(a);
+  el.classList.add("flash");
+  if(!matchesFilter(a)) el.style.display = "none";
+  list.insertBefore(el, list.firstChild);
+  setTimeout(function(){ el.classList.remove("flash"); }, 1000);
+  while(list.children.length > MAX_ALERTS) list.removeChild(list.lastChild);
+}
+function matchesFilter(a){
+  return S.kind === "all" || a.kind === S.kind;
+}
+function rerenderAlerts(){
+  var list = $("alertList");
+  list.innerHTML = "";
+  var shown = 0;
+  for(var i=0;i<S.alerts.length;i++){
+    var a = S.alerts[i];
+    if(!matchesFilter(a)) continue;
+    list.appendChild(alertNode(a));
+    shown++;
+  }
+  if(!shown){
+    list.innerHTML = '<div class="empty">'+(S.alerts.length ? "当前筛选无告警" : "等待告警…（休市时无推送）")+'</div>';
+  }
+  updateAlertMeta();
+}
+function updateAlertMeta(){
+  var visible = 0;
+  for(var i=0;i<S.alerts.length;i++){ if(matchesFilter(S.alerts[i])) visible++; }
+  var txt = visible + " / " + S.alerts.length + " 条";
+  if(S.pendingNew) txt += " · 暂停中 " + S.pendingNew + " 新";
+  $("alertMeta").textContent = txt;
+}
+
+/* ===================== 异动榜 ===================== */
+function sortQuotes(items){
+  var key = S.sort, dir = S.sortDir;
+  var arr = items.slice();
+  arr.sort(function(a,b){
+    var va, vb;
+    if(key === "code" || key === "name"){
+      va = String(a[key]||""); vb = String(b[key]||"");
+      return va < vb ? -dir : va > vb ? dir : 0;
+    }
+    va = Number(a[key]); vb = Number(b[key]);
+    if(!isFinite(va)) va = -Infinity;
+    if(!isFinite(vb)) vb = -Infinity;
+    return (vb - va) * dir;
+  });
+  return arr;
+}
+function renderQuotes(items){
+  S.quotes = items || [];
+  var body = $("quotesBody");
+  body.innerHTML = "";
+  if(!S.quotes.length){
+    body.innerHTML = '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+    $("quotesMeta").textContent = "点击行展开分时图 · 共 0 只";
+    return;
+  }
+  var arr = sortQuotes(S.quotes);
+  var frag = document.createDocumentFragment();
+  for(var i=0;i<arr.length;i++){
+    var q = arr[i];
+    var tr = document.createElement("tr");
+    tr.className = "row";
+    tr.dataset.code = q.code;
+    tr.innerHTML =
+      '<td>'+esc(q.code)+'</td>' +
+      '<td title="'+esc(q.name||"")+'">'+esc(q.name||"")+'</td>' +
+      '<td class="num '+cls(q.pct)+'">'+num(q.price)+'</td>' +
+      '<td class="num '+cls(q.pct)+'">'+signed(q.pct)+'%</td>' +
+      '<td class="num '+cls(q.speed_1m)+'">'+signed(q.speed_1m)+'</td>' +
+      '<td class="num '+cls(q.speed_5m)+'">'+signed(q.speed_5m)+'</td>' +
+      '<td class="num">'+num(q.volume_ratio)+'</td>' +
+      '<td class="num">'+num(Number(q.amount)/1e8)+'</td>' +
+      '<td class="num">'+num(q.turnover)+'</td>' +
+      '<td class="num">'+num(q.amplitude)+'</td>';
+    tr.addEventListener("click", (function(code){
+      return function(){ toggleChart(code); };
+    })(q.code));
+    frag.appendChild(tr);
+    if(S.expanded === q.code){
+      tr.classList.add("sel");
+      var cr = document.createElement("tr");
+      cr.className = "chartRow";
+      var td = document.createElement("td");
+      td.colSpan = 10;
+      td.appendChild(chartBox(q, "q"));
+      cr.appendChild(td);
+      frag.appendChild(cr);
+    }
+  }
+  body.appendChild(frag);
+  $("quotesMeta").textContent = "点击行展开分时图 · 共 " + arr.length + " 只 · 按 " + S.sort + " 排序";
+  if(S.expanded) drawChart(S.expanded, "q");
+}
+function toggleChart(code){
+  S.expanded = (S.expanded === code) ? null : code;
+  renderQuotes(S.quotes);
+  if(S.expanded) loadSeries(code, "q");
+}
+function chartBox(q, prefix){
+  var slot = prefix + "_" + q.code;
+  var wrap = document.createElement("div");
+  wrap.className = "chartWrap";
+  var cv = document.createElement("canvas");
+  cv.width = 620; cv.height = 132;
+  cv.id = "cv_" + slot;
+  var info = document.createElement("div");
+  info.className = "chartInfo";
+  info.id = "ci_" + slot;
+  info.innerHTML = '<span class="k">分时（'+esc(q.code)+' '+esc(q.name||"")+'）</span>' +
+                   '<span class="k">加载中…</span>';
+  wrap.appendChild(cv);
+  wrap.appendChild(info);
+  return wrap;
+}
+function loadSeries(code, prefix){
+  S.seriesAt[code] = Date.now();
+  fetch("/api/series?code=" + encodeURIComponent(code) + "&limit=240")
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      S.series[code] = (d && d.items) || [];
+      drawChart(code, prefix);
+    })
+    .catch(function(){
+      var ci = $("ci_" + prefix + "_" + code);
+      if(ci) ci.innerHTML = '<span class="k">分时数据加载失败</span>';
+    });
+}
+/* 已展开的图每 15 秒刷新一次，避免每 2 秒 tick 都打接口 */
+function refreshOpenCharts(){
+  var now = Date.now();
+  if(S.expanded && now - (S.seriesAt[S.expanded] || 0) > 15000) loadSeries(S.expanded, "q");
+  if(S.wlExpanded && now - (S.seriesAt[S.wlExpanded] || 0) > 15000) loadSeries(S.wlExpanded, "w");
+}
+function drawChart(code, prefix){
+  var cv = $("cv_" + prefix + "_" + code);
+  if(!cv) return;
+  var items = S.series[code] || [];
+  var ctx = cv.getContext("2d");
+  var W = cv.width, H = cv.height;
+  var dpr = window.devicePixelRatio || 1;
+  if(cv.dataset.dpr != String(dpr)){
+    cv.dataset.dpr = String(dpr);
+    cv.width = W * dpr; cv.height = H * dpr;
+    cv.style.width = W + "px"; cv.style.height = H + "px";
+  }
+  W = cv.width; H = cv.height;
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,W,H);
+  ctx.fillStyle = "#0a0d13"; ctx.fillRect(0,0,W,H);
+
+  var ci = $("ci_" + prefix + "_" + code);
+  if(!items.length){
+    ctx.fillStyle = "#5d6a80"; ctx.font = (12*dpr)+"px sans-serif";
+    ctx.fillText("暂无分时数据", 10*dpr, H/2);
+    if(ci) ci.innerHTML = '<span class="k">分时（'+esc(code)+'）</span><span class="k">无数据</span>';
+    return;
+  }
+  var min = Infinity, max = -Infinity, i, p;
+  for(i=0;i<items.length;i++){
+    p = Number(items[i].price);
+    if(!isFinite(p)) continue;
+    if(p < min) min = p;
+    if(p > max) max = p;
+  }
+  if(!isFinite(min) || !isFinite(max)){ min = 0; max = 1; }
+  if(max - min < 1e-6){ max = min + Math.max(0.01, Math.abs(min)*0.002); }
+  var padT = 8*dpr, padB = 15*dpr, padL = 4*dpr, padR = 46*dpr;
+  var plotW = W - padL - padR, plotH = H - padT - padB;
+  var n = items.length;
+  var X = function(idx){ return padL + (n<=1 ? plotW/2 : plotW*idx/(n-1)); };
+  var Y = function(v){ return padT + plotH*(1 - (v-min)/(max-min)); };
+
+  /* 网格 */
+  ctx.strokeStyle = "#151b26"; ctx.lineWidth = 1*dpr;
+  for(i=0;i<=3;i++){
+    var gy = padT + plotH*i/3;
+    ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(padL+plotW, gy); ctx.stroke();
+  }
+  ctx.strokeStyle = "#202836";
+  ctx.beginPath(); ctx.moveTo(padL+plotW*0.25, padT); ctx.lineTo(padL+plotW*0.25, padT+plotH); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(padL+plotW*0.75, padT); ctx.lineTo(padL+plotW*0.75, padT+plotH); ctx.stroke();
+
+  /* 首价基准线 */
+  var base = Number(items[0].price);
+  if(isFinite(base)){
+    ctx.strokeStyle = "#3a465c"; ctx.setLineDash([3*dpr, 3*dpr]);
+    ctx.beginPath(); ctx.moveTo(padL, Y(base)); ctx.lineTo(padL+plotW, Y(base)); ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  /* 走势线 + 渐变填充 */
+  var last = Number(items[n-1].price);
+  var rise = last >= base;
+  var color = rise ? "#ff4d4f" : "#12c46a";
+  var grad = ctx.createLinearGradient(0, padT, 0, padT+plotH);
+  grad.addColorStop(0, rise ? "rgba(255,77,79,.30)" : "rgba(18,196,106,.30)");
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.beginPath();
+  for(i=0;i<n;i++){
+    p = Number(items[i].price);
+    if(!isFinite(p)) continue;
+    if(i===0) ctx.moveTo(X(i), Y(p)); else ctx.lineTo(X(i), Y(p));
+  }
+  ctx.strokeStyle = color; ctx.lineWidth = 1.5*dpr; ctx.stroke();
+  ctx.lineTo(X(n-1), padT+plotH); ctx.lineTo(X(0), padT+plotH); ctx.closePath();
+  ctx.fillStyle = grad; ctx.fill();
+
+  /* 端点 */
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(X(n-1), Y(last), 2.4*dpr, 0, Math.PI*2); ctx.fill();
+
+  /* 右侧刻度 */
+  ctx.fillStyle = "#7d8ba1"; ctx.font = (10.5*dpr)+"px Consolas, monospace";
+  ctx.textAlign = "left";
+  ctx.fillText(max.toFixed(2), padL+plotW+4*dpr, padT+9*dpr);
+  ctx.fillText(((max+min)/2).toFixed(2), padL+plotW+4*dpr, padT+plotH/2+3*dpr);
+  ctx.fillText(min.toFixed(2), padL+plotW+4*dpr, padT+plotH+3*dpr);
+
+  if(ci){
+    var pct = Number(items[n-1].pct);
+    if(!isFinite(pct) && isFinite(base) && base>0) pct = (last/base - 1)*100;
+    ci.innerHTML =
+      '<span class="k">分时 · '+n+' 点</span>' +
+      '<span>最新 <b class="'+cls(pct)+'">'+num(last)+'</b></span>' +
+      '<span>区间涨跌 <b class="'+cls(pct)+'">'+signed(pct)+'%</b></span>' +
+      '<span class="k">最低 '+num(min)+' / 最高 '+num(max)+'</span>' +
+      '<span class="k">'+esc(fmtTs(items[0].t))+' → '+esc(fmtTs(items[n-1].t))+'</span>';
+  }
+}
+function fmtTs(epoch){
+  var n = Number(epoch);
+  if(!isFinite(n) || n <= 0) return "--:--";
+  var d = new Date(n*1000);
+  var p = function(x){ return (x<10?"0":"")+x; };
+  return p(d.getHours())+":"+p(d.getMinutes());
+}
+
+/* ===================== 自选股 ===================== */
+function toggleWlChart(code){
+  S.wlExpanded = (S.wlExpanded === code) ? null : code;
+  renderWatchlist(S.watchlist);
+  if(S.wlExpanded) loadSeries(code, "w");
+}
+function renderWatchlist(items){
+  S.watchlist = items || [];
+  var body = $("wlBody");
+  body.innerHTML = "";
+  if(!S.watchlist.length){
+    body.innerHTML = '<tr><td colspan="6" class="empty">暂无自选股</td></tr>';
+    $("wlMeta").textContent = "0 只";
+    return;
+  }
+  var frag = document.createDocumentFragment();
+  for(var i=0;i<S.watchlist.length;i++){
+    var q = S.watchlist[i];
+    var tr = document.createElement("tr");
+    tr.className = "wlrow";
+    tr.title = (q.above_vwap ? "站上均价 " : "跌破均价 ") + num(q.vwap) + " · 点击看分时";
+    tr.innerHTML =
+      '<td>'+esc(q.code)+'</td>' +
+      '<td>'+esc(q.name||"")+'</td>' +
+      '<td class="num '+cls(q.pct)+'">'+num(q.price)+'</td>' +
+      '<td class="num '+cls(q.pct)+'">'+signed(q.pct)+'%</td>' +
+      '<td class="num">'+num(q.volume_ratio)+'</td>' +
+      '<td class="num '+cls(q.speed_5m)+'">'+signed(q.speed_5m)+'</td>';
+    tr.addEventListener("click", (function(code){
+      return function(){ toggleWlChart(code); };
+    })(q.code));
+    frag.appendChild(tr);
+    if(S.wlExpanded === q.code){
+      tr.classList.add("sel");
+      var cr = document.createElement("tr");
+      cr.className = "chartRow";
+      var td = document.createElement("td");
+      td.colSpan = 6;
+      td.appendChild(chartBox(q, "w"));
+      cr.appendChild(td);
+      frag.appendChild(cr);
+    }
+  }
+  body.appendChild(frag);
+  $("wlMeta").textContent = S.watchlist.length + " 只 · 点击看分时";
+  if(S.wlExpanded) drawChart(S.wlExpanded, "w");
+}
+
+/* ===================== 短线精灵（滚动播报） ===================== */
+/* 信号中文名/方向/分组**全部来自服务端**（arad/spirit.py 的注册表）：
+   这里只按 dir 上色、按 group 过滤，绝不重新实现一份信号名映射。 */
+function spiritGroupLabel(g){ return g || "其它"; }
+function spiritRow(a){
+  var el = document.createElement("div");
+  var dir = (a.dir === "up" || a.dir === "down") ? a.dir : "flat";
+  var sev = Number(a.severity);
+  if(!isFinite(sev) || sev <= 0) sev = 2;
+  el.className = "sp " + dir + " sev" + Math.max(1, Math.min(3, Math.round(sev)));
+  el.dataset.group = a.group || "other";
+  el.dataset.dir = dir;
+  el.dataset.key = a.key || "";
+  var tip = [];
+  if(a.hint) tip.push(a.hint);
+  if(a.name || a.code) tip.push((a.name || "") + " " + (a.code || ""));
+  tip.push("信号 " + (a.cn || a.signal || "") + (a.signal && a.signal !== a.cn ? "（" + a.signal + "）" : ""));
+  tip.push("分组 " + spiritGroupLabel(a.group));
+  if(a.title) tip.push(a.title);
+  var ex = a.extra || {};
+  for(var k in ex){
+    if(Object.prototype.hasOwnProperty.call(ex, k) && ex[k] != null) tip.push(k + " " + ex[k]);
+  }
+  el.title = tip.join("\n");
+  var pctCls = dir === "flat" ? cls(a.pct) : dir;
+  el.innerHTML =
+    '<span class="tm">'+esc(hhmmss(a.ts))+'</span>' +
+    '<span class="cd">'+esc(a.code||"")+'</span>' +
+    '<span class="nm">'+esc(a.name||"")+'</span>' +
+    '<span class="sg '+dir+'">'+esc(a.cn || a.signal || "?")+'</span>' +
+    '<span class="px '+pctCls+'">'+num(a.price, 2)+'</span>' +
+    '<span class="pc '+pctCls+'">'+signed(a.pct, 2)+'%</span>';
+  return el;
+}
+function spiritMatches(a){
+  return S.spGroup === "all" || (a.group || "other") === S.spGroup;
+}
+function insertSpiritNode(a){
+  var list = $("spiritList");
+  var ph = list.querySelector(".empty");
+  if(ph) ph.remove();
+  var el = spiritRow(a);
+  el.classList.add("flash");
+  if(!spiritMatches(a)) el.style.display = "none";
+  list.insertBefore(el, list.firstChild);
+  setTimeout(function(){ el.classList.remove("flash"); }, 900);
+  while(list.children.length > MAX_SPIRIT) list.removeChild(list.lastChild);
+}
+function rerenderSpirit(){
+  var list = $("spiritList");
+  list.innerHTML = "";
+  var shown = 0;
+  for(var i=0;i<S.spirit.length;i++){
+    var a = S.spirit[i];
+    if(!spiritMatches(a)) continue;
+    list.appendChild(spiritRow(a));
+    shown++;
+  }
+  if(!shown){
+    list.innerHTML = '<div class="empty">'+
+      (S.spirit.length ? "当前筛选无信号" : "等待信号…（休市时无推送）")+'</div>';
+  }
+  updateSpiritMeta();
+}
+function updateSpiritMeta(){
+  var visible = 0;
+  for(var i=0;i<S.spirit.length;i++){ if(spiritMatches(S.spirit[i])) visible++; }
+  $("spiritMeta").textContent = visible + " / " + S.spirit.length + " 条";
+}
+function pushSpirit(a){
+  if(!a || !a.key) return;
+  if(S.spSeen[a.key]) return;              /* 去重：SSE 重连会重放，靠 key 去重 */
+  S.spSeen[a.key] = 1;
+  S.spirit.unshift(a);                     /* 最新的在最上面 */
+  if(S.spirit.length > MAX_SPIRIT){
+    var dropped = S.spirit.splice(MAX_SPIRIT);
+    for(var i=0;i<dropped.length;i++){ delete S.spSeen[dropped[i].key]; }
+  }
+  insertSpiritNode(a);
+  updateSpiritMeta();
+  if((Number(a.severity) || 2) >= 3) beep(true); else beep(false);
+}
+/* 分组按钮由服务端给的 groups 动态生成（分组清单只在 spirit.py 里有一份） */
+function renderSpiritFilters(groups){
+  if(!groups || !groups.length) return;
+  var box = $("spFilters");
+  var sig = groups.map(function(g){ return g.group + ":" + g.count; }).join(",");
+  if(box.dataset.sig === sig) return;      /* 清单没变就不重建，免得闪烁 */
+  box.dataset.sig = sig;
+  box.innerHTML = '<button class="sfbtn on" data-group="all">全部</button>';
+  for(var i=0;i<groups.length;i++){
+    var g = groups[i] || {};
+    var b = document.createElement("button");
+    b.className = "sfbtn";
+    b.dataset.group = g.group || "other";
+    b.textContent = spiritGroupLabel(g.cn || g.group);
+    if(g.count) b.title = b.textContent + " " + g.count + " 个信号";
+    box.appendChild(b);
+  }
+  if(S.spGroup !== "all" && !box.querySelector('[data-group="'+S.spGroup+'"]')){
+    S.spGroup = "all";                     /* 分组消失了就回到全部 */
+  }
+}
+/* 首屏/重连后补齐历史信号（SSE 只推增量）。
+   不变量：S.spirit[0] **永远是最新的一条**（和 pushSpirit 的 unshift 一致），
+   rerenderSpirit 从 0 往下 append 就自然是"最新的在最上面"。 */
+function loadSpirit(){
+  return fetchJSON("/api/spirit?limit=" + MAX_SPIRIT).then(function(d){
+    if(d.groups) renderSpiritFilters(d.groups);
+    var items = d.items || [];                     /* 接口是倒序：最新的在前 */
+    for(var i=items.length-1;i>=0;i--){            /* 从最旧的一条往回插 */
+      var a = items[i];
+      if(!a || !a.key || S.spSeen[a.key]) continue;
+      S.spSeen[a.key] = 1;
+      S.spirit.unshift(a);
+      if(S.spirit.length > MAX_SPIRIT){
+        var dropped = S.spirit.pop();              /* 丢最旧的，同步清去重表 */
+        if(dropped) delete S.spSeen[dropped.key];
+      }
+    }
+    rerenderSpirit();
+  }).catch(function(){});
+}
+
+/* ===================== 声音 ===================== */
+var audioCtx = null;
+function beep(urgent){
+  if(!S.sound) return;
+  try{
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if(!AC) return;
+    if(!audioCtx) audioCtx = new AC();
+    if(audioCtx.state === "suspended" && audioCtx.resume) audioCtx.resume();
+    var t0 = audioCtx.currentTime;
+    var dur = urgent ? 0.24 : 0.13;
+    var osc = audioCtx.createOscillator();
+    var gain = audioCtx.createGain();
+    osc.type = urgent ? "square" : "sine";
+    osc.frequency.setValueAtTime(urgent ? 1180 : 880, t0);
+    if(urgent) osc.frequency.setValueAtTime(1480, t0 + 0.10);
+    gain.gain.setValueAtTime(0.0001, t0);
+    gain.gain.exponentialRampToValueAtTime(urgent ? 0.16 : 0.10, t0 + 0.012);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t0 + dur);
+    osc.connect(gain); gain.connect(audioCtx.destination);
+    osc.start(t0); osc.stop(t0 + dur + 0.02);
+  }catch(e){ /* 浏览器策略限制：忽略 */ }
+}
+$("btnSound").addEventListener("click", function(){
+  S.sound = !S.sound;
+  this.textContent = "声音提醒：" + (S.sound ? "开" : "关");
+  this.className = "btn" + (S.sound ? " on" : "");
+  if(S.sound) beep(false);
+  toast(S.sound ? "声音提醒已开启（紧急告警双响）" : "声音提醒已关闭");
+});
+$("btnPause").addEventListener("click", function(){
+  S.paused = !S.paused;
+  this.textContent = S.paused ? "继续滚动" : "暂停滚动";
+  this.className = "btn" + (S.paused ? " warn-on" : "");
+  if(!S.paused){
+    S.pendingNew = 0;
+    rerenderAlerts();
+  } else {
+    updateAlertMeta();
+  }
+});
+
+/* ===================== 筛选 ===================== */
+$("filters").addEventListener("click", function(ev){
+  var b = ev.target.closest(".fbtn");
+  if(!b) return;
+  var btns = this.querySelectorAll(".fbtn");
+  for(var i=0;i<btns.length;i++) btns[i].classList.remove("on");
+  b.classList.add("on");
+  S.kind = b.dataset.kind;
+  rerenderAlerts();
+});
+/* 短线精灵：按服务端给的 group 过滤 */
+$("spFilters").addEventListener("click", function(ev){
+  var b = ev.target.closest(".sfbtn");
+  if(!b) return;
+  var btns = this.querySelectorAll(".sfbtn");
+  for(var i=0;i<btns.length;i++) btns[i].classList.remove("on");
+  b.classList.add("on");
+  S.spGroup = b.dataset.group;
+  rerenderSpirit();
+});
+
+/* ===================== 表头排序 ===================== */
+$("quotesTable").querySelector("thead").addEventListener("click", function(ev){
+  var th = ev.target.closest("th");
+  if(!th || !th.dataset.sort) return;
+  var key = th.dataset.sort;
+  if(S.sort === key) S.sortDir = -S.sortDir;
+  else { S.sort = key; S.sortDir = (key === "code" || key === "name") ? 1 : -1; }
+  var ths = this.querySelectorAll("th");
+  for(var i=0;i<ths.length;i++) ths[i].classList.remove("on");
+  th.classList.add("on");
+  renderQuotes(S.quotes);
+});
+
+/* ===================== 数据获取 ===================== */
+function fetchJSON(url){
+  return fetch(url, {cache:"no-store"}).then(function(r){
+    if(!r.ok) throw new Error("HTTP " + r.status);
+    return r.json();
+  });
+}
+/* 首屏/重连后补齐历史告警（SSE 只推增量） */
+function loadRecentAlerts(){
+  return fetchJSON("/api/alerts?limit=" + MAX_ALERTS).then(function(d){
+    var items = (d.items || []).slice().reverse();   /* 接口是倒序，逐条 push 后自然正序 */
+    for(var i=0;i<items.length;i++){
+      var a = items[i];
+      if(!a || !a.key || S.seen[a.key]) continue;
+      S.seen[a.key] = 1;
+      S.alerts.push(a);                              /* 末尾，保持时间从旧到新 */
+    }
+    while(S.alerts.length > MAX_ALERTS){
+      var dropped = S.alerts.shift();
+      if(dropped) delete S.seen[dropped.key];
+    }
+    rerenderAlerts();
+  }).catch(function(){});
+}
+function refreshAll(){
+  fetchJSON("/api/status").then(renderStatus).catch(function(){});
+  fetchJSON("/api/quotes?limit=30&sort=" + encodeURIComponent(S.sort))
+    .then(function(d){ renderQuotes(d.items || []); }).catch(function(){});
+  fetchJSON("/api/watchlist")
+    .then(function(d){ renderWatchlist(d.items || []); }).catch(function(){});
+  refreshOpenCharts();
+}
+
+/* ===================== SSE ===================== */
+function touch(){
+  S.lastMsg = Date.now();
+  if(!S.live){ S.live = true; setConn(true, "实时连接"); }
+}
+function onTick(d){
+  touch();
+  d = d || {};
+  renderStatus(d.status);
+  if(d.quotes && d.quotes.length) renderQuotes(d.quotes);
+  if(d.watchlist) renderWatchlist(d.watchlist);
+  if(d.ts) $("stUpdated").textContent = hhmmss(d.ts);
+}
+function onAlert(d){
+  touch();
+  pushAlert(d);
+}
+function connect(){
+  var es;
+  try{ es = new EventSource("/api/stream"); }
+  catch(e){ setConn(false, "SSE 不可用"); return; }
+  es.addEventListener("open", function(){ touch(); });
+  es.addEventListener("tick", function(ev){
+    var d; try{ d = JSON.parse(ev.data); }catch(e){ return; }
+    onTick(d);
+  });
+  es.addEventListener("alert", function(ev){
+    var d; try{ d = JSON.parse(ev.data); }catch(e){ return; }
+    onAlert(d);
+  });
+  es.addEventListener("spirit", function(ev){
+    var d; try{ d = JSON.parse(ev.data); }catch(e){ return; }
+    touch();
+    pushSpirit(d);                         /* 服务端已给好中文名/方向/分组，直接上屏 */
+  });
+  es.addEventListener("message", function(ev){
+    var d; try{ d = JSON.parse(ev.data); }catch(e){ return; }
+    if(d && d.kind && d.key) onAlert(d); else onTick(d);
+  });
+  es.addEventListener("bye", function(){ /* 服务端主动收尾，交给自动重连 */ });
+  es.addEventListener("error", function(){
+    setConn(false, "连接异常·重连中");
+  });
+}
+/* 失活检测：超过 10 秒无消息即报异常，并主动兜底拉一次 */
+setInterval(function(){
+  var gap = Date.now() - (S.lastMsg || 0);
+  if(gap > STALE_MS){
+    if(S.live){ S.live = false; setConn(false, "连接异常 " + Math.floor(gap/1000) + "s"); }
+    refreshAll();
+  } else if(gap < 3000){
+    if(!S.live){ S.live = true; setConn(true, "实时连接"); }
+  }
+}, 2000);
+
+/* ===================== 启动 ===================== */
+$("stUpdated").textContent = hhmmss(new Date().toTimeString().slice(0,8));
+refreshAll();
+loadRecentAlerts();
+loadSpirit();
+connect();
+setInterval(refreshAll, 30000);
+/* 重连后补齐断线期间可能错过的告警（靠 key 去重，重复拉取安全） */
+document.addEventListener("visibilitychange", function(){
+  if(!document.hidden){ refreshAll(); loadRecentAlerts(); loadSpirit(); }
+});
+})();
+</script>
+</body>
+</html>

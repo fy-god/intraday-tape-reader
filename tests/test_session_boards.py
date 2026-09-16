@@ -1,0 +1,275 @@
+"""交易时段与板块判定：边界回归测试。
+
+这些断言覆盖 A 股硬规则（涨跌停比例、板块归属、时段边界），
+任何一条挂掉都意味着会真金白银地误报或漏报。
+"""
+from __future__ import annotations
+
+from datetime import date, datetime
+
+import pytest
+
+from arad.models import (Alert, AlertKind, Board, board_of, guess_prefix,
+                         limit_rate_of, Quote)
+from arad.session import CONTINUOUS, SessionPhase, TradingCalendar
+
+
+def at(h: int, m: int, s: int = 0, d: date = date(2026, 9, 15)) -> datetime:
+    return datetime(d.year, d.month, d.day, h, m, s)
+
+
+@pytest.fixture
+def cal() -> TradingCalendar:
+    return TradingCalendar(holidays=set())      # 只测时段，不叠加节假日
+
+
+# ==========================================================================
+# 时段边界
+# ==========================================================================
+@pytest.mark.parametrize("dt,expect,desc", [
+    (at(0, 0), SessionPhase.CLOSED, "午夜"),
+    (at(9, 14, 59), SessionPhase.CLOSED, "集合竞价前"),
+    (at(9, 15), SessionPhase.CALL_AUCTION, "集合竞价开始"),
+    (at(9, 24, 59), SessionPhase.CALL_AUCTION, "集合竞价末"),
+    (at(9, 25), SessionPhase.SILENCE, "竞价结束→静默"),
+    (at(9, 29, 59), SessionPhase.SILENCE, "静默末"),
+    (at(9, 30), SessionPhase.MORNING, "开盘"),
+    (at(11, 29, 59), SessionPhase.MORNING, "上午末秒"),
+    (at(11, 30), SessionPhase.LUNCH, "午休开始（左闭右开）"),
+    (at(12, 59, 59), SessionPhase.LUNCH, "午休末秒"),
+    (at(13, 0), SessionPhase.AFTERNOON, "下午开盘"),
+    (at(14, 59, 59), SessionPhase.AFTERNOON, "下午末秒"),
+    (at(15, 0), SessionPhase.POST, "收盘瞬间即 POST"),
+    (at(23, 59, 59), SessionPhase.POST, "深夜"),
+])
+def test_phase_boundaries(cal, dt, expect, desc):
+    assert cal.phase(dt) is expect, desc
+
+
+def test_auction_aliases_match():
+    """语义别名必须指向同一个成员，避免"以为拿到竞价、实为静默"。"""
+    assert SessionPhase.CALL_AUCTION is SessionPhase.PRE_OPEN
+    assert SessionPhase.SILENCE is SessionPhase.AUCTION
+    assert SessionPhase.PRE_OPEN.value == "pre_open"
+    assert SessionPhase.AUCTION.value == "auction"
+
+
+def test_continuous_contains_only_two_sessions():
+    assert set(CONTINUOUS) == {SessionPhase.MORNING, SessionPhase.AFTERNOON}
+    assert SessionPhase.LUNCH not in CONTINUOUS
+    assert SessionPhase.PRE_OPEN not in CONTINUOUS
+
+
+def test_is_open_matches_phase(cal):
+    assert cal.is_open(at(10, 0)) is True
+    assert cal.is_open(at(14, 0)) is True
+    assert cal.is_open(at(11, 30)) is False
+    assert cal.is_open(at(15, 0)) is False
+    assert cal.is_open(at(9, 20)) is False      # 集合竞价不可连续竞价成交
+
+
+def test_elapsed_trading_seconds_full_day_is_14400(cal):
+    """A股每天连续竞价 4 小时 = 14400 秒。"""
+    assert cal.elapsed_trading_seconds(at(9, 30)) == 0.0
+    assert cal.elapsed_trading_seconds(at(10, 0)) == 1800.0
+    assert cal.elapsed_trading_seconds(at(11, 30)) == 7200.0
+    assert cal.elapsed_trading_seconds(at(13, 0)) == 7200.0
+    assert cal.elapsed_trading_seconds(at(15, 0)) == 14400.0
+    assert cal.elapsed_trading_seconds(at(20, 0)) == 14400.0
+
+
+def test_elapsed_never_decreases(cal):
+    """已交易秒数必须单调不减（量能节奏对比的前提）。"""
+    prev = -1.0
+    for h in range(9, 16):
+        for m in (0, 15, 30, 45):
+            v = cal.elapsed_trading_seconds(at(h, m))
+            assert v >= prev, f"{h}:{m:02d} 倒退"
+            prev = v
+
+
+def test_non_trading_day_is_always_closed(cal):
+    for d in (date(2026, 9, 19), date(2026, 9, 20)):    # 周六、周日
+        assert cal.phase(at(10, 0, d=d)) is SessionPhase.CLOSED
+        assert cal.is_trading_day(d) is False
+        assert cal.elapsed_trading_seconds(at(10, 0, d=d)) == 0.0
+
+
+def test_holiday_is_not_trading_day():
+    cal = TradingCalendar(holidays={"2026-10-01"})
+    assert cal.is_trading_day(date(2026, 10, 1)) is False
+    assert cal.phase(at(10, 0, d=date(2026, 10, 1))) is SessionPhase.CLOSED
+
+
+def test_next_open_skips_weekend_and_holiday():
+    cal = TradingCalendar(holidays={"2026-09-21"})       # 周一放假
+    nxt = cal.next_open(datetime(2026, 9, 18, 16, 0))    # 周五收盘后
+    assert nxt == datetime(2026, 9, 22, 9, 30)           # 跳过周六日 + 周一
+
+
+def test_minutes_to_close(cal):
+    assert cal.minutes_to_close(at(15, 0)) == 0.0
+    assert cal.minutes_to_close(at(20, 0)) == 0.0
+    assert cal.minutes_to_close(at(14, 0)) == pytest.approx(60.0)
+    assert cal.minutes_to_close(at(9, 30)) == pytest.approx(330.0)   # 5.5 小时
+
+
+# ==========================================================================
+# 板块与涨跌幅限制（A 股硬规则）
+# ==========================================================================
+@pytest.mark.parametrize("code,name,board,rate", [
+    ("600000", "浦发银行", Board.MAIN, 0.10),
+    ("601318", "中国平安", Board.MAIN, 0.10),
+    ("603259", "药明康德", Board.MAIN, 0.10),
+    ("605499", "东鹏饮料", Board.MAIN, 0.10),
+    ("000001", "平安银行", Board.MAIN, 0.10),
+    ("001979", "招商蛇口", Board.MAIN, 0.10),
+    ("002594", "比亚迪", Board.MAIN, 0.10),
+    ("003816", "中国广核", Board.MAIN, 0.10),
+    ("300750", "宁德时代", Board.GEM, 0.20),
+    ("301029", "怡合达", Board.GEM, 0.20),
+    ("688111", "金山办公", Board.STAR, 0.20),
+    ("689009", "九号公司", Board.STAR, 0.20),
+    ("830799", "艾融软件", Board.BJ, 0.30),
+    ("430047", "诺思兰德", Board.BJ, 0.30),
+    ("920001", "某北交所", Board.BJ, 0.30),
+    ("600001", "ST某", Board.MAIN, 0.05),
+    ("000002", "*ST某", Board.MAIN, 0.05),
+    ("300001", "ST创业板", Board.GEM, 0.20),      # ST 不改变双创 20%
+])
+def test_board_and_limit_rate(code, name, board, rate):
+    assert board_of(code, name) is board
+    assert limit_rate_of(code, name) == pytest.approx(rate)
+
+
+def _q(code, name, pc):
+    return Quote(code=code, name=name, price=pc, prev_close=pc,
+                 board=board_of(code, name), open=pc, high=pc, low=pc,
+                 volume_lots=10000.0, amount=pc * 1_000_000.0)
+
+
+@pytest.mark.parametrize("code,name,pc,up,dn", [
+    ("600000", "浦发银行", 10.00, 11.00, 9.00),
+    ("600519", "贵州茅台", 1500.00, 1650.00, 1350.00),
+    ("600000", "浦发银行", 10.05, 11.06, 9.05),     # 11.055 -> 四舍五入到分
+    ("300750", "宁德时代", 100.00, 120.00, 80.00),
+    ("688111", "金山办公", 100.00, 120.00, 80.00),
+    ("830799", "艾融软件", 10.00, 13.00, 7.00),
+    ("600001", "ST某", 10.00, 10.50, 9.50),
+])
+def test_limit_prices_rounded_to_cent(code, name, pc, up, dn):
+    q = _q(code, name, pc)
+    assert q.limit_up_price == pytest.approx(up, abs=0.005)
+    assert q.limit_down_price == pytest.approx(dn, abs=0.005)
+
+
+def test_suspended_minus_one_limit_price_is_recomputed():
+    """停牌/PT 股常给 -1.0 的限价 -> 必须按板率自行推算，不能拿 -1 去比较。"""
+    q = _q("600000", "浦发银行", 10.0).copy_with(limit_up=-1.0, limit_down=-1.0)
+    assert q.limit_up_price == pytest.approx(11.0)
+    assert q.limit_down_price == pytest.approx(9.0)
+
+
+def test_limit_price_never_negative_or_zero():
+    """任何情况下限价都必须是正数，否则规则里的比较会全部失真。"""
+    for code, name in (("600000", "浦发银行"), ("300750", "宁德时代"),
+                       ("688111", "金山办公"), ("830799", "艾融软件")):
+        q = _q(code, name, 20.0)
+        assert q.limit_up_price > 0
+        assert q.limit_down_price > 0
+        assert q.limit_down_price < q.price < q.limit_up_price
+
+
+# ==========================================================================
+# 审计修复回归（全部是执行确认过的真实缺陷）
+# ==========================================================================
+def test_limit_rate_accepts_board_enum():
+    """``limit_rate_of`` 必须容忍误传 Board 枚举。
+
+    回归：`replay.py` 曾写 `limit_rate_of(self.board, self.name)`，传的是枚举。
+    `board_of` 收到非字符串会判成 `Board.OTHER` -> 10%，于是创业板/科创板剧本
+    的涨停价全算错（300750 算成 55.00 而非 60.00），离线校验形同虚设。
+    现在传枚举也能得到正确比例。
+    """
+    assert limit_rate_of(Board.GEM, "测试") == pytest.approx(0.20)
+    assert limit_rate_of(Board.STAR, "测试") == pytest.approx(0.20)
+    assert limit_rate_of(Board.BJ, "测试") == pytest.approx(0.30)
+    assert limit_rate_of(Board.MAIN, "测试") == pytest.approx(0.10)
+    # 与按代码算的结果一致
+    for code, name in (("300750", "宁德时代"), ("688111", "金山办公"),
+                       ("830799", "艾融软件"), ("600000", "浦发银行")):
+        assert limit_rate_of(board_of(code, name), name) == \
+            pytest.approx(limit_rate_of(code, name))
+
+
+def test_board_of_tolerates_int_code():
+    """回归：`board_of(600000)` 曾抛 AttributeError（int 没有 .strip）。"""
+    assert board_of(600000) is Board.MAIN          # type: ignore[arg-type]
+    assert board_of(300750) is Board.GEM           # type: ignore[arg-type]
+    assert board_of(None) is Board.OTHER           # type: ignore[arg-type]
+    assert board_of(1) is Board.OTHER              # type: ignore[arg-type]  八进制陷阱后的残值
+
+
+def test_guess_prefix_handles_b_shares():
+    """回归：B 股前缀曾判错（900901 沪B 被判 bj，200011 深B 被判 sh）。"""
+    assert guess_prefix("900901") == "sh"          # 沪B
+    assert guess_prefix("200011") == "sz"          # 深B
+    # 常见 A 股不受影响
+    assert guess_prefix("600000") == "sh"
+    assert guess_prefix("000001") == "sz"
+    assert guess_prefix("300750") == "sz"
+    assert guess_prefix("688111") == "sh"
+    assert guess_prefix("830799") == "bj"
+    assert guess_prefix("920001") == "bj"
+
+
+@pytest.mark.parametrize("code,name", [
+    ("000001", ""),            # 平安银行，数据源偶尔不返名称
+    ("000010", ""),
+    ("000016", ""),
+])
+def test_missing_name_does_not_make_real_stock_an_index(code, name):
+    """回归：名称缺失时 `000001` 曾被判为上证指数。
+
+    那会让 `filters.exclude_boards=["index"]` 把平安银行（就在默认自选里）
+    静默剔除——最难发现的一类问题：不报错，只是永远不告警。
+    """
+    assert board_of(code, name) is Board.MAIN
+    # 明确像指数的名称仍然判 INDEX
+    assert board_of("000001", "上证指数") is Board.INDEX
+    # 399xxx 恒为指数
+    assert board_of("399001", "") is Board.INDEX
+
+
+def test_nonfinite_numbers_never_reach_json():
+    """回归：NaN/Infinity 曾被 json.dumps 输出成裸 NaN -> 非法 JSON。
+
+    浏览器端 `JSON.parse` 会直接抛错，整条 SSE 推送失效。
+    真实数据源能产出：东财返回 f2="1e999" -> inf。
+    """
+    import json
+    import math
+
+    q = Quote(code="600000", name="测试", price=float("inf"), prev_close=10.0,
+              board=Board.MAIN, open=10.0, high=10.0, low=10.0,
+              volume_lots=1.0, amount=1.0)
+    alert = Alert(key="k", kind=AlertKind.SURGE, code="600000", name="测试",
+                  ts=datetime(2026, 9, 15, 10, 0, 0), price=float("inf"),
+                  pct=float("nan"), title="t", detail="d", severity=2,
+                  metrics={"a": float("nan"), "b": float("inf"),
+                           "c": float("-inf"), "d": 1.5, "e": "s"})
+    d = alert.to_dict()
+    assert d["price"] is None
+    assert d["pct"] is None
+    assert d["metrics"]["a"] is None
+    assert d["metrics"]["b"] is None
+    assert d["metrics"]["c"] is None
+    assert d["metrics"]["d"] == 1.5
+    assert d["metrics"]["e"] == "s"                # 非数值原样透传
+
+    s = json.dumps(d, ensure_ascii=False)
+    assert "NaN" not in s and "Infinity" not in s, f"非法 JSON: {s}"
+    json.loads(s)                                   # 必须能被严格解析
+    # 顺带确认 Quote 自身的派生字段也不会炸
+    assert isinstance(q.pct, float)
+    assert math.isfinite(q.limit_up_price)

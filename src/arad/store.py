@@ -1,0 +1,298 @@
+"""运行期共享状态容器：告警仓库 + 订阅广播（供 Web/SSE 使用）。
+
+设计要点
+--------
+* ``AlertStore`` 是引擎与 Web 层之间**唯一**的数据通道，避免两者直接耦合。
+* 所有跨线程访问都用 ``threading.RLock`` 保护；订阅队列写满时丢弃最旧事件，
+  绝不阻塞引擎（行情推送不能被慢客户端拖死）。
+"""
+from __future__ import annotations
+
+import logging
+import queue
+import threading
+import time
+from collections import deque
+from datetime import datetime
+from typing import Any
+
+from .config import Settings, load_settings
+from .models import Alert, AlertKind, Quote
+from .session import PHASE_CN, SessionPhase, TradingCalendar
+
+__all__ = ["AlertStore"]
+
+log = logging.getLogger("arad.store")
+
+# 榜单排序键
+_SORTS = {
+    "speed": lambda it: -abs(it.get("speed_1m") or 0.0),
+    "speed5": lambda it: -abs(it.get("speed_5m") or 0.0),
+    "pct": lambda it: -abs(it.get("pct") or 0.0),
+    "up": lambda it: -(it.get("pct") or 0.0),
+    "down": lambda it: (it.get("pct") or 0.0),
+    "amount": lambda it: -(it.get("amount") or 0.0),
+    "volume_ratio": lambda it: -(it.get("volume_ratio") or 0.0),
+}
+
+
+class AlertStore:
+    """引擎产出 → 前端消费的共享仓库。"""
+
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        *,
+        calendar: TradingCalendar | None = None,
+        max_alerts: int = 300,
+        series_len: int = 240,
+    ):
+        self.settings = settings or load_settings()
+        self.calendar = calendar or TradingCalendar.load()
+        self._lock = threading.RLock()
+        self._engine: Any = None
+
+        self._alerts: deque[dict] = deque(maxlen=max(int(max_alerts), 10))
+        self._acked: set[str] = set()
+        self._total = 0
+        self._by_kind: dict[str, int] = {}
+        self._subs: set[queue.Queue] = set()
+
+        self._series_len = max(int(series_len), 2)
+        self._series: dict[str, deque[dict]] = {}
+        self._series_codes: deque[str] = deque(maxlen=120)
+
+        self._started = time.time()
+        self._last_poll_ts: str = ""
+        self._last_poll_ms: int = 0
+        self._poll_count: int = 0
+        self._source_health: list[dict] = []
+        self._notes: list[str] = []
+
+    # ------------------------------------------------------------------
+    # 引擎接入
+    # ------------------------------------------------------------------
+    def attach(self, engine: Any) -> None:
+        """绑定引擎，之后 ``status()/top_quotes()`` 才能读到实时行情。"""
+        with self._lock:
+            self._engine = engine
+
+    @property
+    def engine(self) -> Any:
+        return self._engine
+
+    def _state(self):
+        eng = self._engine
+        return getattr(eng, "state", None) if eng is not None else None
+
+    # ------------------------------------------------------------------
+    # 写入侧（引擎调用）
+    # ------------------------------------------------------------------
+    def add_alert(self, alert: Alert) -> dict:
+        """记录一条告警并广播。返回其 dict 形式。"""
+        d = alert.to_dict()
+        with self._lock:
+            self._alerts.appendleft(d)
+            self._total += 1
+            k = d.get("kind", "")
+            self._by_kind[k] = self._by_kind.get(k, 0) + 1
+        self.broadcast("alert", d)
+        return d
+
+    def record_tick(self, quotes: list[Quote], now: datetime | None = None) -> None:
+        """记录分时序列（供前端 mini 图）。"""
+        ts = (now or datetime.now()).timestamp()
+        with self._lock:
+            for q in quotes:
+                if q.price <= 0:
+                    continue
+                buf = self._series.get(q.code)
+                if buf is None:
+                    buf = deque(maxlen=self._series_len)
+                    self._series[q.code] = buf
+                    self._series_codes.append(q.code)
+                buf.append({"t": round(ts, 1), "price": round(q.price, 3),
+                            "pct": round(q.pct, 3)})
+
+    def set_poll_stats(self, *, poll_ms: int, count: int,
+                       health: list[dict] | None = None,
+                       now: datetime | None = None) -> None:
+        with self._lock:
+            self._last_poll_ms = int(poll_ms)
+            self._poll_count = int(count)
+            self._last_poll_ts = (now or datetime.now()).strftime("%H:%M:%S")
+            if health is not None:
+                self._source_health = list(health)
+
+    def add_note(self, msg: str) -> None:
+        with self._lock:
+            self._notes.append(f"{datetime.now().strftime('%H:%M:%S')} {msg}")
+            del self._notes[:-20]
+
+    def broadcast(self, event: str, data: Any) -> None:
+        """向所有订阅者推送事件；队列满则丢弃最旧的一条。"""
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait({"event": event, "data": data})
+            except queue.Full:
+                try:
+                    q.get_nowait()
+                    q.put_nowait({"event": event, "data": data})
+                except Exception:  # noqa: BLE001
+                    pass
+            except Exception:  # noqa: BLE001
+                pass
+
+    # ------------------------------------------------------------------
+    # 订阅
+    # ------------------------------------------------------------------
+    def subscribe(self) -> queue.Queue:
+        q: queue.Queue = queue.Queue(maxsize=200)
+        with self._lock:
+            self._subs.add(q)
+        return q
+
+    def unsubscribe(self, q: queue.Queue) -> None:
+        with self._lock:
+            self._subs.discard(q)
+
+    @property
+    def subscriber_count(self) -> int:
+        with self._lock:
+            return len(self._subs)
+
+    # ------------------------------------------------------------------
+    # 读取侧（Web 调用）
+    # ------------------------------------------------------------------
+    def status(self) -> dict:
+        state = self._state()
+        phase = self.calendar.phase()
+        with self._lock:
+            total = self._total
+            by_kind = dict(self._by_kind)
+            poll_ms, poll_count = self._last_poll_ms, self._poll_count
+            health = list(self._source_health)
+            notes = list(self._notes)
+            last_poll_ts = self._last_poll_ts
+        quotes = getattr(state, "quotes", {}) if state is not None else {}
+        watch = list(getattr(self._engine, "watchlist", []) or []) if self._engine else []
+        return {
+            "phase": phase.value,
+            "session": PHASE_CN.get(phase, phase.value),
+            "session_desc": self.calendar.describe(),
+            "is_open": phase in (SessionPhase.MORNING, SessionPhase.AFTERNOON),
+            "uptime_s": round(time.time() - self._started, 1),
+            "universe": len(quotes),
+            "alerts_total": total,
+            "by_kind": by_kind,
+            "sources": health,
+            "last_poll_ms": poll_ms,
+            "poll_count": poll_count,
+            "last_poll_ts": last_poll_ts,
+            "watchlist": len(watch),
+            "title": str(self.settings.get("web.title", "A股盘中雷达")),
+            "dry_run": self.settings.dry_run,
+            "replay": self.settings.replay,
+            "subscribers": self.subscriber_count,
+            "notes": notes,
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+    def recent_alerts(self, limit: int = 100, kind: str | None = None) -> list[dict]:
+        try:
+            n = max(1, min(int(limit), 1000))
+        except (TypeError, ValueError):
+            n = 100
+        with self._lock:
+            items = list(self._alerts)
+            acked = set(self._acked)
+        if kind:
+            items = [a for a in items if a.get("kind") == kind]
+        out = []
+        for a in items[:n]:
+            a = dict(a)
+            a["acked"] = a.get("key") in acked
+            out.append(a)
+        return out
+
+    def alerts_total(self) -> int:
+        with self._lock:
+            return self._total
+
+    def ack(self, key: str) -> bool:
+        if not key:
+            return False
+        with self._lock:
+            self._acked.add(str(key))
+            if len(self._acked) > 5000:
+                self._acked = set(list(self._acked)[-2000:])
+        return True
+
+    # --- 行情榜单 -------------------------------------------------------
+    def _quote_item(self, q: Quote, state) -> dict:
+        s1 = s5 = 0.0
+        if state is not None:
+            now_ep = time.time()
+            try:
+                v1 = state.price_change(q.code, 60, now_ep)
+                v5 = state.price_change(q.code, 300, now_ep)
+                s1 = float(v1) if v1 is not None else 0.0
+                s5 = float(v5) if v5 is not None else 0.0
+            except Exception:  # noqa: BLE001
+                pass
+        return {
+            "code": q.code, "name": q.name, "price": round(q.price, 3),
+            "pct": round(q.pct, 2), "speed_1m": round(s1, 2), "speed_5m": round(s5, 2),
+            "volume_ratio": round(q.volume_ratio, 2), "amount": round(q.amount, 0),
+            "turnover": round(q.turnover, 2), "board": q.board.value,
+            "vwap": round(q.vwap, 3), "above_vwap": bool(q.above_vwap),
+            "limit_up": round(q.limit_up_price, 3), "amplitude": round(q.amplitude, 2),
+            "high": round(q.high, 3), "low": round(q.low, 3), "open": round(q.open, 3),
+            "prev_close": round(q.prev_close, 3),
+        }
+
+    def top_quotes(self, limit: int = 30, sort: str = "speed") -> list[dict]:
+        state = self._state()
+        if state is None:
+            return []
+        try:
+            n = max(1, min(int(limit), 200))
+        except (TypeError, ValueError):
+            n = 30
+        key = sort if sort in _SORTS else "speed"
+        quotes = list(getattr(state, "quotes", {}).values())
+        items = [self._quote_item(q, state) for q in quotes if not q.is_suspended]
+        items.sort(key=_SORTS[key])
+        return items[:n]
+
+    def watchlist_quotes(self) -> list[dict]:
+        state = self._state()
+        if state is None or self._engine is None:
+            return []
+        codes = list(getattr(self._engine, "watchlist", []) or [])
+        qmap = getattr(state, "quotes", {})
+        return [self._quote_item(qmap[c], state) for c in codes if c in qmap]
+
+    def series(self, code: str, limit: int = 240) -> list[dict]:
+        with self._lock:
+            buf = self._series.get(code)
+            items = list(buf) if buf else []
+        if limit and limit > 0:
+            items = items[-int(limit):]
+        return items
+
+    def series_codes(self) -> list[str]:
+        with self._lock:
+            return list(self._series_codes)
+
+    # ------------------------------------------------------------------
+    def snapshot_payload(self, top_n: int = 30) -> dict:
+        """SSE tick 事件用的聚合负载。"""
+        return {
+            "status": self.status(),
+            "quotes": self.top_quotes(top_n, "speed"),
+            "watchlist": self.watchlist_quotes(),
+            "ts": datetime.now().strftime("%H:%M:%S"),
+        }

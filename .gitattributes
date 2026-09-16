@@ -1,0 +1,27 @@
+# 统一换行符：仓库内一律 LF，检出到 Windows 时也不转换。
+# 为什么强制：本项目的测试会读取 fixtures/ 里的原始响应样本做字节级比对，
+# 也有一条前端测试把 dashboard.html 的内容与磁盘字节对照。如果 Git 在检出时
+# 把 LF 换成 CRLF，这些比对会莫名失败。
+* text=auto eol=lf
+
+# 二进制文件不要做任何转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.gz binary
+*.zip binary
+
+# 语言与文档
+*.py   text diff=python
+*.md   text
+*.yaml text
+*.yml  text
+*.toml text
+*.html text
+*.js   text
+
+# 告警日志与报告是机器生成的，diff 无意义
+*.jsonl -diff
+data/** -diff

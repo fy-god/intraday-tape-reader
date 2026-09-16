@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 测试与工具缓存
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# 运行时产物：告警日志、soak/benchmark 报告
+# 这些是**本机运行痕迹**，含时间戳，不该进版本库
+data/
+*.jsonl
+*.log
+
+# 审计截图（体积大且是本地渲染结果，需要时用
+# `python tools/audit_dashboard_visual.py` 重新生成）
+tools/audit_shots/
+tools/*_dashboard.png
+tools/*.png
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# 操作系统
+Thumbs.db
+Desktop.ini
+.DS_Store

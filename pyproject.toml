@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "intraday-tape-reader"
+version = "1.0.0"
+description = "盘中短线精灵 — A股盘中实盘急拉急跌预警系统（纯标准库实现）"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# 唯一的第三方依赖是 YAML 解析。行情、HTTP、看板服务、SSE、并发
+# 全部用标准库（urllib / http.server / threading / json），
+# 目的是让这个系统能在任何一台装了 Python 的机器上直接跑起来。
+dependencies = ["PyYAML>=6.0"]
+
+keywords = [
+    "a-share", "stock", "intraday", "realtime", "alert",
+    "tape-reading", "market-monitor", "china-stock-market",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.optional-dependencies]
+# 真浏览器验证（红涨绿跌核对、布局溢出、截图）。核心功能不需要它。
+browser = ["playwright>=1.40"]
+
+[project.urls]
+Homepage = "https://github.com/fy-god/intraday-tape-reader"
+Repository = "https://github.com/fy-god/intraday-tape-reader"
+Issues = "https://github.com/fy-god/intraday-tape-reader/issues"
+
+[project.scripts]
+arad = "arad.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"arad.server" = ["*.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+# 性能测试对机器负载敏感：CPU 被占满时「1000 只 < 200ms」这类断言会偶发失败。
+# 单独重跑可确认（实测空闲时 ~40ms，20 倍余量）。见 README「盘中可用吗」。
+addopts = "-q"
+markers = [
+    "slow: 耗时较长的测试",
+]
