@@ -397,6 +397,17 @@ def test_duplicate_and_prefixed_codes_normalized():
 
 
 def test_chunking_1300_codes_into_3_batches():
+    """1300 只票按 bulk_chunk=600 切成 3 批（600/600/100）。
+
+    ⚠ 断言必须**与批次完成顺序无关**。``RecordingFetcher`` 在锁内 append，
+    所以 ``fetcher.urls`` 的顺序是**线程实际完成的顺序**；源码走
+    ``ThreadPoolExecutor``（默认多 worker），高负载下线程调度错位，
+    完成顺序本来就不保证等于提交顺序 —— 曾实测到 ``[600, 100, 600]``。
+    所以这里比的是**多重集合**（排序后），而不是按下标逐一比对。
+
+    顺序无关的写法并不比原来弱：下面额外校验了「批次不重不漏、合起来正好是
+    全部 1300 只」，比单纯看三个数字更能说明切分是对的。
+    """
     fetcher = RecordingFetcher()
     src = TencentSource({"bulk_chunk": 600, "workers": 4}, fetcher=fetcher)
     codes = [f"{600000 + i:06d}" for i in range(1300)]
@@ -404,10 +415,17 @@ def test_chunking_1300_codes_into_3_batches():
 
     assert quotes == []                                  # fetcher 返回空 body
     assert len(fetcher.urls) == 3                        # 600 + 600 + 100
-    sizes = [len(u.split("=", 1)[1].split(",")) for u in fetcher.urls]
-    assert sizes == [600, 600, 100]
+    batches = [u.split("=", 1)[1].split(",") for u in fetcher.urls]
+    sizes = sorted(len(b) for b in batches)
+    assert sizes == [100, 600, 600]
     assert all(s <= MAX_CHUNK for s in sizes)
     assert all(s <= 600 for s in sizes)
+
+    # 不重不漏：三批并起来正好是输入的 1300 只，且没有一只出现在两个批次里
+    flat = [c for b in batches for c in b]
+    assert len(flat) == len(set(flat)) == 1300
+    assert set(flat) == {f"sh{c}" for c in codes}        # 6 开头 -> sh 前缀
+
     assert src.stats()["chunks"] == 3
     assert src.stats()["requests"] == 3
     assert src.stats()["errors"] == 0

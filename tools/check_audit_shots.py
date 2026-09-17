@@ -78,7 +78,8 @@ def main() -> int:
         print(f"✗ {SHOTS} 里没有 PNG")
         return 1
 
-    print(f"{'文件':<40}{'尺寸':<13}{'色数':>7}{'主色占比':>10}  判定")
+    print(f"{'文件':<40}{'尺寸':<13}{'色数':>7}{'主色占比':>10}"
+          f"{'墨迹行':>7}{'墨迹占比':>8}  判定")
     print("-" * 78)
     bad: list[str] = []
     for p in shots:
@@ -90,13 +91,36 @@ def main() -> int:
             continue
         cnt = Counter(px)
         colors = len(cnt)
-        top_ratio = cnt.most_common(1)[0][1] / max(1, len(px))
-        # 判据：看板截图必然有大量 UI 文字/彩色行 -> 色数多、纯色占比低。
-        # 纯色图（色数 < 10）或近纯色（主色 > 92%）判为可疑。
-        ok = colors >= 50 and top_ratio < 0.92
+        top_color, top_n = cnt.most_common(1)[0]
+        top_ratio = top_n / max(1, len(px))
+
+        # 判据要**尺度不变**。曾经用「主色占比 < 92%」，但那个判据是错的：
+        # `#spiritList` 是滚动容器，局部截图会把**全部可滚动内容**一起截下来，
+        # 而文字只占顶部一小段 —— 一张 420×4604 的图里 81% 高度是合法空白，
+        # 主色占比自然冲到 94%，于是把一张正常截图误判成空白图。
+        # （它一度「变好」只是因为行高从 46.5px 降到 23.2px、图变矮了，
+        #   属于运气，不是判据修好了。）
+        #
+        # 改成数**有内容的行**（ink rows）：一行里只要存在任何一个与主色
+        # （即背景色）不同的像素，这一行就算有内容。空白区域不产生 ink row，
+        # 所以「图很高但内容很少」不再影响判定，而真正的空白图 ink_rows == 0。
+        ink_rows = 0
+        ink_px = 0
+        for y in range(h):
+            row = px[y * w:(y + 1) * w]
+            n = sum(1 for c in row if c != top_color)
+            if n:
+                ink_rows += 1
+                ink_px += n
+        ink_ratio = ink_px / max(1, len(px))
+
+        # 真截图：颜色多、有若干条文字行、有可见墨迹。
+        # 空白/纯色图：颜色极少，或一行墨迹都没有。
+        ok = colors >= 50 and ink_rows >= 3 and ink_ratio >= 0.001
         if not ok:
             bad.append(p.name)
-        print(f"{p.name:<40}{f'{w}x{h}':<13}{colors:>7}{top_ratio:>9.1%}  "
+        print(f"{p.name:<40}{f'{w}x{h}':<13}{colors:>7}{top_ratio:>9.1%}"
+              f"{ink_rows:>7}{ink_ratio:>8.2%}  "
               f"{'✓' if ok else '✗ 疑似空白/纯色'}")
 
     print("\n" + "=" * 78)

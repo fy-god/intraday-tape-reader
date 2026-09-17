@@ -4,9 +4,20 @@ Records RAW payloads into fixtures/raw/ so that parser unit tests can run
 fully offline against ground truth captured from the real endpoints.
 
 Run:  python tools/probe_sources.py
+
+⚠ 这个脚本会**覆盖 fixtures/raw/ 下的样本文件**，而那些文件是 35 处解析器测试
+的基线（tests/ 里 load_raw(...) 的调用点）。覆盖的后果很隐蔽：测试仍然全绿，
+但它们比对的已经不是你 review 过的那份数据了 —— 若实时接口某天改了格式，
+覆盖后测试会「跟着一起改」而不是报错，等于悄悄丢失回归能力。
+
+因此默认**拒绝覆盖已存在的文件**，要求显式 --force。想更新基线时：
+    1. python tools/probe_sources.py --force
+    2. git diff fixtures/    ← 必须人工看一眼差异，确认只是格式微调
+    3. python -m pytest -q   ← 确认解析器仍能应付新格式
 """
 from __future__ import annotations
 
+import argparse
 import concurrent.futures as cf
 import json
 import os
@@ -20,6 +31,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 RAW = ROOT / "fixtures" / "raw"
 RAW.mkdir(parents=True, exist_ok=True)
+
+#: 由 --force 置位。False 时遇到已存在的夹具文件直接报错退出，
+#: 避免"顺手跑一下"就把测试基线洗掉。
+FORCE = False
+
+
+def write_fixture(name: str, data: bytes | str) -> None:
+    """写夹具，默认不覆盖已存在的文件。
+
+    ``name`` 是 fixtures/raw/ 下的文件名；存在且未加 --force 时直接退出 ——
+    宁可让这个脚本失败，也不要静默替换测试基线。
+    """
+    p = RAW / name
+    if p.exists() and not FORCE:
+        sys.exit(
+            f"拒绝覆盖已存在的夹具：fixtures/raw/{name}\n"
+            f"它是解析器测试的基线（tests/ 里 load_raw 的比对对象）。\n"
+            f"确实要更新基线请加 --force，然后务必 git diff fixtures/ 人工核对差异。"
+        )
+    if isinstance(data, str):
+        p.write_text(data, encoding="utf-8")
+    else:
+        p.write_bytes(data)
+
 
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 CTX = ssl.create_default_context()
@@ -103,7 +138,16 @@ def tencent_bulk(codes, chunk=800):
     return out
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
+    global FORCE
+    ap = argparse.ArgumentParser(
+        description="探测行情数据源并把原始响应存成离线夹具",
+        epilog="⚠ 会覆盖 fixtures/raw/ 下的测试基线，需显式 --force")
+    ap.add_argument("--force", action="store_true",
+                    help="允许覆盖已存在的夹具（覆盖后请 git diff fixtures/ 核对）")
+    args = ap.parse_args(argv)
+    FORCE = args.force
+
     print("=" * 78)
     print("A-share source probe")
     print("=" * 78)
@@ -122,7 +166,7 @@ def main() -> int:
             "fid": "f3", "fs": FS_ALL, "fields": EM_FIELDS,
             "ut": "bd1d9ddb04089700cf9c27f6f7426281"})
     )
-    (RAW / "eastmoney_clist_p1.txt").write_bytes(raw_first)
+    write_fixture("eastmoney_clist_p1.txt", raw_first)
 
     prefixed = [
         ("sh" if c.startswith(("6", "9", "5")) else "bj" if c.startswith(("4", "8")) else "sz") + c
@@ -137,7 +181,7 @@ def main() -> int:
         lines = sum(len([x for x in b.split("\n") if x.strip()]) for b in bodies)
         nbytes = sum(len(b) for b in bodies)
         print(f"       tencent lines={lines} bytes={nbytes} wall={time.perf_counter()-t0:.2f}s")
-        (RAW / "tencent_bulk_sample.txt").write_text("\n".join(bodies)[:200000], encoding="utf-8")
+        write_fixture("tencent_bulk_sample.txt", "\n".join(bodies)[:200000])
 
     # --- tencent small batch (watchlist lane)
     timed("tencent bulk 5 codes", lambda: tencent_bulk(["sh600000", "sz000001", "sz300750", "sh688111", "bj430047"], chunk=5))
@@ -156,7 +200,7 @@ def main() -> int:
 
     r = timed("eastmoney ulist.np 5 codes", lambda: em_ulist(["sh600000", "sz000001", "sz300750", "sh688111", "bj430047"]))
     if r:
-        (RAW / "eastmoney_ulist_5.txt").write_text(r, encoding="utf-8")
+        write_fixture("eastmoney_ulist_5.txt", r)
         print("       " + r[:260])
 
     chunk = prefixed[:800]
@@ -175,7 +219,7 @@ def main() -> int:
 
     s = timed("sina bulk 5 codes", lambda: sina_bulk(["sh600000", "sz000001", "sz300750", "sh688111", "bj430047"]))
     if s:
-        (RAW / "sina_bulk_5.txt").write_text(s, encoding="utf-8")
+        write_fixture("sina_bulk_5.txt", s)
         print("       " + s.replace("\n", " | ")[:240])
     s2 = timed("sina bulk 800 codes", lambda: sina_bulk(chunk))
     if s2:
@@ -193,7 +237,7 @@ def main() -> int:
 
     t = timed("eastmoney trends2 1-min bars (600000)", lambda: em_trend("600000"))
     if t:
-        (RAW / "eastmoney_trends2_600000.txt").write_text(t, encoding="utf-8")
+        write_fixture("eastmoney_trends2_600000.txt", t)
         print("       " + t[:260])
 
     # --- persist the universe for offline use
@@ -207,8 +251,8 @@ def main() -> int:
         }
         for r in uni
     ]
-    (RAW / "universe_sample.json").write_text(
-        json.dumps(slim, ensure_ascii=False, indent=1), encoding="utf-8")
+    write_fixture("universe_sample.json",
+                  json.dumps(slim, ensure_ascii=False, indent=1))
     print(f"\nwrote fixtures/raw/ : {sorted(p.name for p in RAW.iterdir())}")
     print("\nDONE")
     return 0
