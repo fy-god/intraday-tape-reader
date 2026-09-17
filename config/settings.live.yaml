@@ -1,0 +1,54 @@
+# =============================================================================
+# 盘中实盘配置（覆盖层）—— 把 33 个短线精灵信号**全开**
+#
+# 用法：
+#     python -m arad.cli serve --config config/settings.live.yaml
+#
+# 为什么单独一个文件、而不是直接改 settings.yaml：
+#   settings.yaml 是**出厂默认**，那三个 spirit_* 模块默认关着是有原因的
+#   （spirit_price 和 tick_surge 都在抓"快速上涨"，一起开会对同一波行情
+#    重复播报）。这个文件是"我现在就要看短线精灵"的显式选择，改它不影响默认值，
+#   也不会让"默认配置为什么是关的"这条设计决策被悄悄抹掉。
+#
+# 本文件只需写要**改**的字段，其余自动继承 settings.yaml / DEFAULTS（深合并）。
+# =============================================================================
+
+app:
+  log_level: "INFO"
+  # 想真收钉钉/飞书/弹窗就改成 false；true 时只打印不真发。
+  dry_run: true
+
+rules:
+  # --- 短线精灵：价格形态类（火箭发射 / 快速反弹 / 高台跳水 / 加速下跌）---
+  spirit_price:
+    enabled: true
+
+  # --- 短线精灵：盘口委托类（大笔买入/卖出、有大买盘、机构买单/吃货…）---
+  # 注意：成交类信号是"相邻两轮外盘增量"的**近似**，不是逐笔（免费数据源限制）。
+  spirit_order:
+    enabled: true
+
+  # --- 短线精灵：指数类（拉升指数 / 打压指数）---
+  # 需要 poll.index_codes，已默认配好 5 个指数（前缀必须带）。
+  spirit_index:
+    enabled: true
+
+  # ⚠ 关键取舍：tick_surge（急拉/急跌）与 spirit_price 的"火箭发射/高台跳水"
+  # 判据高度重叠，两个都开会对同一波行情**报两条**。这里关掉 tick_surge，
+  # 用短线精灵的措辞播报 —— 也就是"同花顺短线精灵那种效果"。
+  # 想换回简洁的"急拉 +3.2% / 1分钟"措辞，就把这条改回 true 并关掉 spirit_price。
+  tick_surge:
+    enabled: false
+
+  # 下面三个与短线精灵不重叠，保持开启
+  limit_board:
+    enabled: true      # 触板 / 封板 / 炸板（状态跃迁）
+  volume_burst:
+    enabled: true      # 放量异动
+  unusual:
+    enabled: true      # 巨震 / 高开低走 / 快速回封等形态
+
+notify:
+  # 盘中先只落文件 + 控制台，避免刷屏轰炸。
+  # 想要弹窗/钉钉就加进 enabled，并把 app.dry_run 改成 false。
+  enabled: ["console", "file"]

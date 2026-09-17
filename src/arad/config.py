@@ -169,17 +169,38 @@ def load_settings(path: str | os.PathLike | None = None, *, use_cache: bool = Tr
     ``use_cache=False`` 表示"要一份**独占**的副本"——既不读缓存，**也不写缓存**。
     只跳过读、仍然回写的话，调用方改一改这份"私有"配置就会污染进程内的共享
     实例（实测：一个测试改了 rules.*.enabled，导致同进程的回放测试全部 0 告警）。
+
+    **``path`` 是覆盖层，不是替换**（自定义配置会**叠加在**默认 settings.yaml 之上）：
+
+        默认 settings.yaml  <-  DEFAULTS（代码兜底）  <-  path（本次指定的文件）
+
+    为什么是叠加而不是替换：``path`` 的典型用途是"我只想改两三个开关"
+    （比如开盘时打开短线精灵），此时**没人会想把 ``poll.index_codes``、
+    ``sources.universe`` 这些没提到的设置一起清空**。早先的实现是直接替换，
+    于是 ``--config config/settings.live.yaml`` 会静默丢掉 ``index_codes``
+    （该键只在 YAML 里、不在 DEFAULTS 里），表现为"spirit_index 明明 enabled
+    却永远不出信号"——一个很难查的静默失效。
+
+    想**完全替换**（不要默认值）就传一个显式的完整配置：叠加语义下，
+    后写的键值总是赢，所以完整配置的行为与替换一致。
     """
     p = Path(path) if path else DEFAULT_SETTINGS
     key = str(p)
     if use_cache and key in _CACHE:
         return _CACHE[key]
-    data: dict[str, Any] = {}
-    if p.exists():
-        with open(p, "r", encoding="utf-8") as fh:
+
+    def _read(fp: Path) -> dict[str, Any]:
+        if not fp.exists():
+            return {}
+        with open(fp, "r", encoding="utf-8") as fh:
             loaded = yaml.safe_load(fh) or {}
-        if isinstance(loaded, dict):
-            data = loaded
+        return loaded if isinstance(loaded, dict) else {}
+
+    # 默认文件先铺底，再叠 DEFAULTS，最后叠调用方指定的覆盖层。
+    # 顺序要紧：覆盖层必须最后应用，否则它会被默认文件里的同名键盖掉。
+    data = _read(DEFAULT_SETTINGS)
+    if p != DEFAULT_SETTINGS:
+        data = _deep_merge(data, _read(p))
     merged = _deep_merge(DEFAULTS, data)
     st = Settings(raw=merged, path=p)
     if use_cache:

@@ -452,7 +452,14 @@ class SpiritOrderRule:
             if hit is not None:
                 out.append(self._mk(
                     q, "institution_eat",
-                    title=f"机构吃货 {hit[0] / 1e4:,.0f}股",
+                    # ⚠ 标题单位用「手」，与同级信号（大笔买入/机构买单/有大买盘…）
+                    # 保持一致，且 ``d_outer`` 本来就是手。
+                    # 这里曾经写的是 ``{hit[0] / 1e4:,.0f}股``：``hit[0]`` 是**股**，
+                    # 除 1e4 之后已经是**万股**了，却仍标「股」——于是 7,000 股
+                    # 被显示成「1股」（差 1 万倍）。实盘日志里真的打出了
+                    # 「机构吃货 1股」却同时写着「成交 7,000 股 / 140.0 万元」。
+                    # 精确值仍在 extra 里（股 + 万元），标题只要量级正确、可扫读。
+                    title=f"机构吃货 {d_outer:,.0f}手",
                     extra=f"本区间主动买入成交 {hit[0]:,.0f} 股 / {buy_amount / 1e4:,.1f} 万元"
                           f"（约 {d_outer:,.0f} 手），命中：{hit[3]}",
                     metrics={"buy_shares": hit[0], "buy_amount": buy_amount,
@@ -466,7 +473,7 @@ class SpiritOrderRule:
             if hit is not None:
                 out.append(self._mk(
                     q, "institution_vomit",
-                    title=f"机构吐货 {hit[0] / 1e4:,.0f}股",
+                    title=f"机构吐货 {d_inner:,.0f}手",
                     extra=f"本区间主动卖出成交 {hit[0]:,.0f} 股 / {sell_amount / 1e4:,.1f} 万元"
                           f"（约 {d_inner:,.0f} 手），命中：{hit[3]}",
                     metrics={"sell_shares": hit[0], "sell_amount": sell_amount,

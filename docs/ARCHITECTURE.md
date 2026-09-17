@@ -184,14 +184,14 @@ if cd > 0.0 and ck:
 
 填了 `cooldown_key` 的规则（`src/arad/rules/*.py` 里搜 `cooldown_key=` 就是全部）：
 
-| 规则 | `cooldown_key` | 冷却（`cooldown_seconds`） |
+| 规则 | `cooldown_key` | 冷却（`cooldown_seconds`，代码默认 / YAML 现值） |
 |---|---|---|
-| `tick_surge` | `f"{code}:{kind.value}"` | 300 |
-| `volume_burst` | `f"{code}:{kind.value}"` | 300 |
-| `unusual` | `f"{code}:{kind.value}:{pattern}"` | 900 |
-| `spirit_price` | `f"{code}:{kind.value}:{pattern}"` | 300 |
-| `spirit_order` | `f"{code}:{kind.value}:{pattern}"` | 300 |
-| `spirit_index` | `f"{code}:{kind.value}:{pattern}"` | 300 |
+| `tick_surge` | `f"{code}:{kind.value}"` | 300 / 300 |
+| `volume_burst` | `f"{code}:{kind.value}"` | 600 / 600 |
+| `unusual` | `f"{code}:{kind.value}:{pattern}"` | 900 / 900 |
+| `spirit_price` | `f"{code}:{kind.value}:{pattern}"` | 300 / 300 |
+| `spirit_order` | `f"{code}:{kind.value}:{pattern}"` | 300 / 300 |
+| `spirit_index` | `f"{code}:{kind.value}:{pattern}"` | 300 / 300 |
 
 `limit_board` 不在这张表里（见 §3.4 末）。
 
@@ -372,9 +372,12 @@ CPU 饱和时单轮从约 1s 膨胀到约 6s。任何"撑得住 / 撑不住"的�
 后者用的是 `limit_up_seal` / `limit_down_seal` / `limit_up_touch` / `limit_down_touch` / `open_limit_up`
 这些**带方向的细分名**（`limit_board._make_seal` / `_make_touch` / `_check_break`）。
 
-注册表 33 个名字里，**31 个**在规则代码里以字符串字面量出现（含 `KIND_FALLBACK` 的 6 个目标）；
+注册表 33 个名字里，**27 个**在 `rules/*.py` 里以字符串字面量出现，放宽到 `spirit.py` 之外
+的全部模块则是 **31 个**（多出来的 4 个是 `surge` / `plunge` / `seal` / `break`，
+它们作为 `replay.py` 的 `KIND_*` 常量出现）。
 `open_limit_down` 与 `touch` 目前**只作为注册表条目存在**：
-`limit_board` 的跌停侧不做撬板口径（见 §3.3），而触板走的是 `limit_up_touch` / `limit_down_touch`。
+`limit_board` 的跌停侧不做撬板口径（见 §3.3），而触板写进 `metrics["pattern"]` 的是
+`limit_up_touch` / `limit_down_touch`。
 它们留在表里是为了语义完整——上游一旦补上撬板口径，展示层不用改。
 
 各规则往 `metrics["pattern"]` 里写的名字有：`limit_board`（封板/触板/炸板）、
@@ -498,19 +501,26 @@ def _finite(v, default=0.0) -> float:
 ### 6.2 SSE 流
 
 `GET /api/stream`，`text/event-stream`，`Cache-Control: no-cache`、`X-Accel-Buffering: no`，
-首帧 `retry: 3000`。事件名是**透传**的（队列里来什么就发什么），当前有三类：
+首帧 `retry: 3000`。事件名是**透传**的（队列里来什么就发什么），当前有五类：
 
 | 事件 | 何时 | 负载 |
 |---|---|---|
 | `alert` | `AlertStore.add_alert()` 时广播 | `Alert.to_dict()` 原样 |
 | `spirit` | 紧跟在 `alert` 之后**自动补发**（`_expand_queue_item`） | `spirit.to_feed_item()` 的展示形状 |
-| `tick` | 每 `web.sse_interval`（默认 2s）心跳 | `{ts, status, quotes, watchlist}` |
 | `phase` | `poll_once` 每轮开头广播 | `{phase}` |
+| `tick` | 每 `web.sse_interval`（默认 2s）心跳 | `{ts, status, quotes, watchlist}` |
 | `bye` | 服务端 shutdown 或 `sse_timeout`（默认 3600s）到期 | `{ts, reason}`，发完**正常结束**该连接，浏览器按 `retry` 自动重连 |
 
-前端只监听 `tick` / `alert` / `spirit`（另有 `message` 兜底分支），其余事件由 `EventSource` 自然忽略
-——所以引擎新增事件类型不需要改 web 层。补发 `spirit` 事件的意义：让精灵面板拿到就能直接画，
+**透传是有意的**：引擎侧新增一类事件，web 层一行都不用改。`tick` 和 `bye` 由 web 层自己造，
+其余来自 `store.broadcast()`。前端显式监听 `tick` / `alert` / `spirit` / `bye` / `message` / `error`
+（`bye` 是空处理——服务端主动收尾，交给 `EventSource` 自动重连；`message` 是兜底，按 `kind`+`key`
+判断该走告警还是榜单分支）。`phase` 之类没有监听器的由 `EventSource` 自然丢弃。
+补发 `spirit` 事件的意义：让精灵面板拿到就能直接画，
 不用在 JS 里重做一遍信号名映射。补发失败绝不影响主事件。
+
+前端另有一条**不依赖 SSE 的失活兜底**：每 2 秒检查距上次消息的间隔，超过 `STALE_MS = 10000`
+就标红顶栏并主动 `refreshAll()` 拉一次 REST。理由是 SSE 可能"连着但不来数据"
+（服务端线程卡住、中间代理吞流），此时 `EventSource` 不会触发 `error`。
 
 两个必须知道的实现细节：
 

@@ -165,3 +165,66 @@ def test_cached_load_returns_same_object():
         assert load_settings() is load_settings()
     finally:
         clear_cache()
+
+
+# ==========================================================================
+# path 参数是"覆盖层"，不是"替换"
+# ==========================================================================
+def test_custom_config_is_an_overlay_not_a_replacement(tmp_path):
+    """传入自定义配置时，**没提到的键必须继承默认 settings.yaml**。
+
+    这曾经是个静默失效：``--config`` 直接**替换**了整个配置，于是
+    ``config/settings.live.yaml``（只想打开几个开关）会把
+    ``poll.index_codes``、``sources.universe`` 一起清空 —— 而这两个键只在
+    YAML 里、不在代码 DEFAULTS 里，补不回来。
+
+    症状是"``spirit_index`` 明明 enabled 却永远不出信号"，
+    因为指数代码列表变成了空。这种"开关是对的、数据是空的"最难查，
+    所以用测试钉住：覆盖层生效 + 未提及的键继承。
+    """
+    from arad.config import clear_cache, load_settings
+
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text(
+        "rules:\n"
+        "  spirit_price:\n"
+        "    enabled: true\n"
+        "app:\n"
+        "  dry_run: false\n",
+        encoding="utf-8")
+
+    clear_cache()
+    try:
+        base = load_settings(use_cache=False)
+        st = load_settings(overlay, use_cache=False)
+
+        # 1) 覆盖层里的键生效
+        assert st.get("rules.spirit_price.enabled") is True
+        assert st.get("app.dry_run") is False
+
+        # 2) 覆盖层**没提到**的键必须继承默认文件（而不是变 None）
+        assert st.get("poll.index_codes") == base.get("poll.index_codes"), \
+            "自定义配置把 poll.index_codes 清空了 —— 覆盖层退化成了替换"
+        assert st.get("poll.index_codes"), "index_codes 不能为空，否则 spirit_index 静默失效"
+        assert st.get("sources.universe") == base.get("sources.universe")
+        assert st.get("poll.universe_seconds") == base.get("poll.universe_seconds")
+
+        # 3) 覆盖层不该反向污染默认配置
+        assert load_settings(use_cache=False).get("rules.spirit_price.enabled") is False, \
+            "加载覆盖层污染了默认配置"
+    finally:
+        clear_cache()
+
+
+def test_overlay_does_not_leak_into_default_settings():
+    """加载覆盖层之后，默认配置必须还是原来那份（开关没被带偏）。"""
+    from arad.config import clear_cache, load_settings
+
+    clear_cache()
+    try:
+        before = load_settings(use_cache=False).get("rules.tick_surge.enabled")
+        load_settings("config/settings.live.yaml", use_cache=False)
+        after = load_settings(use_cache=False).get("rules.tick_surge.enabled")
+        assert before == after, "加载 live 覆盖层后默认配置被改动了"
+    finally:
+        clear_cache()

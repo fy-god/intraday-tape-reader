@@ -411,6 +411,58 @@ def test_institution_eat_by_amount():
     assert "100万元" in a.detail
 
 
+def test_eat_vomit_title_number_matches_its_unit():
+    """标题里的数字必须与它标的单位**量级一致**。
+
+    这是一条真实的显示缺陷：标题原本写
+    ``f"机构吃货 {hit[0] / 1e4:,.0f}股"``，而 ``hit[0]`` 是**股**，
+    除以 1e4 之后已经是**万股**了，却仍标「股」—— 于是 6,000 手（60 万股）
+    在实盘日志里显示成「机构吃货 60股」，配合同一行的
+    「本区间主动买入成交 60 万股 / 140.0 万元」自相矛盾。
+
+    这类缺陷不会让任何测试变红（标题里确实有"机构吃货"四个字），
+    也不会报错，只会让人读到一个差 1 万倍的数字。所以专门钉住：
+    从标题里解析出数字，和 metrics 里的真实股数/手数对照量级。
+    """
+    import re
+
+    r = Rule()
+    # 6,000 手 = 60 万股 > 50 万股 门槛
+    eat = by_pattern(r.ev2(buy_cur(), buy_prev()))["institution_eat"]
+    assert eat.metrics["buy_shares"] == pytest.approx(600_000.0)
+
+    m = re.search(r"机构吃货\s*([\d,]+)\s*(手|万股|股)", eat.title)
+    assert m, f"标题格式变了，解析不到数字+单位：{eat.title!r}"
+    shown, unit = float(m.group(1).replace(",", "")), m.group(2)
+
+    if unit == "手":
+        expected = eat.metrics["buy_shares"] / 100.0      # 1 手 = 100 股
+    elif unit == "万股":
+        expected = eat.metrics["buy_shares"] / 1e4
+    else:                                                  # 裸「股」
+        expected = eat.metrics["buy_shares"]
+
+    assert shown == pytest.approx(expected, rel=0.02), (
+        f"标题说「{shown:,.0f}{unit}」，但真实是 {eat.metrics['buy_shares']:,.0f} 股 "
+        f"（= {eat.metrics['buy_shares'] / 100:,.0f} 手）—— 数字与单位不匹配。"
+        f"标题：{eat.title!r}")
+
+    # 吐货侧同样检查（两侧是复制的代码，容易只修一边）
+    vomit = by_pattern(r.ev2(sell_cur(8_000.0), buy_prev()))["institution_vomit"]
+    assert vomit.metrics["sell_shares"] == pytest.approx(800_000.0)
+    m2 = re.search(r"机构吐货\s*([\d,]+)\s*(手|万股|股)", vomit.title)
+    assert m2, f"标题格式变了：{vomit.title!r}"
+    shown2, unit2 = float(m2.group(1).replace(",", "")), m2.group(2)
+    if unit2 == "手":
+        expected2 = vomit.metrics["sell_shares"] / 100.0
+    elif unit2 == "万股":
+        expected2 = vomit.metrics["sell_shares"] / 1e4
+    else:
+        expected2 = vomit.metrics["sell_shares"]
+    assert shown2 == pytest.approx(expected2, rel=0.02), (
+        f"机构吐货标题数字与单位不匹配：{vomit.title!r}")
+
+
 def test_institution_eat_by_float_pct_alone():
     """把两个绝对量阈值调到不可能达到，只留比例项，证明比例项独立生效。"""
     r = Rule(institution_eat_shares=1e12, institution_eat_amount=1e12)
