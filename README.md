@@ -60,10 +60,17 @@
 ## 快速开始
 
 ```bash
-pip install PyYAML          # 唯一的第三方依赖
+pip install -e .            # 装本项目（唯一的第三方依赖 PyYAML 会一起装上）
 python -m arad.cli selftest # 离线全链路自检，不需要开盘
 python -m arad.cli serve    # 起 Web 看板 -> http://127.0.0.1:8899/
 ```
+
+> 不想装也可以：把 `src/` 加进 `PYTHONPATH` 即可
+> （`$env:PYTHONPATH='src'`，Linux/macOS 用 `PYTHONPATH=src`）。
+> 但**必须**是二者之一——`src/` 布局意味着直接 `python -m arad.cli` 找不到包。
+>
+> 装完还可以直接用 `arad` 这个命令（等价于 `python -m arad.cli`）：
+> `arad selftest` / `arad serve` / `arad check`。
 
 看板长这样：左边是**短线精灵**滚动列表（新行从顶部插入，红涨绿跌），下面是告警流，
 右边是行情表。带分组筛选按钮：全部 / 价格异动 / 盘口委托 / 涨跌停 / 指数 / 形态。

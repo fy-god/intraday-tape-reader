@@ -605,8 +605,10 @@ def clear_cache() -> None: ...
 只跳过读、仍然回写的话，调用方改一改这份"私有"配置就会污染进程内的共享实例。
 实测过一次：一个测试改了 `rules.*.enabled`，导致同进程的回放测试全部 0 告警。
 
-需要独占副本的地方：`tools/bench_round.py`、`tools/probe_live_ready.py`、
-`tools/live_session.py` 都要把三个 `spirit_*` 模块临时打开，必须绕开缓存。
+需要独占副本的地方：`tools/bench_round.py`、`tools/live_session.py`、`tools/probe_live_ready.py`、
+`tools/audit_dashboard_visual.py`、`tools/measure_spirit_density.py`、`tools/probe_session_boundaries.py`
+以及 `tests/test_engine.py` 等——它们都要临时改配置（把三个 `spirit_*` 模块打开、换股票池、
+改时段），必须绕开缓存。凡是"我要改这份配置"的调用方，都必须写 `use_cache=False`。
 
 ### 7.2 "孤立键"纪律
 
