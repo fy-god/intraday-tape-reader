@@ -238,6 +238,23 @@ def test_rebound_after_drop():
     assert out[0].metrics["window_pct"] < 0, "窗口涨跌幅确实是负的"
     assert out[0].metrics["signal_pct"] > 0, "但信号强度（自低点拉起）是正的"
 
+    # ⚠ 标题必须印**信号强度**（正），不能印窗口涨跌幅（负）。
+    # 这是一条真实的用户可见缺陷：旧代码的标题取的是 window_pct，
+    # 于是这里会显示「快速反弹 -1.00%」—— 一个叫"反弹"的信号带着负数，
+    # 读起来完全相反。更极端的例子是现价恰好涨回窗口起点时，
+    # 自低点已拉起 5%（severity 3，会弹窗），标题却是「快速反弹 +0.00%」。
+    #
+    # 上面两行断言只验证了 metrics 里两个数一正一负（旧代码也通过），
+    # 所以这个缺陷在测试里潜伏了很久 —— 必须直接盯标题。
+    title_pct = out[0].title.replace("快速反弹", "").strip()
+    assert title_pct.startswith("+"), (
+        f"「快速反弹」的标题不应是负数或零，实际是 {out[0].title!r}；"
+        f"窗口涨跌幅 {out[0].metrics['window_pct']} 与信号强度 "
+        f"{out[0].metrics['signal_pct']} 是两个量，标题要印后者")
+    assert f"{out[0].metrics['signal_pct']:.2f}" in title_pct, (
+        f"标题 {out[0].title!r} 里的数字与分级依据 signal_pct "
+        f"{out[0].metrics['signal_pct']} 对不上")
+
 
 def test_rebound_counterexample_no_prior_drop():
     """一路上涨（没先跌过）-> 不是反弹，是火箭发射。"""

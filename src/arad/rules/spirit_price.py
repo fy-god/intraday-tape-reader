@@ -356,6 +356,20 @@ class SpiritPriceRule:
             severity = 3
 
         actual = change if window_pct is None else window_pct
+        # ⚠ 标题必须印 **change（信号强度）**，不是 window_pct（窗口涨跌幅）。
+        # 这两个量在 rebound/dive 上语义不同：rebound 的 change 是"自低点拉起"、
+        # dive 的 change 是"自峰值回落"，而 window_pct 是窗口首点到现价的涨跌。
+        # 分级（上面的 severity）看的是 change，所以标题也必须看 change ——
+        # 否则会出现"分级说它紧急、标题却显示 0.00%"这种自相矛盾：
+        #   实测：窗口 10.50 -> 低点 10.00 -> 现价 10.50
+        #   自低点拉起 +5.00%（=> severity 3，会弹窗），
+        #   而窗口涨跌幅 0.00% —— 旧代码标题就打「快速反弹 +0.00%」。
+        # 更糟的是现价仍低于窗口起点时，标题会印出**负数**（如 -0.95%），
+        # 而信号名却叫「快速反弹」，读起来完全相反。
+        #
+        # window_pct 并没有丢：detail 第一行明确标着"窗口 N分钟 xx%"，
+        # 那里才是它该出现的地方（标签与数值口径一致）。
+        strength = change
         detail = "\n".join([
             f"{cn} · 现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  "
             f"窗口 {self._fmt_s(seconds)} {fmt_pct(actual)}",
@@ -367,7 +381,7 @@ class SpiritPriceRule:
             key=f"{q.code}:{kind.value}:{pattern}:{bucket}",
             kind=kind, code=q.code, name=q.name, ts=now,
             price=q.price, pct=q.pct,
-            title=f"{cn} {fmt_pct(actual)}", detail=detail, severity=severity,
+            title=f"{cn} {fmt_pct(strength)}", detail=detail, severity=severity,
             cooldown_key=f"{q.code}:{kind.value}:{pattern}",
             cooldown_seconds=self.cooldown,
             metrics={
