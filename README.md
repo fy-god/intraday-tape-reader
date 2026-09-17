@@ -68,6 +68,14 @@ python -m arad.cli serve    # 起 Web 看板 -> http://127.0.0.1:8899/
 看板长这样：左边是**短线精灵**滚动列表（新行从顶部插入，红涨绿跌），下面是告警流，
 右边是行情表。带分组筛选按钮：全部 / 价格异动 / 盘口委托 / 涨跌停 / 指数 / 形态。
 
+每条精灵一行显示 6 列：`时间 代码 名称 信号 现价 涨跌幅`，行高 **23px**，
+一屏约 10 条——这个密度是刻意的。短线精灵的价值全在**信息密度**：一眼扫过去能看多少条
+异动，决定了它有没有用。所以布局是横向铺开而不是上下堆叠。
+
+> 这里踩过坑：CSS 只声明了 5 列却有 6 个格子（漏了涨跌幅），CSS Grid 把第 6 个自动换到
+> 第二行，行高从 23px 变成 **46.5px**，一屏从 10 条掉到 5 条。不报错、测试不红、截图乍看
+> 也正常，只是密度腰斩。现在有 `tests/test_dashboard_frontend.py` 盯着列数与格子数必须相等。
+
 盘中用之前：
 
 ```bash
@@ -179,22 +187,52 @@ src/arad/
 ## 验证
 
 ```bash
-python -m pytest -q                  # 1026 项，全离线
+python -m pytest -q                  # 1029 项，全离线
 python -m arad.cli selftest          # 全链路自检（植入剧本，随时可跑）
 ```
 
-系统只在开盘时段告警，而开发往往在收盘后。所以验证分两类：
+系统只在开盘时段告警，而开发往往在收盘后。所以验证**离线优先**：
 
-**离线**（任何时候都能跑，确定性）：
 `selftest` 用合成行情驱动**真实引擎**跑完整个交易日，并刻意植入急拉/急跌/封板/炸板
-等剧本。还有真浏览器验证（Playwright）：CSS 是否生效、布局是否溢出、SSE 新告警是否
-自动冒到顶部、以及 **10 个信号的红涨绿跌逐个核对**（`打开涨停` 必须是绿的、
-`打开跌停` 必须是红的——这两个最容易搞反）。
+等剧本——确定性、可重复、不需要开盘。另有真浏览器（Playwright）验证：红涨绿跌逐个
+核对（`打开涨停` 必须绿、`打开跌停` 必须红）、布局是否溢出、滚动列表的信息密度。
 
-**联网**（回答"盘中能不能用"）：
-`tools/bench_round.py` 测全市场规模的真实耗时；`tools/live_session.py` 做限时
-实盘 soak（跑 N 分钟，检查抓取失败率、看板接口健康状况、SSE 是否断流、内存是否有界，
-最后给明确结论）。
+### 工具清单
+
+**离线自检**（不需要网络，随时可跑）
+
+| 工具 | 用途 |
+|---|---|
+| `python -m arad.cli selftest` | 全链路自检，植入剧本跑完一整天 |
+| `check_spirit_mapping.py` | 33 个信号在展示层是否都有名字（漏一个会静默降级成兜底名） |
+| `check_config_wiring.py` | 配置键是否真被读到（含 `max_per_round=0` 是否保持"不限量"） |
+| `check_orphan_config.py` | 找出 `settings.yaml` 里**写了但代码从不读**的键 |
+| `probe_session_boundaries.py` | 假时钟走一遍开盘/午休/收盘边界 |
+| `dash_render_check.js` | Node 执行看板真实 JS，验渲染/去重/DOM 上限（无需浏览器） |
+| `check_audit_shots.py` | 校验审计截图是真渲染内容而非空白图 |
+
+**真浏览器**（需 Playwright + Chromium）
+
+| 工具 | 用途 |
+|---|---|
+| `audit_dashboard_visual.py` | **68 项**视觉/交互审计：信息密度、4 种分辨率布局、红涨绿跌、筛选、对比度、色盲载体 |
+| `shot_browser.py` | 打开看板截图 + 关键断言 |
+| `check_colors.py` | 10 个信号的红涨绿跌逐个核对 |
+| `shot_dashboard.py` / `shot_spirit.py` / `shot_index.py` | 起真服务 + 回放数据截图 |
+
+**联网**（回答"盘中能不能用"）
+
+| 工具 | 用途 |
+|---|---|
+| `bench_round.py` | 全市场规模真实耗时 + 线性度（`--offline` 只测纯 CPU 成本） |
+| `probe_live_ready.py` | 盘中可用性总检：股票池、单轮耗时、五档/内外盘可用率 |
+| `live_session.py` | 限时实盘 soak：抓取失败率、看板健康、SSE 断流、内存有界，给出结论 |
+| `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
+| `probe_sources.py` / `verify_tencent_fields.py` | 数据源连通性与字段布局核对 |
+| `probe_index_codes.py` / `probe_index_live.py` | 指数前缀与实时行情（`sh000001` ≠ `000001`） |
+
+> `probe_*` 只做观测并打印结果，`check_*` 会给出断言式的 ✓/✗ 并通过退出码表态——
+> 想接 CI 就用 `check_*`。
 
 ---
 

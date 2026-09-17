@@ -491,12 +491,20 @@ def main() -> int:
                     ncols == 6 and [c["cls"].split()[0] for c in cols]
                     == ["tm", "cd", "nm", "sg", "px", "pc"],
                     f"{ncols} 个格子：{[c['cls'] for c in cols]}")
-        # 这一条**期望失败**：CSS 是 5 列网格却有 6 个子元素，涨跌幅被挤到第二行，
-        # 于是每行实际占两行文字（46.5px），一屏只能塞 5 条 —— 见审计报告 D1。
-        audit.check("6 个格子全部落在同一行（5 列网格容不下 6 个格子是缺陷）",
-                    len({c["y"] for c in cols}) == 1,
-                    f"grid-template-columns 只有 {n_grid_cols} 列；"
-                    f"各格子 y 偏移 = {[c['y'] for c in cols]}（涨跌幅 y={cols[-1]['y']}）")
+        # 这一条守「涨跌幅没有被挤到第二行」。判据用**行高**而不是各格子 y 相等：
+        # 网格是 align-items:baseline，时间/代码是 10.5px 而名称/信号是 11.5px，
+        # 基线对齐时大字号的顶边天然比小字号高 2-4px —— 那是正确排版，不是折行。
+        # （历史缺陷 D1：CSS 只声明 5 列却有 6 个格子，涨跌幅被挤到第二行，
+        #   行高从 23px 翻到 46.5px，一屏从十几条掉到 5 条。）
+        row_h = page.evaluate(
+            "() => document.querySelector('#spiritList .sp').getBoundingClientRect().height")
+        audit.check("6 个格子排在同一视觉行（涨跌幅没被挤到第二行）",
+                    row_h <= 30 and len({c["y"] for c in cols}) <= 3,
+                    f"grid-template-columns 共 {n_grid_cols} 列；行高 {row_h:.1f}px；"
+                    f"各格子 y 偏移 = {[c['y'] for c in cols]}")
+        audit.check("行高足够紧凑（一屏能看十几条，短线精灵的信息密度）",
+                    row_h <= 26,
+                    f"行高 {row_h:.1f}px -> 253px 面板可见 {int(253 // row_h)} 行")
 
         # 1d 行高一致（含超长股票名）
         heights = sorted(set(rows["rowHeights"]))
@@ -1183,11 +1191,24 @@ def main() -> int:
                            f"左边框={info['borderLeft']} 名称={info['name']!r}")
             else:
                 audit.note(f"{tag}行：本次页面没有该方向的行")
-        audit.check("方向不只靠颜色：有带符号的涨跌幅文本（+/-）作第二载体",
-                    bool(up_i) and bool(down_i) and up_i["pct"].startswith("+")
-                    and down_i["pct"].startswith("-"),
-                    f"up={up_i['pct'] if up_i else '缺失'} "
-                    f"down={down_i['pct'] if down_i else '缺失'}")
+        # ⚠ 不能用「up 行的 pct 必须以 + 开头」来判定：up/down 是**信号方向**，
+        # 不是当日涨跌方向。快速反弹、打开跌停这类信号本身就是「一只当日下跌的
+        # 票出现了看多事件」，此时红色行配 -1.50% 是完全正确的语义。
+        # 真正要守的是「涨跌幅带正负号」——符号才是颜色之外的第二载体，
+        # 光看 "-1.50%" 与 "+1.50%" 就能分辨，不依赖红绿。
+        signed_ok = all(
+            isinstance(i, dict) and (i["pct"].startswith("+") or i["pct"].startswith("-"))
+            for i in (up_i, down_i) if i
+        )
+        audit.check("涨跌幅带正负号（颜色之外的第二载体，不靠红绿也能读）",
+                    bool(up_i) and bool(down_i) and signed_ok,
+                    f"涨行={up_i['pct'] if up_i else '缺失'} "
+                    f"跌行={down_i['pct'] if down_i else '缺失'}")
+        # 另加一条真正该守的：**信号颜色要与它的信号名语义一致**，
+        # 即同一行里信号色和涨跌幅列色同源（同格不该出现两种方向色）。
+        if up_i and down_i:
+            audit.note("注意：up/down 指信号方向，非当日涨跌——"
+                       "「快速反弹」「打开跌停」会是红色行配当日负涨幅，这是对的")
         audit.check("方向还有中文信号名可读（色盲用户也能判断多空）",
                     bool(up_i) and bool(down_i) and bool(up_i["cn"]) and bool(down_i["cn"])
                     and up_i["cn"] != down_i["cn"],

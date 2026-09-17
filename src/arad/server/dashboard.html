@@ -8,7 +8,7 @@
 <style>
 :root{
   --bg:#0b0e13; --bg2:#11151d; --bg3:#161b25; --line:#232a37; --line2:#2d3648;
-  --fg:#dfe6f2; --fg2:#8b98ae; --fg3:#5d6a80;
+  --fg:#dfe6f2; --fg2:#8b98ae; --fg3:#75849e;
   --up:#ff4d4f; --down:#12c46a; --flat:#8b98ae;
   --k-surge:#ff4d4f; --k-plunge:#12c46a; --k-limitup:#ffcc33;
   --k-limitdown:#22d3ee; --k-vol:#a855f7; --k-unusual:#8593a8;
@@ -67,6 +67,13 @@ body{
 .grid{
   flex:1 1 auto;display:grid;gap:1px;background:var(--line);min-height:0;
   grid-template-columns:minmax(420px,30fr) minmax(520px,44fr) minmax(268px,26fr);
+}
+/* 窄屏（<1140px）降级：三栏 min-width 合计 1208px，硬撑会横向溢出 ~186px，
+   最右侧「自选股」列被切掉一截。这里改成两栏——自选股换到第二行整行铺开，
+   宁可上下排也不要横向滚动条（横向滚动会连带把左侧短线精灵一起推出视野）。 */
+@media (max-width:1140px){
+  .grid{grid-template-columns:minmax(360px,42fr) minmax(0,58fr);}
+  .grid>.wide{grid-column:1 / -1;}
 }
 .col{
   display:flex;flex-direction:column;gap:1px;background:var(--line);
@@ -161,8 +168,14 @@ tr.chartRow td{padding:0;background:#0d1119;border-bottom:1px solid var(--line2)
 .tag{font-size:10px;padding:0 4px;border-radius:2px;border:1px solid var(--line2);color:var(--fg3)}
 
 /* ---------------- 短线精灵（滚动播报） ---------------- */
+/* 6 列对 6 个格子：时间 / 代码 / 名称 / 信号 / 现价 / 涨跌幅。
+   ⚠ 这里曾只声明 5 列却有 6 个格子（漏了「涨跌幅」一列），CSS Grid 会把第 6 个
+   自动换到第二行 —— 每行变成 46.5px 的**两行**，一屏只能显示 5 条，而真实的
+   短线精灵一屏十几条。滚动列表的价值就在信息密度，行高一翻倍观感就完全不对了。
+   信号名给固定 60px 而不是 auto：遇到超长信号名要**截断**，不能让 auto 撑开
+   把名称列挤没（测试里用超长中文名钉住了这条）。 */
 .sp{
-  display:grid;grid-template-columns:50px 54px minmax(0,1fr) 54px 54px;gap:6px;
+  display:grid;grid-template-columns:46px 52px minmax(0,1fr) 60px 50px 50px;gap:6px;
   align-items:baseline;padding:2px 9px;border-bottom:1px solid #161c26;
   font-size:11.5px;line-height:1.5;white-space:nowrap;
 }
@@ -197,10 +210,18 @@ tr.chartRow td{padding:0;background:#0d1119;border-bottom:1px solid var(--line2)
    精灵稳稳拿到 306px，剩余空间全给告警流。 */
 #spiritPanel{flex:0 0 306px;min-height:118px}
 #alertsPanel{flex:1 1 0;min-height:118px}
-.spfilters{display:flex;gap:4px;flex-wrap:wrap}
+/* 6 个分组按钮必须**排在同一行**。原来只有 flex-wrap:wrap，左栏窄的时候
+   （420px）按钮会折成两行，表头从 31px 涨到 53px —— 白吃掉 22px 高度，
+   而这块面板是定高 306px 的，等于少显示一整条精灵。
+   改法：给容器 flex:1 1 auto + min-width:0（否则 flex 项的最小尺寸默认是
+   auto=内容宽度，根本不让收缩，于是折行），再 nowrap + overflow:hidden 兜底；
+   按钮本身也略收紧内边距与字号，实测 6 个合计 ~230px，420px 下富余。 */
+.spfilters{display:flex;gap:4px;flex:1 1 auto;min-width:0;
+  flex-wrap:nowrap;overflow:hidden}
 .sfbtn{
   background:transparent;border:1px solid var(--line2);color:var(--fg2);border-radius:3px;
-  font-size:11px;padding:1px 6px;cursor:pointer;font-family:inherit;
+  font-size:10.5px;padding:1px 5px;cursor:pointer;font-family:inherit;
+  white-space:nowrap;flex:0 0 auto;
 }
 .sfbtn.on{color:#fff;border-color:#5b6b8c;background:#222b3b}
 
@@ -304,7 +325,7 @@ tr.chartRow td{padding:0;background:#0d1119;border-bottom:1px solid var(--line2)
     </section>
 
     <!-- 右：自选股 -->
-    <section class="panel" id="wlPanel">
+    <section class="panel wide" id="wlPanel">
       <div class="phead">
         <span class="ptitle">自选股</span>
         <span class="pmeta" id="wlMeta">0 只</span>
