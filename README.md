@@ -304,6 +304,8 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `bench_round.py` | 全市场规模真实耗时 + 线性度（`--offline` 只测纯 CPU 成本） |
 | `probe_live_ready.py` | 盘中可用性总检：股票池、单轮耗时、五档/内外盘可用率 |
 | `live_session.py` | 限时实盘 soak：抓取失败率、看板健康、SSE 断流、内存有界，给出结论 |
+| `probe_memory_day.py` | 把**一整天**压进十几秒跑完，量内存是收敛还是泄漏（见 `docs/MEMORY_AUDIT.md`） |
+| `probe_history_bound.py` | 验引擎侧 `state.history` 单只受 maxlen 约束、键数靠 `prune` 收敛 |
 | `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
 | `probe_sources.py` | 逐端点探数据源；东财被限流时**自动降级到新浪**继续探 |
 | `probe_spirit_fields.py` | 验腾讯源的盘口/内外盘字段真实可用（内外盘之和 ≈ 成交量） |
@@ -312,7 +314,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 > `probe_*` 只做观测并打印结果，`check_*` 会给出断言式的 ✓/✗ 并通过退出码表态——
 > 想接 CI 就用 `check_*`。
 
-两份审计报告（都是对**本项目自己**的审计，不是宣传）：
+四份审计报告（都是对**本项目自己**的审计，不是宣传）：
 
 * `docs/ARCHITECTURE.md` —— **代码地图**：一轮引擎从抓行情到上屏经过哪些模块、
   两层去重为什么需要两层、事件型与状态型的区别。想改代码先看这份。
@@ -321,6 +323,8 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 * `docs/TOOLS_AUDIT.md` —— 22 个 `tools/` 脚本逐个实跑审计，
   含 5 条已修问题（覆盖测试基线、`--help` 崩溃、并发竞态、判据非尺度不变、
   前缀判定抄了一份副本导致北交所 344 只被静默丢弃）。
+* `docs/MEMORY_AUDIT.md` —— 长跑内存：把一整天压进十几秒，证明内存**收敛**而非
+  泄漏（现实负载约 44 MB），并记录一个"配置键声明了但没人读"的真缺陷。
 
 ---
 

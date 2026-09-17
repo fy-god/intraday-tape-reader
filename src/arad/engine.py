@@ -348,7 +348,15 @@ class Engine:
         self.state = EngineState(
             history_len=int(self.settings.get("poll.history_len", 360) or 360))
         self.bus = AlertBus(self.state)
-        self.store = store if store is not None else AlertStore(self.settings, calendar=self.calendar)
+        # ⚠ ``series_len`` 必须显式传进去：``AlertStore.__init__`` 的默认值是
+        # 硬编码的 240，它**不会**自己去读 settings。早先这里只写了
+        # ``AlertStore(self.settings, ...)``，于是 ``storage.series_len``
+        # 这个配置键被静默忽略 —— 改了配置没有任何效果，也没有任何报错。
+        # ``or 240`` 是为了让 YAML 里的 ``series_len:``（空值 -> None）回落到默认，
+        # 注意 0 会被 ``or`` 吃掉，但 0 不是合法值（``max(0, 2)`` 也不合理）。
+        self.store = store if store is not None else AlertStore(
+            self.settings, calendar=self.calendar,
+            series_len=int(self.settings.get("storage.series_len", 240) or 240))
         self.store.attach(self)
         self.log = logger or log
 

@@ -228,3 +228,41 @@ def test_overlay_does_not_leak_into_default_settings():
         assert before == after, "加载 live 覆盖层后默认配置被改动了"
     finally:
         clear_cache()
+
+
+# ==========================================================================
+# 配置键必须真的被消费（"声明了但没人读"是静默失效）
+# ==========================================================================
+def test_storage_series_len_actually_reaches_the_store():
+    """``storage.series_len`` 必须真的传到 AlertStore。
+
+    这是一个真实的静默失效：``AlertStore.__init__`` 的 ``series_len`` 有
+    硬编码默认值 240，它**不会**自己去看 settings。而 engine 里原本写的是
+    ``AlertStore(self.settings, calendar=...)`` —— 少传了这一个参数，
+    于是 YAML 里改 ``storage.series_len`` 完全没有效果，也不报错。
+
+    为什么危险：这个键是**内存开关**。全市场 5563 只都记分时约 412 MB，
+    调小它是降内存最直接的手段；一个"改了没反应"的键会让人以为已经生效，
+    然后在长跑里被内存问题咬到（实测一天 2880 轮，内存会爬到稳定值）。
+
+    ``check_orphan_config.py`` 抓不到它：那个检查只确认键名作为字符串
+    字面量存在过，而 ``"series_len"`` 确实出现在 store.py 的 DEFAULTS 里。
+    "名字存在"不等于"接线正确"。
+    """
+    from arad.config import clear_cache, load_settings
+    from arad.engine import Engine
+
+    clear_cache()
+    try:
+        st = load_settings(use_cache=False)
+        st.raw.setdefault("storage", {})["series_len"] = 7
+        eng = Engine(None, settings=st)
+        assert eng.store._series_len == 7, (
+            f"storage.series_len=7 没传到 AlertStore，"
+            f"实际是 {eng.store._series_len}（配置被静默忽略）")
+
+        # 默认值也要对
+        st2 = load_settings(use_cache=False)
+        assert Engine(None, settings=st2).store._series_len == 240
+    finally:
+        clear_cache()
