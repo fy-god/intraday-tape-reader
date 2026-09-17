@@ -182,8 +182,18 @@ if cd > 0.0 and ck:
 `cooldown_seconds` 是真实经过时间。两者都在 `Alert` 上（`models.py:337` / `models.py:344`），
 由规则在 `_mk` / `_make_alert` 里填写——**每条声明了冷却的告警都必须填，否则只有第一层保护**。
 
-已填写的规则：`tick_surge`（`f"{code}:{kind}"`）、`volume_burst`（`f"{code}:{kind}"`）、
-`unusual` / `spirit_price` / `spirit_order` / `spirit_index`（都带 `pattern` 分段）。
+填了 `cooldown_key` 的规则（`src/arad/rules/*.py` 里搜 `cooldown_key=` 就是全部）：
+
+| 规则 | `cooldown_key` | 冷却（`cooldown_seconds`） |
+|---|---|---|
+| `tick_surge` | `f"{code}:{kind.value}"` | 300 |
+| `volume_burst` | `f"{code}:{kind.value}"` | 300 |
+| `unusual` | `f"{code}:{kind.value}:{pattern}"` | 900 |
+| `spirit_price` | `f"{code}:{kind.value}:{pattern}"` | 300 |
+| `spirit_order` | `f"{code}:{kind.value}:{pattern}"` | 300 |
+| `spirit_index` | `f"{code}:{kind.value}:{pattern}"` | 300 |
+
+`limit_board` 不在这张表里（见 §3.4 末）。
 
 ### 3.3 事件型 vs 状态型
 
@@ -233,8 +243,15 @@ key=f"{code}:{_KIND.value}:{pattern}:{bucket}"           # unusual._mk / spirit_
 （`key=f"{q.code}:{kind.value}:seal:{bucket}"` 等），因为同一只票同一轮可能同时产出
 "曾涨停后炸板"和"现封跌停"两个方向的告警，天地板两个方向是独立事件，**不能先到先得互相遮蔽**。
 
-对应地，`cooldown_key` 也要带 `pattern` 分段（`f"{code}:{kind}:{pattern}"`），否则封涨停和
-触涨停会共用一条冷却记录。
+对应地，凡是**填了 `cooldown_key`** 的规则都把它写成带 `pattern` 分段的形式
+（`f"{code}:{kind}:{pattern}"`），否则封涨停和触涨停会共用一条冷却记录。
+
+`limit_board` 是唯一的例外：它**不填 `cooldown_key`**，只靠 `bucket_of(now_ep, cooldown)`
+分桶。这是安全的——它同一只票同一方向同时只可能处于一个阶段（`sealed` / `broken` / `near`），
+阶段之间由状态机互斥，不存在"同一桶内两个信号撞 key"的情形；而重复上报已被状态机本身挡掉。
+`key` 里的阶段分段（`seal` / `touch` / `break`）仍然必要，因为**涨停侧和跌停侧会同时活跃**
+（天地板），两条告警的 `kind` 不同、本来就不撞，但 `seal` / `touch` / `break` 三段必须在同一
+`kind` 下互相区分（`limit_up` 既可能封板也可能触板）。
 
 ---
 
@@ -670,7 +687,9 @@ python -m arad.cli replay --out data/replay_alerts.jsonl
 
 关键设计：
 
-* **确定性**：随机数一律走 `random.Random(seed)`，绝不碰全局 `random`；同 seed + 同参数字节级可复现。
+* **确定性**：随机数一律走 `random.Random(seed)`，绝不碰全局 `random`
+  （`tests/test_replay_cli.py::test_replay_does_not_mutate_global_random` 钉住这一条）。
+  **同一进程内**同 seed + 同参数完全可复现。
 * **几何游走**：价格按**等比**变动。等价差路径的百分比涨幅会随基数增大而衰减
   （10.0→10.25 是 +2.5%，10.25→10.5 只有 +2.44%），会让"加速度"类规则产生非预期结果。
 * **刻意植入剧本**：`default_universe()` 给每只票指定一个 `script`
@@ -680,15 +699,27 @@ python -m arad.cli replay --out data/replay_alerts.jsonl
 * `Replay.run()` 直接给 `engine._codes` 赋值（赋值即 pin）并把 `_universe_refreshed_at` 设为 `inf`，
   跳过全市场抓取——否则离线测试会变成依赖网络、且结果随机。
 
-实测（`python -m arad.cli selftest`，默认 seed=42 / 30 只）：
+> **跨进程的字节级可复现有一个已知破口**：`generate_script()` 给每只票的 RNG 播种时把
+> `hash(s.code) % 2**31` 混进了种子（`replay.py:374`）。`str` 的 `hash()` 受
+> `PYTHONHASHSEED` 影响、每个进程都不同，所以**换一个进程重跑，同一只票的行情路径会变**：
+> 实测 `selftest` 三次分别得到 69 / 70 / 71 条告警，`plunge` 在 12~14 之间浮动；
+> 设 `PYTHONHASHSEED=0` 后三次完全一致。
+> 这不影响任何测试——`test_replay_is_deterministic` 比的是同进程内的两次 `run()`，
+> 而告警类型与剧本命中都不依赖精确条数。但**不要**把某一次的告警条数当成回归基线写进断言，
+> 也**不要**用它比较两台机器的输出。
+
+实测（`python -m arad.cli selftest`，默认 seed=42 / 30 只 / 全天 962 轮）：
 
 ```text
-回放完成：962 轮 / 962 tick，耗时 2607 ms，共 70 条告警
-按类型：limit_down 3 条，limit_up 13 条，plunge 14 条，surge 19 条，unusual 16 条，volume_burst 5 条
+回放完成：962 轮 / 962 tick，耗时 2416 ms，共 70 条告警
+按类型：limit_down 3 条，limit_up 13 条，plunge 13 条，surge 20 条，unusual 16 条，volume_burst 5 条
+  ✓ 涨停炸板     应报 3 只 / 实报 3 只
+  …（8 个剧本全部命中）
 [✓] 全链路正常：70 条告警，覆盖 6 种类型，全部剧本命中
 ```
 
-`cmd_selftest` 的判据不只是"有告警"：`result.total > 0`、`result.ticks > 0`、
+条数会随 `PYTHONHASHSEED` 略有浮动（见上文），但 `limit_up` / `limit_down` 恒为 13 / 3，
+八个剧本每次全中。`cmd_selftest` 判的是后者，不是条数：`result.total > 0`、`result.ticks > 0`、
 `missed()` 为空、且 `surge` / `plunge` / `limit_up` / `limit_down` 四种类型**必须真的出现**。
 
 ### 8.2 fixture 解析测试：基准受保护
