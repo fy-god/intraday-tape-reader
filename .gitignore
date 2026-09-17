@@ -24,6 +24,19 @@ data/
 *.jsonl
 *.log
 
+# 临时/一次性文件：审计或排查时随手重定向出来的输出、改造前的备份
+# （真的发生过：一个 `.baseline_pytest.txt` 被误提交进仓库，里面是 pytest 的点号）
+# ⚠ 只忽略**根目录**下的 .txt，不能写 `*.txt` —— 那会连
+#   config/holidays.txt 和 fixtures/raw/*.txt 一起误伤（它们是被跟踪的测试夹具/配置）。
+/*.txt
+# 但 requirements.txt 是正经交付物，得放行（否则将来有人导出依赖时会被静默忽略）
+!/requirements.txt
+*.bak
+*.orig
+*.rej
+*.tmp
+*~
+
 # 审计截图（体积大且是本地渲染结果，需要时用
 # `python tools/audit_dashboard_visual.py` 重新生成）
 tools/audit_shots/
