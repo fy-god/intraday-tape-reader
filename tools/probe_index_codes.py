@@ -1,4 +1,17 @@
 """验证指数代码与前缀的冲突：同一个 6 位码在不同前缀下是不同标的。"""
+
+# Windows 控制台 UTF-8（见 tools/_console.py）。
+# 先正常导入；若失败说明本文件是被**按路径**加载的（例如测试用 importlib
+# 从 tests/ 里 exec 它），此时 tools/ 不在 sys.path 上——把本文件所在目录
+# 补进去再试一次，这样"直接跑"和"被当模块加载"两种场景都能用。
+try:
+    import _console  # noqa: F401,E402
+except ImportError:  # pragma: no cover - 取决于调用方式
+    import sys as _sys
+    from pathlib import Path as _Path
+
+    _sys.path.insert(0, str(_Path(__file__).resolve().parent))
+    import _console  # noqa: F401,E402
 import sys
 import urllib.request
 

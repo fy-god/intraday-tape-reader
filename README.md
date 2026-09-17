@@ -284,7 +284,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `check_orphan_config.py` | 找出 `settings.yaml` 里**写了但代码从不读**的键 |
 | `probe_session_boundaries.py` | 假时钟走一遍开盘/午休/收盘边界 |
 | `dash_render_check.js` | Node 执行看板真实 JS，验渲染/去重/DOM 上限（无需浏览器） |
-| `check_audit_shots.py` | 校验审计截图是真渲染内容而非空白图 |
+| `check_audit_shots.py` | 校验审计截图是真渲染内容而非空白图（没截图时跳过，CI 用 `--require`） |
 | `verify_tencent_fields.py` | 算术核对腾讯源的字段索引契约（**离线**读夹具，不联网） |
 
 **真浏览器**（需 Playwright + Chromium）
