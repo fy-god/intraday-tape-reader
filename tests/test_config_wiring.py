@@ -337,3 +337,28 @@ def test_no_dead_config_keys():
     assert r.returncode == 0, (
         "发现没人读的配置键（改了不生效）：\n"
         + (r.stdout or "") + (r.stderr or ""))
+
+
+def test_readme_tool_list_matches_tools_dir():
+    """README 的工具清单必须与 `tools/` 实际内容一致。
+
+    新增一个工具却忘了登记，读者就不知道它存在；删了工具却留着表格行，
+    读者照着敲会扑空。两者都是"文档悄悄漂移"，没人会主动发现。
+
+    实现上直接跑 `tools/check_readme_tools.py`，让检查逻辑只有一份。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    tool = root / "tools" / "check_readme_tools.py"
+    if not tool.exists():
+        pytest.skip("check_readme_tools.py 不存在")
+
+    r = subprocess.run([sys.executable, str(tool)], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       cwd=str(root))
+    assert r.returncode == 0, (
+        "README 工具清单与 tools/ 不一致（有工具没登记，或提到了不存在的）：\n"
+        + (r.stdout or "") + (r.stderr or ""))

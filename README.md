@@ -262,7 +262,7 @@ src/arad/
 ## 验证
 
 ```bash
-python -m pytest -q                  # 1029 项，全离线
+python -m pytest -q                  # 1035 项，全离线
 python -m arad.cli selftest          # 全链路自检（植入剧本，随时可跑）
 ```
 
@@ -307,6 +307,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `probe_memory_day.py` | 把**一整天**压进十几秒跑完，量内存是收敛还是泄漏（见 `docs/MEMORY_AUDIT.md`） |
 | `probe_history_bound.py` | 验引擎侧 `state.history` 单只受 maxlen 约束、键数靠 `prune` 收敛 |
 | `check_config_consumed.py` | 找"声明了但没人读"的配置键（改了不生效那种）；`check_orphan_config.py` 抓不到这类 |
+| `check_readme_tools.py` | 核对上面的工具清单与 `tools/` 实际内容是否一致（新增工具忘登记就报错） |
 | `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
 | `probe_sources.py` | 逐端点探数据源；东财被限流时**自动降级到新浪**继续探 |
 | `probe_spirit_fields.py` | 验腾讯源的盘口/内外盘字段真实可用（内外盘之和 ≈ 成交量） |
@@ -321,7 +322,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
   两层去重为什么需要两层、事件型与状态型的区别。想改代码先看这份。
 * `docs/DASHBOARD_VISUAL_AUDIT.md` —— 看板的 68 项视觉/交互审计，
   含 4 个已修缺陷（其中"每行被排成两行、一屏条数腰斩"这条最隐蔽）。
-* `docs/TOOLS_AUDIT.md` —— 22 个 `tools/` 脚本逐个实跑审计，
+* `docs/TOOLS_AUDIT.md` —— `tools/` 脚本逐个实跑审计（审计时 22 个，现存 24 个），
   含 5 条已修问题（覆盖测试基线、`--help` 崩溃、并发竞态、判据非尺度不变、
   前缀判定抄了一份副本导致北交所 344 只被静默丢弃）。
 * `docs/MEMORY_AUDIT.md` —— 长跑内存：把一整天压进十几秒，证明内存**收敛**而非
