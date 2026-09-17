@@ -144,9 +144,14 @@
 cd D:\ccc\ashare-radar
 $env:PYTHONIOENCODING='utf-8'
 python tools\audit_dashboard_visual.py        # 68 项，exit 0 = 全通过
+python tools\measure_spirit_density.py        # 只量密度，打印硬数字
 python tools\check_audit_shots.py             # 校验截图是真内容而非空白图
 python -m pytest -q tests/test_dashboard_frontend.py   # 离线 CSS 结构回归
 ```
+
+`measure_spirit_density.py` 是专门为 D1 这类"看起来正常、其实密度腰斩"的缺陷写的：
+它用真浏览器量出**行高 / 网格列数 vs 格子数 / 一屏可见条数 / 分组按钮占几行**，
+把"观感对不对"变成可打印、可断言的数字（当前：行高 23.2px、6/6、**一屏 11 条**、按钮 1 行）。
 
 `--keep` 会保留服务让你自己打开看；`--shots DIR` 可换截图目录；
 `--headed` 显示浏览器窗口。

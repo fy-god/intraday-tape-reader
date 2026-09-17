@@ -41,6 +41,10 @@
 `check_audit_shots.py`（空白图判据在长列表上必然误报）。
 外加一个不在 `tools/`、但同样威胁基线的既有测试竞态（见「需要修」第 3 条）。
 
+> 📌 **这 4 条的当前状态**：第 2/3/4 条**已修复**，第 1 条的**夹具保护已修复、
+> 但网络 abort 仍在**。逐条对照见上方「后续处理（审计之后）」，
+> 下面「需要修的」各节保留**审计当时**的原始发现与证据。
+
 | 状态 | 数量 | 脚本 |
 |---|---|---|
 | **BROKEN** | 1 | `probe_sources.py` |
@@ -62,7 +66,7 @@
 
 | 脚本 | 状态 | 做什么 | 实测结果与备注 |
 |---|---|---|---|
-| `probe_sources.py` | **BROKEN** | 探数据源连通性，把原始响应落盘到 `fixtures/raw/` | **exit 1**：`RemoteDisconnected: Remote end closed connection without response` → `universe probe failed - aborting`。**且会破坏被跟踪的夹具**，见下节 |
+| `probe_sources.py` | **BROKEN** | 探数据源连通性，把原始响应落盘到 `fixtures/raw/` | **exit 1**：`RemoteDisconnected: Remote end closed connection without response` → `universe probe failed - aborting`。**且会破坏被跟踪的夹具**，见下节。夹具保护已修（`--force` 门槛），**abort 行为仍在** |
 | `audit_dashboard_visual.py` | BROWSER | 真 Chromium 视觉/交互审计，68 项 ✓/✗ + 截图 | **exit 0，68/68 通过**（23.1s）。审计当时为 67 项 / 10 项失败，见附录 A |
 | `check_colors.py` | BROWSER | 真浏览器核对红涨绿跌（含最易搞反的「打开涨停」） | **exit 0**（2.7s），10 个信号配色全对。端口正常释放 |
 | `shot_browser.py` | BROWSER | 起真服务 + 回放 + Chromium 断言 + 截图 | **exit 0**（3.9s），11 项断言全过。**会覆盖 `tools/spirit_dashboard.png`** |
@@ -72,7 +76,7 @@
 | `probe_live_ready.py` | NETWORK | 盘中可用性总检：股票池 + 抓取 + 3 个 spirit 模块 | **exit 0**（25.7s）。东财被限流后**自动退到新浪**，拿到 5563 只（18.3s） |
 | `probe_spirit_fields.py` | NETWORK | 验腾讯源盘口/内外盘字段真实可用 | **exit 0**（0.3s）。6 只票内外盘一致性偏差 ≤0.004% |
 | `bench_round.py` | OK | 单轮耗时基准（`--offline` 纯 CPU / `--live` 端到端） | **两种模式都 exit 0**。`--offline` 0.4s；`--live --repeat 5` 32.7s → p50 1069ms，余量 4.7× |
-| `check_audit_shots.py` | OK | 校验审计截图不是空白图（纯 stdlib 解 PNG） | 当前 **exit 0**「21 张截图都是真实渲染内容」。**但启发式会误报**，见「需要修」 |
+| `check_audit_shots.py` | OK | 校验审计截图不是空白图（纯 stdlib 解 PNG） | 当前 **exit 0**「21 张截图都是真实渲染内容」。**判据曾误报**，现已改为 ink 行数/占比，见「需要修」 |
 | `check_config_wiring.py` | OK | spirit 模块与配置/引擎接线完整性 | **exit 0**（0.2s）。7 模块、18/18/12 键全在 YAML、`max_per_round=0` 保持不限量 |
 | `check_orphan_config.py` | OK | 找「写了但代码从不读」的配置键 | **exit 0**（0.1s）。115 个叶子键 115 个命中，无孤立键 |
 | `check_spirit_mapping.py` | OK | 规则产出的 pattern → 展示层是否都认识 | **exit 0**（0.2s）。14 个信号全部映射，缺失：无 |
@@ -81,7 +85,7 @@
 | `probe_session_boundaries.py` | OK | 假时钟走开盘/午休/收盘边界 | **exit 0**（0.2s）。16 个时刻全对（左闭右开） |
 | `shot_dashboard.py` | OK | 真服务 + 真回放 + 真 HTTP 打 3 个接口 | **exit 0**（5.6s）。接口/SSE/坏数据韧性全过，末行「服务已关闭」 |
 | `shot_index.py` | OK | 指数管道 → 拉升指数 → 中文播报全链路 | **exit 0**（21.8s）。2 条 `index_pull` 告警，端到端正常 |
-| `shot_spirit.py` | OK | 看短线精灵播报效果（真实回放） | **exit 0**（0.3s，`python tools\shot_spirit.py 5`）。**无 argparse，`--help` 会崩**，见「需要修」 |
+| `shot_spirit.py` | OK | 看短线精灵播报效果（真实回放） | **exit 0**（0.3s，`python tools\shot_spirit.py 5`）。审计时**无 argparse、`--help` 会崩**，现已修复（`--help` → exit 0，裸位置参数仍兼容） |
 | `verify_tencent_fields.py` | OK | 算术核对腾讯字段索引契约 | **exit 0**（0.1s）。422/422 一致，5 个索引 100% 吻合。**离线**（读夹具，无网络） |
 
 ---
@@ -89,6 +93,9 @@
 ## 需要修的
 
 ### 1. `probe_sources.py` — BROKEN（且会破坏基线）
+
+> **状态**：夹具覆盖问题**已修**（`write_fixture()` + `--force` 门槛，实测保护生效、
+> 6 个夹具字节未变）；但 **abort 行为仍未修** —— 脚本在当前网络下依然 `exit 1`。
 
 **现状**：从本机直接崩溃，一个字节都没探测到。
 
@@ -160,6 +167,8 @@ assert len(pf_quotes) == VALID_ROWS
 
 ### 2. `shot_spirit.py` — `--help` 崩溃（无 argparse）
 
+> **状态**：✅ **已修**。包成 `main()` + argparse，且保留裸位置参数用法。
+
 ```
 File "tools\shot_spirit.py", line 21, in <module>
   minutes = int(sys.argv[1]) if len(sys.argv) > 1 else 45
@@ -176,6 +185,8 @@ exit code: 1
 ---
 
 ### 3. `tests/test_sources_tencent.py::test_chunking_1300_codes_into_3_batches` — 并发竞态（**非 tools/ 脚本，但审计中发现**）
+
+> **状态**：✅ **已修**。断言改为顺序无关（`sorted(sizes)`），并加强为「不重不漏」。
 
 **不属于 `tools/`，是审计过程中撞见的既有 flake**，因直接威胁「1026 基线」故一并记录。
 
@@ -213,6 +224,8 @@ assert sizes == [600, 600, 100]
 或按 chunk 内容而非完成顺序比对。**
 
 ### 4. `check_audit_shots.py` — 启发式会误报真实截图（**非确定性缺陷**）
+
+> **状态**：✅ **已修**。判据从 `top_ratio < 0.92` 换成 ink 行数 + 墨迹占比。
 
 审计当时（HEAD 截图）它 `exit 1`：
 

@@ -216,6 +216,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | 工具 | 用途 |
 |---|---|
 | `audit_dashboard_visual.py` | **68 项**视觉/交互审计：信息密度、4 种分辨率布局、红涨绿跌、筛选、对比度、色盲载体 |
+| `measure_spirit_density.py` | 量出看板密度的硬数字（行高、列数 vs 格子数、一屏几条） |
 | `shot_browser.py` | 打开看板截图 + 关键断言 |
 | `check_colors.py` | 10 个信号的红涨绿跌逐个核对 |
 | `shot_dashboard.py` / `shot_spirit.py` / `shot_index.py` | 起真服务 + 回放数据截图 |
