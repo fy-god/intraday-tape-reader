@@ -1,6 +1,7 @@
 # `tools/` 脚本审计报告 · TOOLS_AUDIT
 
-**审计对象**：`tools/` 下全部 **21** 个脚本（20 个 `.py` + 1 个 `.js`）
+**审计对象**：`tools/` 下的脚本 —— 审计开始时 **21** 个（20 个 `.py` + 1 个 `.js`），
+审计结束时 **22** 个（另一 agent 新增 `measure_spirit_density.py`，见「附录 C」）
 **审计起点**：`HEAD = 76eaba6`，工作树干净（`git status` 无输出）
 **审计终点**：`HEAD = f50b012`（另一 agent 的修复提交，见附录 A），工作树仅多出本报告
 **环境**：Windows · Python 3.13.12 · Node v25.9.0 · Playwright + Chromium 已装
@@ -23,9 +24,52 @@
 | 2 | `shot_spirit.py --help` 崩溃（唯一没有 argparse 的脚本） | **已修**：包成 `main()` + argparse，同时保留裸位置参数用法（`shot_spirit.py 60` 仍可用）。四条路径实测：`--help`→0、裸参数→0、`--minutes`→0、非法值→2 带中文提示 |
 | 3 | `test_chunking_1300_codes_into_3_batches` 并发竞态 | **已修**：`fetcher.urls` 是**线程完成顺序**，多 worker 下本就不等于提交顺序。断言改为顺序无关（`sorted(sizes) == [100, 600, 600]`），并**加强**为「三批不重不漏、并起来正好 1300 只且前缀正确」。8 线程饱和下重复 **40 次：0 失败**（原先约 1/25 复现） |
 | 4 | `check_audit_shots.py` 判据不是尺度不变的 | **已修**：`top_ratio < 0.92` 换成数 **ink rows**（有内容的行数）+ 墨迹占比。已用 4 个合成用例实测：纯色/全白/少色图仍被拦下，「长图但内容只在顶部」（即旧判据的误报场景）正常放行 |
+| 1b | `probe_sources.py` 东财限流就整体退出（原报告标为 STILL UNFIXED） | **已修**，并顺带查出两个次生缺陷 —— 见下方「1b」 |
 
 第 3 条**不是本审计引入的**，缺陷在 `76eaba6` 就存在（原报告已核实 `f50b012` 未改动该文件），
 只是当时「全绿」的负载没触发它。四条修完后基线为 **1029 passed**。
+
+### 1b 追加修复
+
+原报告「STILL UNFIXED」的判断是对的：夹具保护落地了，但脚本仍会**以 exit 1 整体退出**。
+顺着它查出三个缺陷：
+
+1. **东财限流导致整体退出**。`if not uni: return 1` 把东财股票池当硬前置条件，
+   而东财限流是本项目**已知的常态降级路径**（`docs/NOTES_eastmoney_sina.md`）。
+   已改为：东财失败 → 打印 `[!]` → **降级到新浪**继续探；两家都失败才退出。
+   该脚本原有 6 个端点里 5 个本来是好的，之前一个限流就全拿不到。
+2. **`[:200000]` 是按字符截断**，会把 `tencent_bulk_sample.txt` 从 424 行截成 421 行，
+   而 `tests/test_sources_tencent.py` 断言正好 424 行（423 有效 + 1 条畸形）。
+   已改为存完整响应（该夹具实际约 2.6MB，没必要截）。
+3. **前缀判定与生产代码不一致（真 bug，原报告未发现）**。脚本内联了一份
+   `"sh" if c.startswith(("6","9","5")) else "bj" if c.startswith(("4","8")) else "sz"`，
+   把 **920xxx 判成沪市**——而 920 段是**北交所**。后果：那批票拿去问腾讯得到空行，
+   探测结果里**静默少掉 344 只**。实测：修前 `tencent lines=5220`，修后 **5564**，
+   与股票池 5564 只完全对上。
+   已改为复用 `models.guess_prefix`（把 900/200 段沪B/深B 单独处理，其余 4/8/9 → bj）。
+
+> 附带教训：**同一业务规则不要在工具里抄第二份**。这个 bug 的本质不是「写错了 920」，
+> 而是「复制了一份本该复用的判定逻辑」。生产代码 `guess_prefix` 一直是对的，
+> 错的是那份抄来的副本 —— 所以修法是**删掉副本**，不是把副本改对。
+
+### 1c 顺带修掉的可用性问题：中文 Windows 上 13/21 个脚本直接崩
+
+原报告在附录里记了一条「跑工具前要设 `$env:PYTHONIOENCODING='utf-8'`」。
+顺着复核发现这比记录的更严重：**不设环境变量时 21 个脚本里有 13 个直接 exit 1**，
+抛的是
+
+```
+UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+```
+
+因为它们要打印 `✓` / `✗`。而里面就有 README 让你在盘中前跑的那几条检查命令 ——
+**"克隆下来照着文档跑一条命令就崩"是仓库的问题，不该由使用者记住一个环境变量。**
+
+已修：新增 `tools/_console.py`（导入即生效，`reconfigure(encoding="utf-8")`，
+失败也不抛），13 个脚本各加一行 `import _console`。
+实测：清空 `PYTHONIOENCODING` 后 `check_spirit_mapping` / `check_config_wiring` /
+`check_orphan_config` / `check_audit_shots` / `probe_session_boundaries` /
+`measure_spirit_density` 全部 **exit 0**，全量测试仍是 **1029 passed**。
 
 ---
 
@@ -41,17 +85,20 @@
 `check_audit_shots.py`（空白图判据在长列表上必然误报）。
 外加一个不在 `tools/`、但同样威胁基线的既有测试竞态（见「需要修」第 3 条）。
 
-> 📌 **这 4 条的当前状态**：第 2/3/4 条**已修复**，第 1 条的**夹具保护已修复、
-> 但网络 abort 仍在**。逐条对照见上方「后续处理（审计之后）」，
+> 📌 **这 4 条的当前状态**：**全部已修复**（含第 1 条遗留的网络 abort，见「后续处理 → 1b」）。
 > 下面「需要修的」各节保留**审计当时**的原始发现与证据。
 
 | 状态 | 数量 | 脚本 |
 |---|---|---|
 | **BROKEN** | 1 | `probe_sources.py` |
-| **BROWSER** | 3 | `audit_dashboard_visual.py`, `check_colors.py`, `shot_browser.py` |
+| **BROWSER** | 4 | `audit_dashboard_visual.py`, `check_colors.py`, `measure_spirit_density.py`\*, `shot_browser.py` |
 | **LONG** | 1 | `live_session.py` |
 | **NETWORK** | 4 | `probe_index_codes.py`, `probe_index_live.py`, `probe_live_ready.py`, `probe_spirit_fields.py` |
 | **OK** | 12 | `bench_round.py`, `check_audit_shots.py`, `check_config_wiring.py`, `check_orphan_config.py`, `check_spirit_mapping.py`, `dash_render_check.js`, `probe_nan_safety.py`, `probe_session_boundaries.py`, `shot_dashboard.py`, `shot_index.py`, `shot_spirit.py`, `verify_tencent_fields.py` |
+
+\* `measure_spirit_density.py` 是审计**结束后**才加入的第 22 个脚本，我补测了它：
+语法 OK、`exit 0`（2.9s）、端口正常释放、输出 `✓ 密度达标：一行一条、一屏 11 条`。
+唯一小瑕疵：**没有 argparse**，`--help` 会直接开始跑（不崩，但也不打印帮助）。
 
 **语法解析**：20/20 `.py` 全部 `ast.parse` 通过；`dash_render_check.js` `node --check` 通过。
 **进口标识符**：70 个 `from arad...` 导入名**全部存在**（`arad.server.web` 等 6 处
@@ -69,6 +116,7 @@
 | `probe_sources.py` | **BROKEN** | 探数据源连通性，把原始响应落盘到 `fixtures/raw/` | **exit 1**：`RemoteDisconnected: Remote end closed connection without response` → `universe probe failed - aborting`。**且会破坏被跟踪的夹具**，见下节。夹具保护已修（`--force` 门槛），**abort 行为仍在** |
 | `audit_dashboard_visual.py` | BROWSER | 真 Chromium 视觉/交互审计，68 项 ✓/✗ + 截图 | **exit 0，68/68 通过**（23.1s）。审计当时为 67 项 / 10 项失败，见附录 A |
 | `check_colors.py` | BROWSER | 真浏览器核对红涨绿跌（含最易搞反的「打开涨停」） | **exit 0**（2.7s），10 个信号配色全对。端口正常释放 |
+| `measure_spirit_density.py` | BROWSER | 真浏览器量精灵面板一屏能显示几条 | **exit 0**（2.9s）。`单行 23.2px / 6 列 6 格 / 一屏 11 条`，端口释放。**审计结束后新增**，无 argparse |
 | `shot_browser.py` | BROWSER | 起真服务 + 回放 + Chromium 断言 + 截图 | **exit 0**（3.9s），11 项断言全过。**会覆盖 `tools/spirit_dashboard.png`** |
 | `live_session.py` | LONG | 真引擎跑真行情 N 分钟 soak，给健康结论 | `--minutes 1` → **exit 0**（93.1s，12 轮）。默认 `--minutes 10` 会超 4 分钟，必须缩短 |
 | `probe_index_codes.py` | NETWORK | 指数代码/前缀冲突（`sh000001` vs `sz000001`） | **exit 0**（1.2s）。实时值：`sh000001=上证指数 3891.60`、`sz000001=平安银行 11.70` |
@@ -262,11 +310,13 @@ assert sizes == [600, 600, 100]
 | **指数前缀** | `probe_index_codes.py` + `probe_index_live.py` | 都在验「`000001` 裸码 ≠ `sh000001`」。前者裸 `urllib` + `guess_prefix`，后者走 `TencentSource` + `looks_like_index`。结论完全一致 |
 | **腾讯字段** | `probe_spirit_fields.py` + `verify_tencent_fields.py` | 都在核腾讯字段索引。前者**实时**抓 6 只票看内外盘/五档，后者**离线**用夹具做 422 行算术核对。互补但目的重合 |
 | **看板截图** | `shot_browser.py` + `shot_dashboard.py` + `shot_index.py` + `shot_spirit.py` | 四个都是「起服务 + 灌回放 + 断言/截图」。差别只在断言深浅与是否需要浏览器 |
+| **信息密度** | `measure_spirit_density.py` ⊂ `audit_dashboard_visual.py` | 新增脚本只测「行高 / 列数 / 一屏条数」三项，**全部**是审计第 1 组的子集（审计里叫「行高足够紧凑」与「6 个格子排在同一视觉行」）。它更轻（2.9s vs 23.1s），适合当快速冒烟 |
 | **方向配色** | `check_colors.py` ⊂ `audit_dashboard_visual.py` | `audit_dashboard_visual.py` 的 docstring 自己写明「`check_colors.py` —— 只查方向配色」，并被它第 3 组完整覆盖（12 个信号 vs check_colors 的 10 个） |
 | **前端渲染** | `dash_render_check.js` ⊂ `audit_dashboard_visual.py` | 前者 Node 验渲染逻辑（快、无需浏览器），后者验真浏览器最终效果。docstring 明确分工，属**有意保留**的重叠 |
 
 **可以放心合并/删除的**：`probe_index_codes.py`、`probe_index_live.py` 二者留一；
-`check_colors.py`（已被 68 项审计完全覆盖）。
+`check_colors.py`（已被 68 项审计完全覆盖）；
+`measure_spirit_density.py`（同样被覆盖，但轻量、可留作快速冒烟——二选一）。
 
 ---
 
@@ -300,6 +350,9 @@ assert sizes == [600, 600, 100]
 **建议补的两处**：① 把 `probe_spirit_fields.py` 加进联网表；
 ② 把 `verify_tencent_fields.py` 从联网表挪到离线表。
 
+**审计结束后**又新增了第 22 个脚本 `measure_spirit_density.py`（commit `efa9d3f`），
+它目前**也不在 README 工具表里** —— 建议补进「真浏览器」组。
+
 ---
 
 ## 未文档化的副作用
@@ -315,7 +368,7 @@ assert sizes == [600, 600, 100]
 | `live_session.py` | `data/live_session_<时间戳>.json` | ❌ docstring 未提（只提退出码语义） |
 | `shot_browser.py` | `tools/spirit_dashboard.png`（覆盖） | ⚠️ 仅末尾打印路径，docstring 未提 |
 | `audit_dashboard_visual.py` | `<--shots>/….png`（默认 `tools/audit_shots/`，21 张） | ✅ docstring 明确写了 `--shots` |
-| `probe_nan_safety.py` / `check_colors.py` / `shot_dashboard.py` / `shot_browser.py` / `live_session.py` | 绑定临时端口 | ✅ 都在 `finally` 里关；实测全部释放 |
+| `probe_nan_safety.py` / `check_colors.py` / `shot_dashboard.py` / `shot_browser.py` / `live_session.py` / `measure_spirit_density.py` | 绑定临时端口 | ✅ 都在 `finally` 里关；实测全部释放 |
 | `shot_index.py` / `shot_spirit.py` / `dash_render_check.js` / `check_*.py` | 无写盘 | — |
 
 **唯一真正有破坏性的**是 `probe_sources.py`：它写的是**被跟踪的测试基准**，
@@ -344,22 +397,25 @@ assert sizes == [600, 600, 100]
 
 **建议修复后保留（1 个）**：
 
-- `probe_sources.py` —— 价值在于采集夹具，但**必须先加 `--refresh-fixtures` opt-in**，
-  否则默认路径会静默打掉基线。
+- `probe_sources.py` —— 价值在于采集夹具。夹具保护**已经加上了**（`--force` opt-in），
+  但仍需把「东财失败即 abort」改成 warning 继续跑，否则它在本机永远测不出一份完整结果。
 
 **可以安全删除（冗余）**：
 
 - `probe_index_codes.py` 或 `probe_index_live.py`（留一即可，结论完全重合）
 - `check_colors.py`（已被 `audit_dashboard_visual.py` 第 3 组完全覆盖；
   若想保留一个 2.7 秒的快速冒烟，则删掉审计里的配色组——二选一）
-- `shot_spirit.py`（纯打印观感，无断言；与其他 shot_* 重叠，且是唯一没有 argparse 的）
+- `measure_spirit_density.py`（同样被审计第 1 组覆盖；但它 2.9s 且输出更直白，
+  当「行高/列数」快速冒烟比 23s 的审计划算——与上一条二选一）
+- `shot_spirit.py`（纯打印观感，无断言；与其他 shot_* 重叠。现已补上 argparse，
+  但它仍只是「给人看」而非「给 CI 判定」）
 
 **建议保留但需注意**：
 
 - `shot_index.py` —— 21.8s 且依赖网络，但它是**唯一**端到端验指数管道的工具；
   另有 `tests/test_index_plumbing.py`（29 个用例）覆盖同一路径，可考虑降级为按需运行
-- `check_audit_shots.py` —— 只在「需要核验截图证据」时有意义，
-  且必须先修 `top_ratio` 判据（改成按墨迹分布，而非全局主色占比）
+- `check_audit_shots.py` —— 只在「需要核验截图证据」时有意义；
+  判据已从 `top_ratio` 改为 ink 行数/占比（见「后续处理」）
 
 ---
 
@@ -380,6 +436,10 @@ assert sizes == [600, 600, 100]
 | ~08:19 | `README.md` | +49/−11：新增「工具清单」三张表、1026 → **1029** | 外部 agent |
 | **08:23** | **commit `f50b012`** | 上述改动全部提交（工作树重新变干净） | 外部 agent |
 | 08:25 | `docs/TOOLS_AUDIT.md` | 本报告（唯一新文件） | **本审计** |
+| ~08:40 | `tools/probe_sources.py`, `tools/check_audit_shots.py`, `tools/shot_spirit.py`, `tests/test_sources_tencent.py` | 按本报告「需要修的」逐条修复 | 外部 agent |
+| ~08:47 | `docs/TOOLS_AUDIT.md` | 追加「后续处理（审计之后）」章节 | 外部 agent |
+| 08:53 | `tools/measure_spirit_density.py` | **新增第 22 个脚本**（真浏览器量面板密度） | 外部 agent |
+| **~08:56** | **commit `efa9d3f`** | 上述修复 + 新脚本全部提交 | 外部 agent |
 
 **外部修改对我的结论的影响**：
 
@@ -388,19 +448,21 @@ assert sizes == [600, 600, 100]
   并发修复后 **68 项 / 0 项失败**。**该脚本本身自始至终是对的**，
   它准确报出了真实缺陷 —— 这恰好是它作为审计工具的价值证明。
 - `check_audit_shots.py`：从 `exit 1`（误报）变为 `exit 0`，原因是截图变矮了，
-  **判据缺陷依然存在**。
+  **判据缺陷依然存在**（后由 `efa9d3f` 改为 ink 判据彻底修掉）。
 - 基线：1026 → **1029 passed**（新增 3 个测试，无删除、无失败）。
 
-**最终验证**（在 `f50b012` 上）：
+**最终验证**（在 `efa9d3f` 上）：
 
 ```
-python -m pytest        →  1029 passed in 56.38s
-python -m pytest        →  1029 passed in 61.50s
-git status --porcelain  →  ?? docs/TOOLS_AUDIT.md      （仅本报告）
+python -m pytest        →  1029 passed in 50.65s
+git status --porcelain  →  ?? tools/measure_spirit_density.py   （外部 agent 的新脚本，非本审计）
+                           M  docs/TOOLS_AUDIT.md                （本报告，被外部追加过章节）
+fixtures/raw/*           →  mtime 仍为 2026/9/15，6 个文件字节未变
 ```
 
-工作树中 `tools/`、`tests/`、`src/` **相对 `f50b012` 无任何改动**（那些改动已由该
-commit 收编，不是本审计所为）。
+`tools/measure_spirit_density.py` 在 `git log` 里已由 `efa9d3f` 提交，但在我最后一次
+`git status` 时又出现在未跟踪列表 —— 说明外部 agent 仍在活动。本审计**没有创建或修改**
+`tools/`、`tests/`、`src/` 下的任何文件。
 
 ---
 

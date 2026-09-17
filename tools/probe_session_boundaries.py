@@ -15,6 +15,8 @@
 """
 from __future__ import annotations
 
+import _console  # noqa: F401,E402  —— Windows 控制台 UTF-8（见 tools/_console.py）
+
 import sys
 from datetime import datetime
 from pathlib import Path

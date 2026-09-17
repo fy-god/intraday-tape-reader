@@ -4,6 +4,8 @@
 认不出的会被降级成 kind 兜底文案（例如把"机构吃货"显示成"异动"），
 这正是本项目踩过的坑（触板被显示成涨停）。所以这里要穷举核对。
 """
+
+import _console  # noqa: F401,E402  —— Windows 控制台 UTF-8（见 tools/_console.py）
 import sys
 sys.path.insert(0, 'src')
 

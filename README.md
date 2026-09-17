@@ -210,6 +210,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `probe_session_boundaries.py` | 假时钟走一遍开盘/午休/收盘边界 |
 | `dash_render_check.js` | Node 执行看板真实 JS，验渲染/去重/DOM 上限（无需浏览器） |
 | `check_audit_shots.py` | 校验审计截图是真渲染内容而非空白图 |
+| `verify_tencent_fields.py` | 算术核对腾讯源的字段索引契约（**离线**读夹具，不联网） |
 
 **真浏览器**（需 Playwright + Chromium）
 
@@ -229,7 +230,8 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `probe_live_ready.py` | 盘中可用性总检：股票池、单轮耗时、五档/内外盘可用率 |
 | `live_session.py` | 限时实盘 soak：抓取失败率、看板健康、SSE 断流、内存有界，给出结论 |
 | `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
-| `probe_sources.py` / `verify_tencent_fields.py` | 数据源连通性与字段布局核对 |
+| `probe_sources.py` | 逐端点探数据源；东财被限流时**自动降级到新浪**继续探 |
+| `probe_spirit_fields.py` | 验腾讯源的盘口/内外盘字段真实可用（内外盘之和 ≈ 成交量） |
 | `probe_index_codes.py` / `probe_index_live.py` | 指数前缀与实时行情（`sh000001` ≠ `000001`） |
 
 > `probe_*` 只做观测并打印结果，`check_*` 会给出断言式的 ✓/✗ 并通过退出码表态——
@@ -237,10 +239,13 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 
 两份审计报告（都是对**本项目自己**的审计，不是宣传）：
 
+* `docs/ARCHITECTURE.md` —— **代码地图**：一轮引擎从抓行情到上屏经过哪些模块、
+  两层去重为什么需要两层、事件型与状态型的区别。想改代码先看这份。
 * `docs/DASHBOARD_VISUAL_AUDIT.md` —— 看板的 68 项视觉/交互审计，
   含 4 个已修缺陷（其中"每行被排成两行、一屏条数腰斩"这条最隐蔽）。
-* `docs/TOOLS_AUDIT.md` —— 21 个 `tools/` 脚本逐个实跑审计，
-  含 4 条已修问题（覆盖测试基线、`--help` 崩溃、并发竞态、判据非尺度不变）。
+* `docs/TOOLS_AUDIT.md` —— 22 个 `tools/` 脚本逐个实跑审计，
+  含 5 条已修问题（覆盖测试基线、`--help` 崩溃、并发竞态、判据非尺度不变、
+  前缀判定抄了一份副本导致北交所 344 只被静默丢弃）。
 
 ---
 
