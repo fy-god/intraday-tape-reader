@@ -126,6 +126,45 @@ self.store = AlertStore(self.settings, calendar=self.calendar)   # 少传一个�
 
 ---
 
+## 4b. 顺着这条线查下去：又找到 5 个死键
+
+既然"名字存在 ≠ 接线正确"，就写了个反向检查
+`tools/check_config_consumed.py`：它**先把 `config.py` 里 `DEFAULTS` 那段
+声明挖掉**，再看每个键在剩余源码里有没有真正的读取点
+（`.get("...")` / `["..."]` / `setdefault(...)`）。
+
+> 第一版它是**整个排除 `config.py`** 的，结果两头不讨好：
+> 对 `series_len` 抓不到（因为 `store.py` 的 DEFAULTS 里也有这个名字），
+> 又对 `holidays_file` 误报（因为合法的读取点恰好就在 `config.py` 里）。
+> 改成"只挖声明点、保留读取点"之后才两者都对。
+> 这个教训值得记：**检查器自己也要被检查** —— 两次都用"把代码改坏再跑"
+> 的方式验过它到底能不能抓到。
+
+结果找出 5 个键，逐个用"写哨兵值看行为变不变"确认过：
+
+| 键 | 症状 | 处理 |
+|---|---|---|
+| `session.holidays_file` | `load_holidays()` 支持传路径，但**所有调用点都不传参** | **接线**（见下） |
+| `session.warmup_seconds` | "开盘预热"功能**从未实现**，src/ 零引用 | 删除 |
+| `session.record_auction` | "集合竞价记快照"功能**从未实现** | 删除 |
+| `storage.snapshot_every` | "原始快照落盘"功能**从未实现**（无对应 notifier） | 删除 |
+| `storage.snapshot_path` | 同上 | 删除 |
+
+**为什么"删除"也是正确答案**：一个改了不生效、又不报错的键，比没有这个键更糟
+—— 它让人以为功能存在。留着"以后可能要做"的键，代价是每个读配置的人都要
+重新判断一次它到底通不通。真要做这些功能时，加回来**并同时接线**即可。
+
+`holidays_file` 则值得接线，因为它对应的功能**已经存在**（`config/holidays.txt`
+真的被读了 33 个休市日），只是路径写死、无法指到别处；而它的注释写着
+"每年需更新"，正是最该能改的键。已修：`load_holidays(path, settings=)` 读配置，
+`TradingCalendar.load(settings=)` 透传。测试用**行为**验证（指向不存在的文件
+必须让节假日集合变空），因为这类 bug 的特征恰恰是"读得到、但没用上"。
+
+顺带把 `storage.series_len` 的注释补成它真实的身份（内存开关），
+并指向本文。
+
+---
+
 ## 5. 其余内存相关结论
 
 | 结构 | 上界机制 | 实测 |

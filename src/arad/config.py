@@ -52,8 +52,10 @@ DEFAULTS: dict[str, Any] = {
         "idle_when_closed": True,
     },
     "session": {
-        "warmup_seconds": 60,
-        "record_auction": True,
+        # 注：曾有 warmup_seconds / record_auction 两个键，但"开盘预热"与
+        # "集合竞价记快照"这两个功能**从未实现**，键也就没人读。
+        # 与其留着让人以为能配（改了不生效、也不报错），不如删掉；
+        # 真要做这两个功能时再加回来并同时接线。
         "holidays_file": "config/holidays.txt",
     },
     "sources": {
@@ -75,8 +77,9 @@ DEFAULTS: dict[str, Any] = {
     "notify": {"enabled": ["console"]},
     "storage": {
         "alerts_path": "data/alerts.jsonl",
-        "snapshot_every": 0,
-        "snapshot_path": "data/snapshots.jsonl",
+        # 注：曾有 snapshot_every / snapshot_path 两个键，但"把每轮原始快照
+        # 落盘"这个功能**从未实现**（没有对应的 notifier，src/ 里零引用）。
+        # 同 session 段的处理：删掉而不是留着假装可配。
         "series_len": 240,
     },
     "web": {
@@ -281,9 +284,24 @@ def reload_watchlist(path: str | os.PathLike | None = None) -> list[str]:
     return load_watchlist(path)
 
 
-def load_holidays(path: str | os.PathLike | None = None) -> set[str]:
-    """读取休市日，返回 {'2026-01-01', ...}。"""
+def load_holidays(path: str | os.PathLike | None = None,
+                  settings: "Settings | None" = None) -> set[str]:
+    """读取休市日，返回 {'2026-01-01', ...}。
+
+    ``path`` 优先；未给则读 ``session.holidays_file``（settings.yaml），
+    再退到 ``config/holidays.txt``。
+
+    为什么要读配置：早先所有调用点都是 ``load_holidays()`` 不传参，
+    于是 ``session.holidays_file`` 这个键**改了完全不生效** ——
+    而它的注释写着"节假日表文件（每年需更新）"，正是最需要能改的那种键
+    （比如把节假日表放到项目外、或按年份切换不同文件）。
+    一个"看起来能配、实际写死"的路径键，比没有这个键更糟。
+    """
+    if path is None and settings is not None:
+        path = settings.get("session.holidays_file") or None
     p = Path(path) if path else DEFAULT_HOLIDAYS
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
     if not p.exists():
         return set()
     days: set[str] = set()

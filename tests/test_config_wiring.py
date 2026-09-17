@@ -266,3 +266,74 @@ def test_storage_series_len_actually_reaches_the_store():
         assert Engine(None, settings=st2).store._series_len == 240
     finally:
         clear_cache()
+
+
+def test_session_holidays_file_is_honoured(tmp_path):
+    """``session.holidays_file`` 必须真的决定读哪个节假日表。
+
+    与 series_len 同一类缺陷：``load_holidays()`` 早就支持传路径，
+    但**所有调用点都不传参**（``cli.py`` / ``session.py``），于是这个配置键
+    改了完全不生效。而它的注释写着"每年需更新"——正是最该能改的键。
+
+    验证方式用行为而非静态：指向一个**不存在**的文件，节假日集合必须变空。
+    只断言"键被读到了"是不够的 —— 这个 bug 的特征恰恰是"读得到、但没用上"。
+    """
+    from arad.config import clear_cache, load_settings
+    from arad.session import TradingCalendar
+
+    clear_cache()
+    try:
+        st = load_settings(use_cache=False)
+        # 默认：走 config/holidays.txt，应当有内容
+        default_cal = TradingCalendar.load(settings=st)
+        assert default_cal.holidays, "默认节假日表不应为空（检查 config/holidays.txt）"
+
+        # 指到一个不存在的文件 -> 必须变空，证明路径真的被用了
+        missing = tmp_path / "nope.txt"
+        st.raw.setdefault("session", {})["holidays_file"] = str(missing)
+        cal = TradingCalendar.load(settings=st)
+        assert cal.holidays == set(), (
+            f"session.holidays_file 指向不存在的文件，却仍然读到了 "
+            f"{len(cal.holidays)} 个休市日 —— 配置没生效")
+
+        # 指到一个真实的自建文件 -> 必须读到它的内容
+        custom = tmp_path / "custom.txt"
+        custom.write_text("# 自定义\n2026-10-01\n2026/10/02\n", encoding="utf-8")
+        st.raw["session"]["holidays_file"] = str(custom)
+        cal2 = TradingCalendar.load(settings=st)
+        assert cal2.holidays == {"2026-10-01", "2026-10-02"}, (
+            f"自定义节假日表没被读到：{cal2.holidays}")
+    finally:
+        clear_cache()
+
+
+def test_no_dead_config_keys():
+    """settings.yaml 里不该有"声明了但没人读"的键。
+
+    这类键的症状是**改了不生效且不报错**，最难查。项目里已经出现过两次：
+    ``storage.series_len``（构造器少传一个参数）和
+    ``session.holidays_file``（所有调用点都不传参）。
+
+    注意：``tools/check_orphan_config.py`` **抓不到**这两个 —— 它只检查
+    "键名作为字符串字面量出现过"，而 config.py 的 DEFAULTS 必然为每个键
+    写一次名字，于是无条件通过。本测试调用的
+    ``tools/check_config_consumed.py`` 会先挖掉 DEFAULTS 声明点再看有没有
+    真正的读取点，才能抓到。
+
+    实现方式：直接跑那个脚本，断言退出码为 0。这样两者不会漂移。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    tool = root / "tools" / "check_config_consumed.py"
+    if not tool.exists():
+        pytest.skip("check_config_consumed.py 不存在")
+
+    r = subprocess.run([sys.executable, str(tool)], capture_output=True,
+                       text=True, encoding="utf-8", errors="replace",
+                       cwd=str(root))
+    assert r.returncode == 0, (
+        "发现没人读的配置键（改了不生效）：\n"
+        + (r.stdout or "") + (r.stderr or ""))

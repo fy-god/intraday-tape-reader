@@ -37,11 +37,8 @@ poll:
   idle_when_closed: true
 
 session:
-  # 提前多久预热（秒）：开盘前预取股票池
-  warmup_seconds: 60
-  # 连续竞价外的时段是否仍记录快照（集合竞价观察用）
-  record_auction: true
-  # 节假日表文件（每年需更新）
+  # 节假日表文件（每年需更新）。相对路径按项目根解析。
+  # 这个键**真的会被读**（config.load_holidays -> TradingCalendar.load）。
   holidays_file: "config/holidays.txt"
 
 sources:
@@ -313,10 +310,9 @@ notify:
 storage:
   # 告警落盘（JSONL，追加写）
   alerts_path: "data/alerts.jsonl"
-  # 快照落盘（可选，用于事后复盘；每 N 轮写一次，0=不写）
-  snapshot_every: 0
-  snapshot_path: "data/snapshots.jsonl"
-  # 榜单历史（用于前端画分时速度曲线）
+  # 榜单历史（用于前端画分时速度曲线）。
+  # ⚠ 这是**内存开关**：全市场都记分时约 412MB，调小可显著降内存。
+  #   见 docs/MEMORY_AUDIT.md。
   series_len: 240
 
 web:

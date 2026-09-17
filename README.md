@@ -306,6 +306,7 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `live_session.py` | 限时实盘 soak：抓取失败率、看板健康、SSE 断流、内存有界，给出结论 |
 | `probe_memory_day.py` | 把**一整天**压进十几秒跑完，量内存是收敛还是泄漏（见 `docs/MEMORY_AUDIT.md`） |
 | `probe_history_bound.py` | 验引擎侧 `state.history` 单只受 maxlen 约束、键数靠 `prune` 收敛 |
+| `check_config_consumed.py` | 找"声明了但没人读"的配置键（改了不生效那种）；`check_orphan_config.py` 抓不到这类 |
 | `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
 | `probe_sources.py` | 逐端点探数据源；东财被限流时**自动降级到新浪**继续探 |
 | `probe_spirit_fields.py` | 验腾讯源的盘口/内外盘字段真实可用（内外盘之和 ≈ 成交量） |

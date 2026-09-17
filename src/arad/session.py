@@ -77,8 +77,21 @@ class TradingCalendar:
     _now_fn: object = None
 
     @classmethod
-    def load(cls, holidays_file: str | None = None) -> "TradingCalendar":
-        return cls(holidays=load_holidays(holidays_file))
+    def load(cls, holidays_file: str | None = None, *,
+             settings: "Settings | None" = None) -> "TradingCalendar":
+        """载入交易日历。
+
+        ``holidays_file`` 显式优先；未给时读 ``session.holidays_file`` 配置键
+        （见 ``config.load_holidays`` 的说明：这个键早先是写了不生效的）。
+        """
+        if settings is None:
+            # 延迟导入：session 是最底层模块之一，不想在导入期就依赖 config。
+            try:
+                from .config import load_settings
+                settings = load_settings()
+            except Exception:  # noqa: BLE001 - 拿不到配置也要能用默认表
+                settings = None
+        return cls(holidays=load_holidays(holidays_file, settings=settings))
 
     # ------------------------------------------------------------------
     def is_trading_day(self, d: date | datetime | None = None) -> bool:
