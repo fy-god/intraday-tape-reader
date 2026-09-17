@@ -85,35 +85,40 @@ def consumed_forms(key: str, blob: str) -> list[str]:
 
 
 def strip_defaults(text: str) -> str:
-    """从 config.py 里**只**挖掉 ``DEFAULTS = {...}`` 那个字典字面量。
+    """挖掉所有 ``DEFAULTS = {...}`` 字典字面量。
 
-    为什么要这么精细：DEFAULTS 会为每个键写一次 ``"key": 默认值``，
-    而每个键都必然出现在那里 —— 于是任何"键名在源码里出现过"的检查都会
-    无条件通过。这正是 check_orphan_config.py 抓不到
-    ``storage.series_len`` 的原因，也是本脚本第一版同样抓不到的原因
-    （已实测：把 engine 里那行参数删掉，两个脚本都仍报 ✓）。
+    为什么必须挖：DEFAULTS 会为每个键写一次 ``"key": 默认值``，而每个键都必然
+    出现在那里 —— 于是任何"键名在源码里出现过"的检查都会无条件通过。这正是
+    check_orphan_config.py 抓不到 ``storage.series_len`` 的原因。
 
-    但**不能整个文件排除**：config.py 自己也会合法地读配置
-    （例如 ``load_holidays`` 读 ``session.holidays_file``）。第一版就是这么
-    写的，结果对 holidays_file 误报。正确做法是只挖掉声明点，保留读取点。
+    ⚠ 要挖的是**所有**模块的 DEFAULTS，不只是 config.py 的。
+    六个规则模块各自也有 DEFAULTS（spirit_price / spirit_order / spirit_index /
+    unusual / volume_burst，加 config.py 共 6 处）。第一版只处理了 config.py，
+    于是 ``rebound_off_low_pct``（只在 spirit_price.DEFAULTS 里声明、从没被读）
+    被漏掉 —— 这个漏检是告警文案审计（docs/TEXT_AUDIT.md D11）发现的。
+
+    但**不能整个文件排除**：那些模块自己也会合法地读配置
+    （如 ``self._g("rocket_pct", 2.0)``）。所以只挖声明点、保留读取点。
     """
-    m = re.search(r"^DEFAULTS\s*[:=]", text, re.M)
-    if not m:
-        return text
-    # 从 "DEFAULTS" 起做花括号配平，找到字典结束
-    i = text.find("{", m.start())
-    if i < 0:
-        return text
-    depth, j = 0, i
-    while j < len(text):
-        if text[j] == "{":
-            depth += 1
-        elif text[j] == "}":
-            depth -= 1
-            if depth == 0:
-                break
-        j += 1
-    return text[:m.start()] + text[j + 1:]
+    out = text
+    while True:
+        m = re.search(r"^DEFAULTS\s*[:=]", out, re.M)
+        if not m:
+            return out
+        i = out.find("{", m.start())
+        if i < 0:
+            return out
+        depth, j = 0, i
+        while j < len(out):
+            if out[j] == "{":
+                depth += 1
+            elif out[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        # 保留一个换行，避免把前后两行粘在一起造成误匹配
+        out = out[:m.start()] + "\n" + out[j + 1:]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -131,9 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     parts = []
     for p in sorted(SRC.rglob("*.py")):
         t = p.read_text(encoding="utf-8-sig")
-        if p.name == "config.py":
-            t = strip_defaults(t)      # 只去掉声明点，保留读取点
-        parts.append(t)
+        # 所有模块的 DEFAULTS 都是**声明点**，都要挖掉（见 strip_defaults 注释）
+        parts.append(strip_defaults(t))
     py = "\n".join(parts)
 
     dead: list[tuple[str, int]] = []

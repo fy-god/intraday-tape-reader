@@ -268,6 +268,59 @@ def test_rebound_counterexample_no_prior_drop():
     assert patterns(out) == ["rocket"], "创新高的应归 rocket"
 
 
+def _rebound_state():
+    """10.2 -> 9.9 -> 10.1：自低点拉起 2.02%，窗口涨跌幅 -0.98%。"""
+    st = FakeState()
+    st.feed("600000", [(T0 - 180, 10.2, 1000), (T0 - 120, 10.0, 1300),
+                       (T0 - 60, 9.9, 1600), (T0 - 30, 10.0, 1800),
+                       (T0, 10.1, 2100)])
+    return st
+
+
+def test_rebound_legacy_key_rebound_off_low_pct_is_honoured():
+    """旧配置名 ``rebound_off_low_pct`` 必须真的生效（不只是注释里说兼容）。
+
+    这是一条真实的死键：``config/settings.yaml`` 那行写着
+    "旧配置名，等价于 rebound_pct（保留兼容）"，但代码从来没读过它 ——
+    只有注释在承诺，实现没做。于是把旧名改成一个新值完全不生效，也不报错。
+
+    由 ``tools/check_config_consumed.py`` 抓出（它把各模块 DEFAULTS 的
+    声明点挖掉后再找读取点），对应 docs/TEXT_AUDIT.md D11。
+
+    这里用**行为**验证：把门槛设成 2.5%（大于实际的 2.02%），
+    若旧名真被读了，反弹就不该触发；设成 1.0% 则应当触发。
+    """
+    # 自低点拉起 2.02%：门槛 2.5% -> 不报
+    out_high = run([q_(price=10.1, high=10.25, low=9.9)], _rebound_state(),
+                   cfg={"windows": [180], "rebound_off_low_pct": 2.5,
+                        "rebound_prior_drop_pct": 1.0})
+    assert "rebound" not in patterns(out_high), (
+        "旧名 rebound_off_low_pct=2.5 没生效 —— 2.02% 的反弹仍被报了出来")
+
+    # 门槛 1.0% -> 应报
+    out_low = run([q_(price=10.1, high=10.25, low=9.9)], _rebound_state(),
+                  cfg={"windows": [180], "rebound_off_low_pct": 1.0,
+                       "rebound_prior_drop_pct": 1.0})
+    assert "rebound" in patterns(out_low), (
+        "旧名 rebound_off_low_pct=1.0 没生效 —— 2.02% 的反弹反而没报出来")
+
+
+def test_rebound_new_key_still_wins_over_legacy_default():
+    """新名不能被 DEFAULTS 里那个旧名的默认值压死。
+
+    兼容实现最容易踩的坑：DEFAULTS 里**新旧名都有**（都是 2.0）。
+    若用 merged 判断"用户设了旧名没有"，答案永远为真，于是用户设的
+    ``rebound_pct`` 会被 DEFAULTS 里的旧名默认值静默压掉 ——
+    那就把"兼容"做成了"新名失效"。
+    """
+    out = run([q_(price=10.1, high=10.25, low=9.9)], _rebound_state(),
+              cfg={"windows": [180], "rebound_pct": 5.0,
+                   "rebound_prior_drop_pct": 1.0})
+    assert "rebound" not in patterns(out), (
+        "只设了新名 rebound_pct=5.0（门槛高于 2.02%），却仍报出反弹 —— "
+        "说明新名被 DEFAULTS 里的旧名默认值 2.0 压掉了")
+
+
 def test_rebound_counterexample_drop_too_shallow():
     """跌得太浅（不构成"原来在跌"）-> 不报反弹。"""
     st = FakeState()

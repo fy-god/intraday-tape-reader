@@ -91,6 +91,12 @@ class SpiritPriceRule:
         merged = dict(DEFAULTS)
         merged.update(cfg or {})
         self.cfg = merged
+        # 用户**显式**配置的键（不含 DEFAULTS 补的默认值）。
+        # 兼容别名时必须看这个，而不是 merged —— 因为 DEFAULTS 里新旧名
+        # 都有（rebound_pct 与 rebound_off_low_pct 都是 2.0），
+        # 用 merged 判断"用户设了旧名没有"会永远为真，反而把新名压死。
+        self._user = {k: v for k, v in (cfg or {}).items()
+                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
         self.windows = self._norm_windows(merged.get("windows"))
         self.cooldown = float(merged.get("cooldown_seconds", 300) or 300)
         # 0 = 不限量（约定同 limit_board/volume_burst）。不能用 `or 15`，
@@ -119,6 +125,37 @@ class SpiritPriceRule:
 
     def _g(self, key: str, default: float) -> float:
         return self._n.get(key, default)
+
+    #: 旧配置名 -> 新配置名。settings.yaml 里注释写着这些旧名"保留兼容"，
+    #: 但**此前从未被读取**（只有注释在承诺，代码没实现）—— 于是把
+    #: ``rebound_off_low_pct`` 改成一个新值完全不生效，也不报错。
+    #: 这正是 tools/check_config_consumed.py 抓出来的那类"死键"
+    #: （见 docs/TEXT_AUDIT.md D11）。
+    #:
+    #: 二选一：真的实现兼容，或删掉旧名与那句注释。这里选**实现兼容**，
+    #: 因为旧名已在 settings.yaml 里存在，直接删会让已经照着它配过的用户
+    #: 静默失去设置；实现兼容则新旧都能用，且新名优先。
+    _ALIASES = {"rebound_off_low_pct": "rebound_pct"}
+
+    def _g_alias(self, key: str, default: float) -> float:
+        """读 ``key``；若用户**显式**设了它的旧名，则旧名优先。
+
+        "显式"很关键：DEFAULTS 里新旧名都有（都等于 2.0），若用 merged 判断
+        "有没有旧名"，答案永远是"有"，于是用户设的新名会被 DEFAULTS 里的旧名
+        默认值压掉 —— 那就把"兼容"做成了"新名失效"。
+        """
+        old = None
+        for o, n in self._ALIASES.items():
+            if n == key:
+                old = o
+                break
+        if old is not None and old in self._user:
+            return self._user[old]
+        return self._n.get(key, default)
+
+    def _rebound_threshold(self) -> float:
+        """自低点拉起的门槛：``rebound_pct``，旧名 ``rebound_off_low_pct`` 兼容。"""
+        return self._g_alias("rebound_pct", 2.0)
 
     # ------------------------------------------------------------------
     def evaluate(self, snap: Snapshot, ctx: RuleContext) -> list[Alert]:
@@ -223,7 +260,7 @@ class SpiritPriceRule:
             return None
         # 证据 2：现价确实从低点拉起来了
         off_low = (q.price / low - 1.0) * 100.0
-        if off_low < self._g("rebound_pct", 2.0):
+        if off_low < self._rebound_threshold():
             return None
 
         # 已经创新高的反弹其实就是 rocket，让 rocket 去报，避免同一波两条
