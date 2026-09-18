@@ -186,3 +186,69 @@ def test_theme_foreground_colors_meet_contrast():
     # 层级不能乱：fg3 必须比 fg2 暗，否则"次要信息"看起来比主要信息还重
     assert _lum(colors["--fg3"]) < _lum(colors["--fg2"]), (
         "--fg3 应比 --fg2 暗（它承载时间戳等次要信息）")
+
+
+def test_tooltip_extra_has_units_and_covers_every_whitelisted_key():
+    """悬停提示里的 extra 必须带单位，且**每个**服务端会下发的键都有映射。
+
+    这是一条真实的用户可见缺陷：``extra`` 的键名是英文内部名、值也不带单位，
+    前端直接 ``tip.push(k + " " + v)`` 拼出来是::
+
+        amount 102000000    <- 单位是"元"
+        turnover 5          <- 缺 %
+        window_pct -0.98    <- 缺 %
+
+    而**同一个看板**的股票表用「成交额(亿)」显示同一个量（1.02），
+    于是同屏出现两套单位、差 8 个数量级，用户没法比。
+
+    这条用例做两件事：
+      1. 钉住「服务端白名单里的每个键，前端都有中文名+单位」—— 防止有人
+         在 spirit.py 里新增一个 extra 字段、前端却默默按裸键渲染；
+      2. 钉住未知键**不被丢弃**（原样显示），因为静默丢字段会让排查
+         问题的人以为数据压根没产生。
+    """
+    import re
+
+    from arad import spirit as sp
+
+    html = (ROOT / "src" / "arad" / "server" / "dashboard.html").read_text(encoding="utf-8")
+
+    # 1) 服务端白名单：从 spirit.py 的**源码**里解析出来，而不是在测试里抄一份。
+    #    ⚠ 抄一份会漏掉关键情形：有人在 spirit.py 白名单里新增键、前端没补映射时，
+    #    测试仍拿旧列表比对，照样通过 —— 这条用例就白写了。
+    #    （我第一版就是这么写的，用"往白名单里塞一个未映射键"验证时发现抓不到。）
+    src = (ROOT / "src" / "arad" / "spirit.py").read_text(encoding="utf-8")
+    m_wl = re.search(r'"extra":\s*\{k:\s*_finite\(m\[k\]\)\s*for\s*k\s*in\s*\((.*?)\)',
+                     src, re.S)
+    assert m_wl, "没能从 spirit.py 里解析出 extra 白名单（结构变了？）"
+    keys = tuple(re.findall(r'"(\w+)"', m_wl.group(1)))
+    assert len(keys) >= 5, f"白名单解析可疑：{keys}"
+
+    # 顺带确认这些键确实会被下发（解析出来的列表与真实行为一致）
+    from arad.models import Alert, AlertKind
+    a = Alert(key="k", kind=AlertKind.SURGE, code="600000", name="x", ts=None,
+              price=1.0, pct=1.0, title="t", detail="d",
+              metrics={k: 1.0 for k in keys})
+    extra = sp.to_feed_item(a)["extra"]
+    assert set(extra) == set(keys), f"白名单解析结果与实际不符：{sorted(extra)}"
+
+    # 2) 前端必须有对应的映射表，且覆盖全部键
+    m = re.search(r"var EX_UNITS = \{(.*?)\n  \};", html, re.S)
+    assert m, "dashboard.html 里找不到 EX_UNITS 映射表"
+    mapped = set(re.findall(r"^\s*(\w+):", m.group(1), re.M))
+    missing = set(keys) - mapped
+    assert not missing, (
+        f"这些 extra 键在悬停提示里没有单位映射，会原样渲染成裸键名："
+        f"{sorted(missing)}。请在 dashboard.html 的 EX_UNITS 里补上"
+        f"（中文名 + 换算 + 单位）。")
+
+    # 3) 未知键必须原样保留（不能被静默丢弃）
+    loop = html[html.index("for(var k in ex){"):]
+    loop = loop[:loop.index("el.title")]
+    assert "tip.push(k + \" \" + ex[k])" in loop.replace("'", '"'), (
+        "未知 extra 键必须原样显示；静默丢字段会让排查者以为数据没产生")
+
+    # 4) amount 必须换算成"亿" —— 与同屏股票表的表头口径一致
+    assert re.search(r"amount:\s*\[\s*\"成交额\",\s*1e-8,\s*\"亿\"", m.group(1)), (
+        "amount 应换算成亿（同屏表格用的是「成交额(亿)」），"
+        "否则同一个量会同时以元和亿两种单位出现")

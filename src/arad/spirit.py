@@ -65,9 +65,9 @@ SIGNALS: dict[str, Signal] = {
     "institution_sell": Signal("institution_sell", "机构卖单", DOWN, "order",
                                "卖队列出现大额挂单"),
     "institution_eat": Signal("institution_eat", "机构吃货", UP, "order",
-                              "主动买入成交单巨大（≥50万股/100万元/0.1%流通盘）"),
+                              "区间内主动买入量巨大（≥50万股/100万元/0.1%流通盘）"),
     "institution_vomit": Signal("institution_vomit", "机构吐货", DOWN, "order",
-                                "主动卖出成交单巨大"),
+                                "区间内主动卖出量巨大"),
     "big_bid_wall": Signal("big_bid_wall", "有大买盘", UP, "order",
                            "五档买盘合计 ≥80万股 或 流通盘 0.8%"),
     "big_ask_wall": Signal("big_ask_wall", "有大卖盘", DOWN, "order",
@@ -89,10 +89,13 @@ SIGNALS: dict[str, Signal] = {
     "limit_up": Signal("limit_up", "涨停", UP, "limit", "涨停相关异动"),
     "limit_down": Signal("limit_down", "跌停", DOWN, "limit", "跌停相关异动"),
     # ---- 指数类 -----------------------------------------------------
+    # 窗口可配（spirit_index.DEFAULTS["windows"]，config/settings.yaml 也能改），
+    # 所以 hint 里**不写具体时长** —— 写死「5 分钟」会在把窗口配成 60 秒时
+    # 与规则实际行为矛盾（同 D6 的成因，只是位置不同）。
     "index_pull": Signal("index_pull", "拉升指数", UP, "index",
-                         "5 分钟内指数拉升超阈值"),
+                         "指数在扫描窗口内拉升超阈值"),
     "index_press": Signal("index_press", "打压指数", DOWN, "index",
-                          "5 分钟内指数打压超阈值"),
+                          "指数在扫描窗口内打压超阈值"),
     # ---- 形态类 -----------------------------------------------------
     "high_open_fade": Signal("high_open_fade", "高开低走", DOWN, "pattern",
                              "高开后持续走低"),

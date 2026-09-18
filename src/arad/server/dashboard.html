@@ -829,8 +829,39 @@ function spiritRow(a){
   tip.push("分组 " + spiritGroupLabel(a.group));
   if(a.title) tip.push(a.title);
   var ex = a.extra || {};
+  // extra 的键名是英文内部名，值也不带单位，直接拼会渲染出
+  //   amount 102000000    <- 单位是"元"，而旁边的股票表用"成交额(亿)"显示 1.02
+  //   turnover 5          <- 缺 %
+  // 同一个量在同屏出现两套单位（差 8 个数量级），用户没法比。
+  // 这里把已知键映射成「中文名 + 换算 + 单位」。
+  // ⚠ 未知键仍原样显示（k + " " + v），不要静默丢弃 ——
+  //   丢掉字段会让排查问题的人以为数据没产生。
+  var EX_UNITS = {
+    amount:          ["成交额", 1e-8, "亿", 2],
+    volume_ratio:    ["量比",   1,    "倍", 2],
+    turnover:        ["换手",   1,    "%",  2],
+    seal_amount_wan: ["封单额", 1,    "万元", 0],
+    bid1_amount_wan: ["买一挂单额", 1, "万元", 0],
+    window_pct:      ["区间涨跌", 1,  "%",  2],
+    amplitude:       ["振幅",   1,    "%",  2],
+    ratio_vs_float:  ["占流通盘", 1,  "%",  2]
+  };
   for(var k in ex){
-    if(Object.prototype.hasOwnProperty.call(ex, k) && ex[k] != null) tip.push(k + " " + ex[k]);
+    if(!Object.prototype.hasOwnProperty.call(ex, k) || ex[k] == null) continue;
+    var u = EX_UNITS[k];
+    if(u){
+      var v = Number(ex[k]);
+      if(isFinite(v)){
+        // window_pct 带正负号才有意义（涨/跌）；其余按普通数值渲染
+        var body = (k === "window_pct" && v > 0) ? ("+" + num(v * u[1], u[3]))
+                                                : num(v * u[1], u[3]);
+        tip.push(u[0] + " " + body + u[2]);
+        continue;
+      }
+      tip.push(u[0] + " --");    // 非有限值：显示占位，不显示 NaN
+      continue;
+    }
+    tip.push(k + " " + ex[k]);   // 未知键原样保留
   }
   el.title = tip.join("\n");
   var pctCls = dir === "flat" ? cls(a.pct) : dir;
