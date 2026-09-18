@@ -385,20 +385,20 @@ class LimitBoardRule:
         # 按方向取正确的一侧，并改称"买一挂单/卖一挂单"。
         if rising:
             side_txt = "买一挂单"
-            seal_wan = q.bid_vol * 100.0 * q.price / 10000.0
+            bid1_wan = q.bid_vol * 100.0 * q.price / 10000.0
             limit_txt = f"涨停价 {limit:.2f}"
             extra = f"回落 {retreat:.2f}%"
             title = f"炸板 -{retreat:.2f}%"
         else:
             side_txt = "卖一挂单"
-            seal_wan = q.ask_vol * 100.0 * q.price / 10000.0
+            bid1_wan = q.ask_vol * 100.0 * q.price / 10000.0
             limit_txt = f"跌停价 {limit:.2f}"
             extra = f"回升 {retreat:.2f}%"
             title = f"打开跌停 +{retreat:.2f}%"
         detail = "\n".join([
             f"现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  {limit_txt}  {extra}",
             f"最高 {q.high:.2f}  最低 {q.low:.2f}  振幅 {q.amplitude:.2f}%",
-            f"换手 {q.turnover:.2f}%  成交额 {q.amount / 1e8:.2f}亿  {side_txt} {seal_wan:.0f}万",
+            f"换手 {q.turnover:.2f}%  成交额 {q.amount / 1e8:.2f}亿  {side_txt} {bid1_wan:.0f}万",
         ])
         return Alert(
             key=f"{q.code}:{kind.value}:break:{bucket}",
@@ -413,7 +413,14 @@ class LimitBoardRule:
                 # 所以不要改成 abs —— 那会丢掉"在上还是在下"这个信息，
                 # 而且和既有断言（-4.545）冲突。
                 "distance_to_limit_pct": round((q.price / limit - 1.0) * 100.0, 3),
-                "seal_amount_wan": round(seal_wan, 1),
+                # ⚠ 这里**不能**写 seal_amount_wan：板已经开了，根本不存在封单，
+                # 买一/卖一上那点量只是普通挂单。旧代码复用 _seal_amount_wan()
+                # 并把同一个数同时写进 metrics 和文案，于是字面上说"封单"、
+                # 数值上也在 metrics 里冒充封单 —— 而 seal_amount_wan 在
+                # spirit.to_feed_item 的 extra 白名单里，看板悬停会照原样展示，
+                # 用户就被明确告知"这是封单"。故改用语义正确的 bid1_amount_wan。
+                # 真封板路径（_make_seal）仍然写 seal_amount_wan，那里措辞是对的。
+                "bid1_amount_wan": round(bid1_wan, 1),
                 "one_word_board": 0.0,
                 "is_first_board": 1.0 if self._is_first_board(q, limit, rising) else 0.0,
                 "touch_count": float(self._touch_count(q, ctx, now_ep, limit, rising)),

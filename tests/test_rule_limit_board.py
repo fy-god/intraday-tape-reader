@@ -29,7 +29,12 @@ SEAL_METRIC_KEYS = {
     "seal_amount_wan", "one_word_board", "is_first_board", "touch_count", "stage",
     "pattern", "rising",
 }
-BREAK_METRIC_KEYS = SEAL_METRIC_KEYS | {"retreat_pct"}
+# 炸板/撬板路径**故意不叫 seal_amount_wan**：板已经开了就不存在封单，
+# 买一/卖一那点量只是普通挂单。旧代码复用 _seal_amount_wan 并把同一个数
+# 写进 metrics，而 seal_amount_wan 在 spirit.to_feed_item 的 extra 白名单里，
+# 看板悬停会照原样展示 —— 用户被明确告知"这是封单"。故用 bid1_amount_wan。
+BREAK_METRIC_KEYS = (SEAL_METRIC_KEYS - {"seal_amount_wan"}) | {
+    "retreat_pct", "bid1_amount_wan"}
 
 
 # ==========================================================================
@@ -1079,6 +1084,45 @@ def test_metrics_keys_exact_per_stage():
         mk_ctx(st))[0]
     assert set(brk.metrics) == BREAK_METRIC_KEYS
     assert isinstance(brk.metrics["retreat_pct"], float)
+
+
+def test_break_does_not_claim_a_seal_order_exists():
+    """炸板告警不能说板上还有"封单"—— 板都开了。
+
+    这是一条真实的用户可见缺陷：``_check_break`` 复用了 ``_seal_amount_wan``，
+    于是文案写「买一封单 126万」、``metrics["seal_amount_wan"]`` 也是同一个数。
+    但触发炸板的前提就是现价已远离涨停价（默认回落 ≥0.3%），此时板上
+    **不存在封单**，买一那点量只是普通挂单。而 ``seal_amount_wan`` 在
+    ``spirit.to_feed_item`` 的 extra 白名单里，看板悬停会照原样展示 ——
+    等于明确告诉用户"这是封单"，是指鹿为马。
+
+    注意数字本身算得没错（126 万确实等于买一量 × 价），错的是**标签**；
+    所以这里断言的是语义，不是数值。
+    """
+    st = FakeState()
+    brk = build({}).evaluate(
+        snap_of(limit_up_quote(price=10.5, bid_vol=1200.0, high=11.0, low=10.2)),
+        mk_ctx(st))[0]
+    assert brk.metrics["stage"] == 3.0
+
+    # metrics 侧：不能再出现冒名的 seal_amount_wan
+    assert "seal_amount_wan" not in brk.metrics, (
+        "炸板路径不该产出 seal_amount_wan —— 板已开，没有封单")
+    assert "bid1_amount_wan" in brk.metrics, "应改用语义正确的买一挂单额"
+    # 数值仍要对：(1200 手 × 100 股 × 10.50) / 1e4 = 126.0 万
+    assert brk.metrics["bid1_amount_wan"] == pytest.approx(126.0, abs=0.1)
+
+    # 文案侧：说"挂单"，不说"封单"
+    assert "买一挂单" in brk.detail, brk.detail
+    assert "封单" not in brk.detail, (
+        f"炸板文案里出现了「封单」：{brk.detail!r}")
+
+    # 对照组：真封板时「封单」措辞是**对的**，不能被一起改坏
+    seal = build({}).evaluate(snap_of(limit_up_quote()), mk_ctx(st))[0]
+    assert seal.metrics["stage"] == 2.0
+    assert "seal_amount_wan" in seal.metrics
+    assert "封单" in seal.detail
+    assert "挂单" not in seal.detail
 
 
 def test_max_per_round_limits_output():

@@ -232,10 +232,13 @@ def to_feed_item(alert: Alert) -> dict:
         "severity": int(alert.severity) if isinstance(alert.severity, (int, float))
                     and math.isfinite(float(alert.severity)) else 0,
         "title": alert.title,
-        # 盘口类信号的关键数字，鼠标悬停时展示
+        # 盘口类信号的关键数字，鼠标悬停时展示。
+        # 同时收 seal_amount_wan（真封板）与 bid1_amount_wan（已开板时的买一/卖一
+        # 挂单额）—— 两者语义不同，分开显示才不会把普通挂单说成"封单"。
         "extra": {k: _finite(m[k]) for k in
                   ("amount", "volume_ratio", "turnover", "seal_amount_wan",
-                   "window_pct", "amplitude", "ratio_vs_float")
+                   "bid1_amount_wan", "window_pct", "amplitude",
+                   "ratio_vs_float")
                   if k in m},
     }
 
