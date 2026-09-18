@@ -797,7 +797,7 @@ python tools\probe_live_ready.py                                                
 ### 8.5 全量回归
 
 ```powershell
-python -m pytest -q          # 1029 项，全离线
+python -m pytest -q          # 1064 项，全离线（2026-09-18 实测；数量随测试增长而变）
 ```
 
 `pyproject.toml` 设了 `pythonpath = ["src"]` 与 `testpaths = ["tests"]`。

@@ -203,6 +203,160 @@ def test_source_manager_raises_when_all_fail():
         sm.call("snapshots", ["600000"])
 
 
+def test_source_manager_fails_are_tracked_per_route():
+    """**回归 IT-P1-007**：小额指数请求的成功不得清零个股路由的失败计数。
+
+    真实场景：每轮 ``poll_once`` 先发几千只的个股请求，再发 1~5 只的指数请求。
+    主源对**大请求**失败、对**小额指数请求**成功是很常见的（限流/超时按批量走）。
+    共用一个计数器时，指数请求每轮都会把个股链路攒下的失败计数清零，于是：
+    个股数据一直由备用源提供、``health()`` 却永远显示主源 active，正式切换永不
+    发生，主源还每轮被白试一次（延迟照付）。
+
+    用 ``SizeSensitivePrimary`` 才能如实重现：它在 ``len(codes) > big_limit``
+    时失败、小额时成功。若把两条路由混在一起计账，下面的断言必然失败。
+    """
+
+    class SizeSensitivePrimary:
+        """个股大请求失败、指数小额请求成功的主源。"""
+
+        name = "primary"
+
+        def __init__(self, big_limit: int = 50):
+            self.big_limit = big_limit
+            self.served: list[int] = []
+
+        def snapshots(self, codes):
+            if len(codes) > self.big_limit:
+                from arad.sources.base import SourceError
+
+                raise SourceError("大请求被限流")
+            self.served.append(len(codes))
+            return [make_quote(code="600000")]
+
+        def universe(self):
+            return [make_quote(code="600000")]
+
+        def health(self):
+            return {"name": self.name, "ok": True, "latency_ms": 1, "err": ""}
+
+    primary = SizeSensitivePrimary()
+    backup = FakeSource([make_quote(code="600000")])
+    sm = SourceManager([primary, backup], threshold=3)
+
+    stocks = [f"{600000 + i}" for i in range(100)]     # 大请求 -> 主源失败
+    for _ in range(3):
+        sm.call("snapshots", stocks, route="stocks")   # 备用源顶上
+        sm.call("snapshots", ["sh000001"], route="index")   # 主源成功
+
+    assert sm.current is backup, (
+        "个股链路连续失败 3 次后必须正式切换；"
+        "若仍指向 primary，说明失败计数被指数请求清零了")
+    assert sm.fails_by_route.get("stocks", 0) == 0     # 切换后清零
+    assert sm.serving_of("stocks") == 1                # 个股一直由备用源供数
+    # 主源并没有被冤枉：切换前的小额指数请求它确实服务过。
+    # 第 3 轮切换发生在个股请求之后，此时 backup 已是主源，指数请求直接由
+    # backup 服务 —— 所以是 2 次而非 3 次。这恰好说明切换真的生效了。
+    assert primary.served == [1, 1]
+
+
+def test_route_accounting_keeps_primary_attempts_down():
+    """分清路由后，主源不必每轮都为注定失败的大请求白付一次延迟。"""
+    from arad.sources.base import SourceError
+
+    class AlwaysFailBig:
+        name = "primary"
+
+        def __init__(self):
+            self.big_calls = 0
+
+        def snapshots(self, codes):
+            if len(codes) > 5:
+                self.big_calls += 1
+                raise SourceError("限流")
+            return [make_quote(code="600000")]
+
+        def universe(self):
+            return [make_quote(code="600000")]
+
+        def health(self):
+            return {"name": self.name, "ok": True, "latency_ms": 1, "err": ""}
+
+    primary = AlwaysFailBig()
+    backup = FakeSource([make_quote(code="600000")])
+    sm = SourceManager([primary, backup], threshold=2)
+    big = [f"{600000 + i}" for i in range(100)]
+
+    sm.call("snapshots", big, route="stocks")          # 1 次大请求尝试
+    sm.call("snapshots", ["sh000001"], route="index")  # 主源成功
+    assert sm.current is primary
+    sm.call("snapshots", big, route="stocks")          # 第 2 次 -> 达阈值切换
+    assert sm.current is backup
+    assert primary.big_calls == 2, "切换前主源只该被尝试 threshold 次"
+
+    # 切换后继续跑：主源已经不在首位，不该再收到大请求
+    before = primary.big_calls
+    sm.call("snapshots", big, route="stocks")
+    assert primary.big_calls == before, "已切换后不该再回头试主源的大请求"
+
+
+def test_source_manager_route_specific_counter_isolated():
+    """两条路由的计数互不影响（直接验证分账语义）。
+
+    主源在 ``snapshots`` 上失败、在 ``universe`` 上成功 —— 路由分开计账时，
+    后者不该把前者的计数清零。
+    """
+
+    class FailsSnapshots:
+        name = "primary"
+
+        def snapshots(self, codes):
+            from arad.sources.base import SourceError
+
+            raise SourceError("snapshots 挂了")
+
+        def universe(self):
+            return [make_quote(code="600000")]
+
+        def health(self):
+            return {"name": self.name, "ok": True, "latency_ms": 1, "err": ""}
+
+    backup = FakeSource([make_quote(code="600000")])
+    sm = SourceManager([FailsSnapshots(), backup], threshold=99)   # 阈值拉高，只看计数
+
+    sm.call("snapshots", ["600000"], route="stocks")
+    assert sm.fails_by_route == {"stocks": 1}
+
+    # 主源在 index 路由上成功 -> 只清 index，stocks 的计数必须留着
+    sm.call("universe", route="index")
+    assert sm.fails_by_route.get("stocks") == 1, "指数路由的成功不能清掉个股路由的计数"
+    assert sm.fails_by_route.get("index", 0) == 0
+
+
+def test_source_manager_default_route_is_method_name():
+    """不传 route 时按方法名分账 —— 保持向后兼容，老调用点行为不变。"""
+    bad = FakeSource([], fail_times=99)
+    good = FakeSource([make_quote(code="600000")])
+    sm = SourceManager([bad, good], threshold=2)
+    sm.call("universe")
+    assert sm.fails_by_route == {"universe": 1}
+    assert sm.fails == 1                                     # 旧接口仍可用
+
+
+def test_source_manager_health_reports_serving_routes():
+    """health() 必须能看出「谁在真正供数」，而不只是谁是 active。"""
+    bad = FakeSource([], fail_times=99)
+    good = FakeSource([make_quote(code="600000")])
+    sm = SourceManager([bad, good], threshold=99)
+    sm.call("snapshots", ["600000"], route="stocks")
+    h = sm.health()
+    assert [x["active"] for x in h] == [True, False]
+    # active 是主源，但个股数据其实是备用源在供
+    assert h[0]["serving_routes"] == []
+    assert h[1]["serving_routes"] == ["stocks"]
+    rh = sm.route_health()
+    assert rh["serving"]["stocks"] == "fake"
+
+
 # ==========================================================================
 # Engine 端到端（桩规则）
 # ==========================================================================
@@ -632,6 +786,165 @@ def test_universe_chain_all_fail_keeps_existing_codes(monkeypatch):
     monkeypatch.setattr(eng, "_universe_src", [Boom()])
     assert eng.refresh_universe() == 0
     assert eng._codes == ["600000"], "全失败时不能清空已有股票池"
+
+
+def test_universe_partial_result_does_not_shrink_existing_pool(monkeypatch):
+    """**回归 IT-P1-006**：不完整的部分股票池绝不能覆盖更大的已有池。
+
+    真实场景：新浪 ``universe()`` 中途某页失败会返回前缀（比如 3000 只），
+    旧实现只要「非空」就采用 —— 5563 只的完整池被 3000 只静默覆盖，丢掉 2500
+    多只票却记为「刷新成功」，而且不报任何错（没有任何告警，只是漏掉一半股票）。
+    """
+    st = _settings()
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+    # 现有池更大，且已 pin（模拟上一轮拿到的完整全市场）
+    eng._codes = [f"{600000 + i}" for i in range(5000)]
+    assert len(eng._codes) == 5000
+
+    class PartialSource:
+        name = "sina"
+
+        def universe(self):
+            return [make_quote(code=f"{600000 + i}") for i in range(3000)]   # 只有 3000
+
+        def universe_info(self):
+            return {"complete": False, "pages_failed": 1, "returned": 3000,
+                    "reason": "第 31 页失败"}
+
+    monkeypatch.setattr(eng, "_universe_src", [PartialSource()])
+    n = eng.refresh_universe()
+
+    assert n == 0, "部分结果比现有池小 -> 必须拒绝，返回 0 表示没采用"
+    assert len(eng._codes) == 5000, (
+        f"5563 只的完整池被 {len(eng._codes)} 只的部分池覆盖了")
+
+
+def test_universe_partial_result_is_used_when_it_is_larger(monkeypatch):
+    """部分结果比现有池**更大**时可以使用（否则永远无法从小池长回来）。"""
+    st = _settings()
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+    eng._codes = ["600000"]                                   # 现有池很小
+
+    class PartialSource:
+        name = "sina"
+
+        def universe(self):
+            return [make_quote(code=f"{600000 + i}") for i in range(300)]
+
+        def universe_info(self):
+            return {"complete": False, "pages_failed": 1, "returned": 300,
+                    "reason": "第 4 页失败"}
+
+    monkeypatch.setattr(eng, "_universe_src", [PartialSource()])
+    n = eng.refresh_universe()
+    assert n == 300
+    assert len(eng._codes) == 300
+
+
+def test_universe_prefers_complete_over_partial(monkeypatch):
+    """**回归 IT-P1-006**：先给部分结果的来源不该终止链条，应继续找完整的。
+
+    旧实现「任一非空即采用」，遇到第一个来源只给部分数据就停，后面的完整来源
+    永远拿不到机会。
+    """
+    st = _settings()
+    st.section("sources")["universe"] = ["sina", "eastmoney"]
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+    calls: list[str] = []
+
+    class Partial:
+        name = "sina"
+
+        def universe(self):
+            calls.append("sina")
+            return [make_quote(code=f"{600000 + i}") for i in range(3000)]
+
+        def universe_info(self):
+            return {"complete": False, "pages_failed": 1, "returned": 3000,
+                    "reason": "中途失败"}
+
+    class Complete:
+        name = "eastmoney"
+
+        def universe(self):
+            calls.append("eastmoney")
+            return [make_quote(code=f"{600000 + i}") for i in range(5000)]
+
+        def universe_info(self):
+            return {"complete": True, "pages_failed": 0, "returned": 5000}
+
+    monkeypatch.setattr(eng, "_universe_src", [Partial(), Complete()])
+    n = eng.refresh_universe()
+
+    assert calls == ["sina", "eastmoney"], f"部分结果后必须继续尝试，实际 {calls}"
+    assert n == 5000
+    assert len(eng._codes) == 5000
+
+
+def test_universe_partial_smaller_than_complete_earlier_in_chain(monkeypatch):
+    """兜底候选取**最大**的部分结果，不被更小的部分结果挤掉。"""
+    st = _settings()
+    st.section("sources")["universe"] = ["a", "b"]
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+
+    class Partial:
+        def __init__(self, name, n):
+            self.name = name
+            self.n = n
+
+        def universe(self):
+            return [make_quote(code=f"{600000 + i}") for i in range(self.n)]
+
+        def universe_info(self):
+            return {"complete": False, "pages_failed": 1, "returned": self.n,
+                    "reason": "中途失败"}
+
+    monkeypatch.setattr(eng, "_universe_src", [Partial("a", 300), Partial("b", 900)])
+    n = eng.refresh_universe()
+    assert n == 900, "所有来源都只有部分数据时，应采用其中最大的一个"
+
+
+def test_universe_meta_is_recorded_on_success(monkeypatch):
+    """成功后要记下完整性元数据，供看板/诊断判断这一轮的池可不可信。"""
+    st = _settings()
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+
+    class Complete:
+        name = "eastmoney"
+
+        def universe(self):
+            return [make_quote(code=f"{600000 + i}") for i in range(120)]
+
+        def universe_info(self):
+            return {"complete": True, "pages_failed": 0, "returned": 120,
+                    "expected_total": 120}
+
+    monkeypatch.setattr(eng, "_universe_src", [Complete()])
+    assert eng.refresh_universe() == 120
+    assert eng._universe_meta["complete"] is True
+    assert eng._universe_meta["expected_total"] == 120
+
+
+def test_universe_source_without_meta_is_treated_as_complete(monkeypatch):
+    """来源没实现 ``universe_info``（如腾讯）时按完整处理 —— 不能因缺元数据就拒绝。"""
+    st = _settings()
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 calendar=_morning_cal())
+
+    class NoMeta:
+        name = "tencent"
+
+        def universe(self):
+            return [make_quote(code=f"{600000 + i}") for i in range(50)]
+
+    monkeypatch.setattr(eng, "_universe_src", [NoMeta()])
+    assert eng.refresh_universe() == 50
+    assert len(eng._codes) == 50
 
 
 def test_universe_refresh_falls_back_to_watchlist(monkeypatch):

@@ -185,8 +185,25 @@ class AlertBus:
 # ==========================================================================
 # 数据源故障转移
 # ==========================================================================
+#: 故障转移的记账路由。**必须分开**：个股请求有几千只、指数只有几只，
+#: 共用一个失败计数器时，几乎不会失败的指数请求每轮都会把个股链路的失败
+#: 计数清零，正式切换永远不会发生（IT-P1-007）。
+ROUTE_STOCKS = "stocks"
+ROUTE_INDEX = "index"
+ROUTE_UNIVERSE = "universe"
+
+
 class SourceManager:
-    """主源 + 备用源，连续失败达阈值自动切换。"""
+    """主源 + 备用源，连续失败达阈值自动切换。
+
+    失败计数按 **路由（route）** 分开记账（IT-P1-007）。原因：一轮
+    ``poll_once`` 会发出两类 ``snapshots`` 请求 —— 全市场几千只的个股请求，
+    和只含 ``index_codes`` 那几只的指数请求。指数请求几乎不会失败；若两条
+    路由共用一个计数器，指数请求每轮成功都会把个股请求攒下的失败计数清零，
+    后果是：个股数据一直由备用源提供、``health()`` 却始终显示主源 active，
+    主源还每轮都被白试一次（延迟照付），正式切换永远不会发生。
+    按路由分开后，「个股链路连续失败」才能如实累计到阈值并触发切换。
+    """
 
     def __init__(self, sources: list[Any], *, threshold: int = 3):
         if not sources:
@@ -194,28 +211,52 @@ class SourceManager:
         self.sources = sources
         self.threshold = max(int(threshold), 1)
         self.idx = 0
-        self.fails = 0
+        self._fails: dict[str, int] = {}      # route -> 连续由备用源服务/全失败次数
+        self._serving: dict[str, int] = {}    # route -> 最近一次实际供数的源下标
         self.history: list[dict] = []
 
     @property
     def current(self):
         return self.sources[self.idx]
 
+    @property
+    def fails(self) -> int:
+        """所有路由的失败计数之和（保留旧接口，看板/测试仍可用）。"""
+        return sum(self._fails.values())
+
+    @property
+    def fails_by_route(self) -> dict[str, int]:
+        """各路由的连续失败计数快照。"""
+        return dict(self._fails)
+
+    def serving_of(self, route: str) -> int | None:
+        """某路由最近一次实际供数的源下标（``None`` = 还没有成功过）。"""
+        return self._serving.get(route)
+
     def _switch(self) -> None:
         if len(self.sources) > 1:
             self.idx = (self.idx + 1) % len(self.sources)
-            self.fails = 0
+            self._fails.clear()
             log.warning("数据源切换 -> %s", getattr(self.current, "name", "?"))
 
-    def call(self, method: str, *args):
+    def _bump(self, route: str) -> int:
+        self._fails[route] = self._fails.get(route, 0) + 1
+        return self._fails[route]
+
+    def call(self, method: str, *args, route: str | None = None):
         """调用当前源；失败则按顺序尝试备用源。
 
         语义：
         * 每个源自身已实现内部重试，本方法对每个源只尝试一次。
-        * 主源失败、备用源成功 => 本次返回备用源数据（热备），并累加失败计数；
-          连续失败达到 ``threshold`` 后把该备用源提升为主源（正式切换）。
+        * 主源失败、备用源成功 => 本次返回备用源数据（热备），并累加**该路由**的
+          失败计数；连续失败达到 ``threshold`` 后把该备用源提升为主源（正式切换）。
         * 全部失败 => 抛出最后一个异常。
+
+        ``route`` 把不同用途的调用分开记账（缺省按方法名）。个股请求与指数请求
+        必须传不同的 route，否则小额指数请求的成功会把个股链路的失败计数清零，
+        正式切换永远不会发生（IT-P1-007）。
         """
+        route = route or method
         order = [self.idx] + [i for i in range(len(self.sources)) if i != self.idx]
         last_exc: Exception | None = None
         for i in order:
@@ -226,20 +267,21 @@ class SourceManager:
                 last_exc = exc
                 log.warning("数据源 %s.%s 失败: %s", getattr(src, "name", "?"), method, exc)
                 continue
+            self._serving[route] = i
             if i == self.idx:
-                self.fails = 0
+                self._fails[route] = 0
             else:
-                self.fails += 1
-                log.info("已由备用源 %s 提供服务（连续 %d/%d）",
-                         getattr(src, "name", "?"), self.fails, self.threshold)
-                if self.fails >= self.threshold:
+                n = self._bump(route)
+                log.info("路由 %s 已由备用源 %s 提供服务（连续 %d/%d）",
+                         route, getattr(src, "name", "?"), n, self.threshold)
+                if n >= self.threshold:
                     self.idx = i
-                    self.fails = 0
+                    self._fails.clear()
                     log.warning("数据源已正式切换 -> %s", getattr(src, "name", "?"))
             return out
 
-        self.fails += 1
-        if self.fails >= self.threshold:
+        n = self._bump(route)
+        if n >= self.threshold:
             self._switch()
         if last_exc:
             raise last_exc
@@ -247,15 +289,28 @@ class SourceManager:
 
     def health(self) -> list[dict]:
         out = []
-        for s in self.sources:
+        for pos, s in enumerate(self.sources):
             try:
                 h = s.health()
             except Exception as exc:  # noqa: BLE001
                 h = {"name": getattr(s, "name", "?"), "ok": False, "latency_ms": 0, "err": str(exc)}
             h = dict(h)
-            h["active"] = (s is self.current)
+            h["active"] = (pos == self.idx)
+            # 如实反映「谁在真正供数」：主源 active 而个股路由其实一直由备用源
+            # 服务时，只看 active 会得出完全错误的结论（IT-P1-007）。
+            h["serving_routes"] = sorted(r for r, i in self._serving.items() if i == pos)
             out.append(h)
         return out
+
+    def route_health(self) -> dict:
+        """按路由的故障转移状况（诊断用，不属数据源契约）。"""
+        return {
+            "threshold": self.threshold,
+            "primary": getattr(self.current, "name", "?"),
+            "fails_by_route": dict(self._fails),
+            "serving": {r: getattr(self.sources[i], "name", "?")
+                        for r, i in self._serving.items()},
+        }
 
 
 # ==========================================================================
@@ -376,6 +431,8 @@ class Engine:
         # 让离线测试变成依赖网络、且结果随机。
         self._codes_pinned = False
         self._universe_refreshed_at: float = 0.0
+        #: 最近一次成功刷新股票池的完整性元数据（IT-P1-006）。
+        self._universe_meta: dict[str, Any] = {}
         self._poll_count = 0
         self._errors = 0
         self._stop = False
@@ -456,7 +513,10 @@ class Engine:
         if not self.index_codes or not self._wants_indices:
             return []
         try:
-            return self.sources.call("snapshots", list(self.index_codes))
+            # route 必须与个股请求分开：指数只有几只、几乎不会失败，若共用计数器
+            # 就会每轮把个股链路的失败计数清零（IT-P1-007）。
+            return self.sources.call("snapshots", list(self.index_codes),
+                                     route=ROUTE_INDEX)
         except Exception as exc:  # noqa: BLE001 - 指数是加分项，不能拖垮主循环
             self.log.warning("指数行情抓取失败（不影响个股）: %s", exc)
             return []
@@ -505,34 +565,101 @@ class Engine:
             self._universe_src = chain or [self.sources]
         return self._universe_src
 
+    def _universe_meta_of(self, src: Any, quotes: list[Any]) -> dict:
+        """取某来源最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
+
+        来源没实现 ``universe_info`` 时退化为「按条数判断」，绝不能因为拿不到
+        元数据就把部分结果当完整结果用。
+        """
+        info: dict = {}
+        fn = getattr(src, "universe_info", None)
+        if callable(fn):
+            try:
+                got = fn()
+                if isinstance(got, dict):
+                    info = dict(got)
+            except Exception as exc:  # noqa: BLE001 - 元数据拿不到不能拖垮刷新
+                self.log.warning("读取 %s 的股票池元数据失败: %s",
+                                 getattr(src, "name", src), exc)
+        info.setdefault("returned", len(quotes))
+        info.setdefault("complete", True)
+        return info
+
     def refresh_universe(self) -> int:
         """刷新股票池代码列表（默认每 30 分钟一次）。
 
-        按 ``sources.universe`` 的顺序依次尝试，**任一来源返回非空就采用**；
+        按 ``sources.universe`` 的顺序依次尝试，采用第一个**可用**结果：
+
+        * 完整结果（``complete=True``）**立即采用**，后续来源不再尝试；
+        * 不完整结果（``complete=False``，即分页中途失败/翻页被截断）只作为
+          **兜底候选**，继续往后试，只有所有来源都没给出完整结果时才采用其中
+          最大的那个 —— 且**绝不用它覆盖更大的已有股票池**（IT-P1-006）。
+
+        为什么必须这样：新浪 ``universe()`` 中途某页失败会返回前缀，东财被限流
+        时也会少几页。没有完整性判断时，「5563 只的完整池」会被「3000 只的部分
+        池」静默覆盖 —— 丢掉 2500 多只票却记为「刷新成功」，而且不报任何错。
         全失败才告警并保留原股票池（绝不清空 —— 清空会让引擎彻底停摆）。
         """
         last_exc: Exception | None = None
+        partial: tuple[int, list[Any], dict, Any] | None = None
         for src in self._universe_sources():
+            name = getattr(src, "name", src)
             try:
-                quotes = (src.call("universe") if isinstance(src, SourceManager)
+                quotes = (src.call("universe", route=ROUTE_UNIVERSE)
+                          if isinstance(src, SourceManager)
                           else src.universe())
             except Exception as exc:  # noqa: BLE001
                 last_exc = exc
-                self.log.warning("股票池来源 %s 失败: %s",
-                                 getattr(src, "name", src), exc)
+                self.log.warning("股票池来源 %s 失败: %s", name, exc)
                 continue
             if not quotes:
                 continue
+            meta = self._universe_meta_of(src, quotes)
+            if not meta.get("complete", True):
+                # 候选比较阶段用**纯函数**，不写 state.universe —— 部分结果
+                # 可能因「比现有池更小」而被拒绝，拒绝后不该留下任何痕迹。
+                cand = self._extract_codes(quotes)
+                if not cand:
+                    continue
+                self.log.warning(
+                    "股票池来源 %s 只拿到部分数据（%d 只，%s），继续尝试后续来源",
+                    name, len(cand), meta.get("reason") or "未知原因")
+                # 兜底候选取最大者，避免被更小的部分结果挤掉。
+                if partial is None or len(cand) > partial[0]:
+                    partial = (len(cand), quotes, meta, src)
+                continue
             codes = self._record_universe(quotes)
-            if codes:
-                # 直接写底层字段：这里拿到的是**真·全市场**，必须保持"未 pin"，
-                # 否则 TTL 到期后不会再有下一次刷新（_codes 的 setter 会 pin）。
-                self._codes_raw = codes
-                self._codes_pinned = False
-                self._universe_refreshed_at = time.time()
-                self.log.info("股票池已刷新: %d 只（来源 %s）",
-                              len(codes), getattr(src, "name", src))
-                return len(codes)
+            if not codes:
+                continue
+            # 直接写底层字段：这里拿到的是**真·全市场**，必须保持"未 pin"，
+            # 否则 TTL 到期后不会再有下一次刷新（_codes 的 setter 会 pin）。
+            self._codes_raw = codes
+            self._codes_pinned = False
+            self._universe_refreshed_at = time.time()
+            self._universe_meta = meta
+            self.log.info("股票池已刷新: %d 只（来源 %s）", len(codes), name)
+            return len(codes)
+
+        if partial is not None:
+            n, pquotes, meta, src = partial
+            name = getattr(src, "name", src)
+            prev = len(self._codes_raw)
+            if prev and n < prev:
+                # 关键保护：不完整的部分池比现有池更小 -> 拒绝覆盖，保留现有池。
+                # 否则 5563 只会被 3000 只静默替换，且记为「刷新成功」。
+                self.log.warning(
+                    "所有来源都只给出部分股票池；%s 仅 %d 只 < 现有 %d 只，"
+                    "保留现有股票池以免缩小扫描范围", name, n, prev)
+                return 0
+            codes = self._record_universe(pquotes)
+            self._codes_raw = codes
+            self._codes_pinned = False
+            self._universe_refreshed_at = time.time()
+            self._universe_meta = meta
+            self.log.warning("股票池已用**部分**结果刷新: %d 只（来源 %s，%s）",
+                             len(codes), name, meta.get("reason") or "未知原因")
+            return len(codes)
+
         if last_exc is not None:
             self.log.warning("所有股票池来源都失败，保留原股票池: %s", last_exc)
         return 0
@@ -544,6 +671,26 @@ class Engine:
         ``list_date``，新浪这条链路拿不到，此时该字段为空、新股过滤自动失效
         （规则里对空值一律放行，不会误杀）。
         """
+        codes = self._extract_codes(quotes)
+        for q in quotes:
+            code = getattr(q, "code", None) or (q.get("code") if isinstance(q, dict) else None)
+            if code and not isinstance(q, dict):
+                self.state.universe[str(code).strip()] = q
+        if codes:
+            self.filters.list_dates = {
+                q.code: str(q.list_date or "")
+                for q in self.state.universe.values()
+                if getattr(q, "list_date", "")
+            }
+        return codes
+
+    @staticmethod
+    def _extract_codes(quotes: list[Any]) -> list[str]:
+        """纯函数：从 quotes 里提取去重后的合法 6 位代码。
+
+        与 ``_record_universe`` 分开是为了让「只做候选比较、尚未决定是否采用」
+        的路径没有副作用 —— 被拒绝的部分结果不该污染 ``state.universe``。
+        """
         codes: list[str] = []
         seen: set[str] = set()
         for q in quotes:
@@ -554,15 +701,7 @@ class Engine:
             if not (len(c) == 6 and c.isdigit()) or c in seen:
                 continue
             seen.add(c)
-            if not isinstance(q, dict):
-                self.state.universe[c] = q
             codes.append(c)
-        if codes:
-            self.filters.list_dates = {
-                q.code: str(q.list_date or "")
-                for q in self.state.universe.values()
-                if getattr(q, "list_date", "")
-            }
         return codes
 
     def _maybe_refresh_universe(self, *, force: bool = False) -> None:
@@ -608,7 +747,8 @@ class Engine:
         quotes: list[Quote] = []
         if self._codes:
             try:
-                quotes = self.sources.call("snapshots", list(self._codes))
+                quotes = self.sources.call("snapshots", list(self._codes),
+                                           route=ROUTE_STOCKS)
             except Exception as exc:  # noqa: BLE001
                 self._errors += 1
                 self.log.warning("行情抓取失败: %s", exc)

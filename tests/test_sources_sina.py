@@ -1172,6 +1172,84 @@ class TestUniverseUrlStatsAndRoundTrip:
         assert s["errors"] >= 1              # 失败尝试有记录
         assert src.health()["ok"] is False
 
+    def test_universe_completeness_is_reported_when_it_reaches_the_end(self):
+        """**回归 IT-P1-006**：正常翻到底 -> ``complete=True``。
+
+        没有这个标记，引擎无法区分「翻完了的 100 只」和「翻了 1 页就停的
+        100 只」，两者都只是"非空"。
+        """
+        f = FakeFetcher(lambda u, h, t: (
+            uni_json(uni_rows(seq_codes(1))) if page_of(u) == 1 else b"[]"))
+        src = SinaSource(UNIVERSE_CFG, fetcher=f)
+        assert len(src.universe()) == UNIVERSE_PAGE_SIZE
+        info = src.universe_info()
+        assert info["complete"] is True
+        assert info["pages_failed"] == 0
+        assert info["returned"] == UNIVERSE_PAGE_SIZE
+
+    def test_universe_is_incomplete_when_a_middle_page_fails(self):
+        """**回归 IT-P1-006**：中途某页失败 -> 部分结果必须标成 ``complete=False``。
+
+        这正是"5563 只被 3000 只静默覆盖"的来源：旧实现把它当成功返回。
+        """
+        def respond(url, headers, timeout):
+            n = page_of(url)
+            if n == 1:
+                return uni_json(uni_rows(seq_codes(1)))
+            raise RuntimeError("第 2 页网络失败")
+
+        src = SinaSource(UNIVERSE_CFG, fetcher=FakeFetcher(respond))
+        got = src.universe()
+        assert len(got) == UNIVERSE_PAGE_SIZE          # 仍然保留部分结果
+        info = src.universe_info()
+        assert info["complete"] is False, "部分结果绝不能报成完整"
+        assert info["pages_failed"] == 1
+        assert info["returned"] == UNIVERSE_PAGE_SIZE
+        assert "2" in info["reason"]
+
+    def test_universe_is_incomplete_when_page_cap_truncates(self):
+        """**回归 IT-P1-006**：翻满上限仍未到底 -> ``complete=False``。
+
+        这种"不是失败的失败"最危险：返回了几千只、看着很成功，其实只是全市场的
+        一个前缀。页数上限被截断时必须如实标成不完整。
+        """
+        src = SinaSource(UNIVERSE_CFG, fetcher=FakeFetcher(always_new_pages))
+        got = src.universe(max_pages=3)
+        assert len(got) == 3 * UNIVERSE_PAGE_SIZE
+        info = src.universe_info()
+        assert info["complete"] is False
+        assert info["pages_requested"] == 3
+        assert info["pages_ok"] == 3
+        assert "截断" in info["reason"]
+
+    def test_universe_complete_resets_after_a_clean_round(self):
+        """坏了一轮之后再成功，标记要回到 complete=True（不能永久卡在 False）。"""
+        state = {"fail": True}
+
+        def respond(url, headers, timeout):
+            n = page_of(url)
+            if n == 1:
+                return uni_json(uni_rows(seq_codes(1)))
+            if state["fail"]:
+                raise RuntimeError("挂了")
+            return b"[]"
+
+        src = SinaSource(UNIVERSE_CFG, fetcher=FakeFetcher(respond))
+        src.universe()
+        assert src.universe_info()["complete"] is False
+        state["fail"] = False
+        assert len(src.universe()) == UNIVERSE_PAGE_SIZE
+        assert src.universe_info()["complete"] is True
+
+    def test_first_page_failure_reports_incomplete_metadata(self):
+        """第 1 页就失败 -> 抛错，同时元数据也必须是"不完整"（不是空 dict）。"""
+        src = SinaSource(UNIVERSE_CFG, fetcher=FakeFetcher(lambda u, h, t: b""))
+        with pytest.raises(SourceError):
+            src.universe()
+        info = src.universe_info()
+        assert info["complete"] is False
+        assert info["returned"] == 0
+
     def test_universe_codes_feed_straight_into_snapshots(self):
         """两接口衔接：universe() 给的代码（含 B 股）能原样喂给 snapshots()。"""
         def respond(url, headers, timeout):

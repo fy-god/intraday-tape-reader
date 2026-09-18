@@ -368,6 +368,8 @@ class SinaSource:
             "last_ms": 0,
             "last_err": "",
         }
+        #: 最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
+        self._last_universe: dict[str, Any] = {}
 
     # --- 对外接口（Source 协议） ---------------------------------------
     def universe(self, max_pages: int | None = None) -> list[Quote]:
@@ -386,6 +388,10 @@ class SinaSource:
         seq = self._next_seq()
         out: list[Quote] = []
         seen: set[str] = set()
+        failed_pages: list[int] = []
+        pages_ok = 0
+        # 循环是「正常翻到底」还是「页数用尽被截断」，决定本次结果完不完整。
+        ended_clean = False
 
         for page in range(1, pages + 1):
             url = (
@@ -396,8 +402,16 @@ class SinaSource:
                 raw = self._request(url)
             except SourceError:
                 if page == 1:
+                    with self._lock:
+                        self._last_universe = {
+                            "complete": False, "pages_failed": 1,
+                            "pages_ok": 0, "pages_requested": pages,
+                            "expected_total": 0, "returned": 0,
+                            "reason": "第 1 页即失败",
+                        }
                     raise
                 # 中途某页失败：保留已拿到的部分，别让整轮股票池刷新报废
+                failed_pages.append(page)
                 with self._lock:
                     self._stats["pages_failed"] += 1
                     self._stats["last_err"] = f"universe 第 {page} 页失败"
@@ -405,7 +419,8 @@ class SinaSource:
 
             batch = parse_universe(raw, seq)
             if not batch:
-                break                      # 翻到空页 = 到底了
+                ended_clean = True       # 翻到空页 = 到底了
+                break
             # 逐个判重并**立即写入 seen**：先整体过滤再统一更新 seen 的话，
             # 同一页内部的重复代码会一起通过（节点数据抖动时真的出现过重复）。
             fresh: list[Quote] = []
@@ -415,12 +430,40 @@ class SinaSource:
                 seen.add(q.code)
                 fresh.append(q)
             if not fresh:
-                break                      # 整页都是重复 -> 数据源在回绕，停
+                ended_clean = True       # 整页都是重复 -> 数据源在回绕，停
+                break
             out.extend(fresh)
+            pages_ok += 1
+        else:
+            # for 正常跑完 = 一直没遇到空页/重复页，页数上限把结果截断了。
+            # 这种「不是失败的失败」最危险：返回了几千只、看着很成功，
+            # 其实只是全市场的一个前缀。必须如实标成不完整（IT-P1-006）。
+            ended_clean = False
 
+        complete = ended_clean and not failed_pages
         with self._lock:
             self._stats["calls"] += 1
+            self._last_universe = {
+                "complete": complete,
+                "pages_failed": len(failed_pages),
+                "pages_ok": pages_ok,
+                "pages_requested": pages,
+                "expected_total": 0,      # 新浪列表接口不返回总数，只能靠翻到底判断
+                "returned": len(out),
+                "reason": ("已翻到底" if ended_clean else
+                           (f"第 {failed_pages[0]} 页起失败" if failed_pages
+                            else f"翻满 {pages} 页仍未到底，可能被截断")),
+            }
         return out
+
+    def universe_info(self) -> dict:
+        """最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
+
+        契约之外的诊断接口：``complete=False`` 表示这次只拿到全市场的一部分，
+        调用方（``Engine.refresh_universe``）据此拒绝用小块覆盖更大的完整股票池。
+        """
+        with self._lock:
+            return dict(getattr(self, "_last_universe", {}) or {})
 
     def snapshots(self, codes: list[str]) -> list[Quote]:
         """指定代码的最新快照（每批 ``bulk_chunk``，并发）。批次失败即抛 SourceError。"""

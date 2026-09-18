@@ -307,20 +307,34 @@ class EastmoneySource:
             "last_ms": 0,
             "last_err": "",
         }
+        #: 最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
+        self._last_universe: dict[str, Any] = {}
 
     # --- 对外接口（Source 协议） ---------------------------------------
     def universe(self) -> list[Quote]:
-        """全市场股票池快照（翻页 + 并发）。"""
+        """全市场股票池快照（翻页 + 并发）。
+
+        完整性（IT-P1-006）：``total`` 可用时，期望页数由总数算出，
+        ``pages_failed`` 为空才算完整；``total`` 不可用（``data/diff`` 为 null）
+        时只能顺序探测，遇空页即停，此时**无法证明**拿全了，故标为不完整。
+        """
         seq = self._next_seq()
         failed: list[int] = []
+        pages_requested = 0
+        expected_total = 0
+        reason = ""
         first = self._request_json(self._clist_url(1))
         quotes = parse_clist(first, seq)
         total = self._total_of(first)
         if total > 0:
+            expected_total = total
             pages = min(self.max_pages, -(-total // self.page_size))
+            pages_requested = pages
             if pages > 1:
                 more, failed = self._fetch_pages(range(2, pages + 1), seq)
                 quotes.extend(more)
+            if failed:
+                reason = f"第 {failed[0]} 页起失败，共 {len(failed)} 页"
         else:
             # total 不可用（data/diff 为 null）：顺序探测，遇空页即停，避免空转 80 页
             for pn in range(2, self.max_pages + 1):
@@ -328,10 +342,31 @@ class EastmoneySource:
                 if not rows:
                     break
                 quotes.extend(rows)
+                pages_requested = pn
+            else:
+                pages_requested = self.max_pages
+            # 没有 total 就没有「应该有多少只」的基准，无法证明完整。
+            reason = "接口未返回总数，只能顺序探测，无法确认是否翻完"
         out = _dedupe(quotes)
         err = f"clist {len(failed)} 页失败: {failed[:5]}" if failed else ""
+        complete = bool(total > 0) and not failed
+        with self._lock:
+            self._last_universe = {
+                "complete": complete,
+                "pages_failed": len(failed),
+                "pages_ok": max(pages_requested - len(failed), 0),
+                "pages_requested": pages_requested,
+                "expected_total": expected_total,
+                "returned": len(out),
+                "reason": reason or "已按总数翻完",
+            }
         self._finish(err, out)
         return out
+
+    def universe_info(self) -> dict:
+        """最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。"""
+        with self._lock:
+            return dict(getattr(self, "_last_universe", {}) or {})
 
     def snapshots(self, codes: list[str]) -> list[Quote]:
         """指定 6 位代码的最新快照（每批 ≤50 码，并发）。批次失败即抛 SourceError。"""
