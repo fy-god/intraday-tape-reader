@@ -298,6 +298,11 @@ class UnusualRule:
         sealed_at = None           # 最近一次「曾涨停」的时间
         pulled_back = False        # 该次封板之后是否跌离涨停超过阈值
         floor = limit * (1.0 - pullback_pct / 100.0)
+        # 窗口内最低价。文案说的是「近 N 分钟内」，所以这里必须只统计窗口内的点 ——
+        # 旧代码图省事直接用 q.low（**当日**最低），于是"近 10 分钟内最低 10.30"
+        # 里的 10.30 可能出现在几小时前，回落幅度被夸大十几倍
+        # （实测：窗口内真实最低 10.94 -> 0.55%，却印成当日口径的 6.36%）。
+        win_low = 0.0
         for point in rows:
             try:
                 t = float(point[0])
@@ -306,6 +311,8 @@ class UnusualRule:
                 continue
             if t < start or t > now_epoch or p <= 0.0:
                 continue
+            if win_low <= 0.0 or p < win_low:
+                win_low = p
             if sealed_at is None:
                 if p >= limit - tol:
                     sealed_at = t       # 窗口内第一次触及涨停
@@ -319,13 +326,21 @@ class UnusualRule:
         if sealed_at is None or not pulled_back:
             return None
 
-        gap = (limit - float(q.low)) / limit * 100.0
+        # 窗口内一个有效点都没有时（理论上不会走到这里，因为 pulled_back
+        # 需要窗口内的点）退回当日最低，保证不会算出 0 元这种数。
+        if win_low <= 0.0:
+            win_low = float(q.low)
+
+        gap = (limit - win_low) / limit * 100.0
         return self._mk(
             q, ctx, ts, bucket, "reseal", _SEV_RESEAL,
             title="快速回封",
-            extra=f"近 {reseal_seconds / 60.0:.0f} 分钟内炸板回落（最低 {float(q.low):.2f} 元，"
+            extra=f"近 {reseal_seconds / 60.0:.0f} 分钟内炸板回落（最低 {win_low:.2f} 元，"
                   f"较涨停价 {gap:.2f}%）后重新封上涨停 {limit:.2f} 元",
-            metrics={"limit_up_price": limit, "low": float(q.low)},
+            # metrics 里同时保留两个口径，避免下游把"窗口最低"误当"当日最低"
+            metrics={"limit_up_price": limit, "low": win_low,
+                     "day_low": float(q.low),
+                     "reseal_window_seconds": float(reseal_seconds)},
         )
 
     # ------------------------------------------------------------------

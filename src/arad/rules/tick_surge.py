@@ -245,19 +245,35 @@ class TickSurgeRule:
         if threshold and abs(change) >= abs(threshold) * self.urgent_multiple:
             severity = 3
 
-        to_limit = 0.0
-        if q.limit_up_price > 0 and q.price > 0:
-            to_limit = (q.limit_up_price / q.price - 1.0) * 100.0
+        # 距限价：方向必须跟着**告警方向**走。
+        # 急拉看"离涨停还有多远"（+ 号读作"还能涨多少"）；
+        # 急跌看"离跌停还有多远"。旧代码只算涨停口径、且两个方向共用同一行
+        # detail，于是急跌告警里印着「距涨停 +13.40%」——
+        # 一条 kind=plunge、标题为负的告警带着一个「+」号，
+        # 而用户真正需要的「距跌停」在整条告警里根本不存在。
+        #
+        # 仅在对应限价可用时才输出：拿不到真实限价（如指数、缺字段）时
+        # **不打印**这个字段，而不是打一个 0.00% 让用户误以为"贴着了"。
+        to_limit = None
+        if q.price > 0:
+            if kind is AlertKind.SURGE and q.limit_up_price > 0:
+                to_limit = (q.limit_up_price / q.price - 1.0) * 100.0
+            elif kind is AlertKind.PLUNGE and q.limit_down_price > 0:
+                to_limit = (q.price / q.limit_down_price - 1.0) * 100.0
+        limit_label = "距涨停" if kind is AlertKind.SURGE else "距跌停"
 
         amount_yi = q.amount / 1e8
         title = f"{verb} {fmt_pct(change)} / {win_txt}"
         vwap_txt = "上方" if self._above_vwap(q) else "下方"
         ratio_txt = "数据不足" if vol_ratio is None else f"{vol_ratio:.2f}倍"
+        # 拿不到限价时整段省略（连同标签），免得出现「距跌停  最高 …」这种空值
+        limit_txt = (f"{limit_label} {to_limit:+.2f}%  " if to_limit is not None
+                     else "")
         detail = "\n".join([
             f"现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  窗口 {win_txt} {fmt_pct(change)}",
             f"分时均价 {q.vwap:.2f}（现价在其{vwap_txt}）  量能比 {ratio_txt}",
             f"振幅 {q.amplitude:.2f}%  换手 {q.turnover:.2f}%  成交额 {amount_yi:.2f}亿",
-            f"距涨停 {to_limit:+.2f}%  最高 {q.high:.2f}  最低 {q.low:.2f}  开盘 {q.open:.2f}",
+            f"{limit_txt}最高 {q.high:.2f}  最低 {q.low:.2f}  开盘 {q.open:.2f}",
         ])
 
         return Alert(
@@ -279,7 +295,13 @@ class TickSurgeRule:
                 "amount": round(q.amount, 0),
                 "turnover": round(q.turnover, 2),
                 "amplitude": round(q.amplitude, 2),
-                "to_limit_pct": round(to_limit, 2),
+                # to_limit_pct 现在是**跟随告警方向**的"距限价"：
+                # 急拉 = 距涨停，急跌 = 距跌停。旧代码无论方向都只写涨停口径，
+                # 于是急跌告警的 metrics 里塞着一个跌停方向根本用不到的涨停距离。
+                # 沿用同一个键名（值是"距限价"而非"距涨停"），方向由 Alert.kind
+                # 决定 —— 不再额外加一个 label 键，那只是把 kind 抄一遍。
+                # 拿不到限价时为 -1.0（与 vol_ratio 的"数据不足"约定一致）。
+                "to_limit_pct": round(to_limit, 2) if to_limit is not None else -1.0,
                 "hits": 1.0,
             },
         )

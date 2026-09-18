@@ -294,6 +294,59 @@ def test_reseal_negative_no_history():
     assert run([reseal_quote()], st) == []
 
 
+def test_reseal_reports_window_low_not_day_low():
+    """「近 N 分钟内…最低 X 元」的 X 必须是**窗口内**最低，不能是当日最低。
+
+    这是一条真实的用户可见缺陷：``_reseal`` 图省事直接用 ``q.low``（当日最低），
+    而文案说的是「近 10 分钟内」。于是 X 可能是几小时前的价，回落幅度被夸大
+    十几倍 —— 实测当日最低 10.30（约 5.4 小时前）、窗口内最低 10.94 时：
+
+        文案印的： (11.00 - 10.30) / 11.00 = 6.36%   <- 当日口径，差 11.6 倍
+        窗口真实： (11.00 - 10.94) / 11.00 = 0.55%
+
+    用户读到「近 10 分钟内炸板回落 6.36%」会以为十分钟内有过一次深砸盘。
+
+    关键：本用例的当日最低（10.30）**故意放在窗口之外**，
+    所以"当日口径"和"窗口口径"给出不同的数 —— 否则用例根本区分不出来
+    （既有的 test_reseal_positive 就是两边恰好都等于 10.80，测不出这个 bug）。
+    """
+    st = FakeState()
+    st.feed("600000", [
+        # 5 小时前砸到 10.30（当日最低，但**在 600 秒窗口之外**）
+        (NOW_EPOCH - 19800.0, 10.30, 50_000.0),
+        # --- 以下都在 reseal_seconds=600 的窗口内 ---
+        # 注意窗口内的点都 >= 10.90，所以窗口最低是 10.90 ——
+        # 与当日最低 10.30 明显不同，这样"当日口径"与"窗口口径"才区分得开。
+        (NOW_EPOCH - 540.0, 11.00, 100_000.0),   # 曾封上涨停
+        (NOW_EPOCH - 480.0, 10.92, 120_000.0),
+        (NOW_EPOCH - 300.0, 10.90, 150_000.0),   # 窗口内最低
+        (NOW_EPOCH - 60.0, 11.00, 180_000.0),
+        (NOW_EPOCH, 11.00, 200_000.0),           # 重新封回
+    ])
+    # 当日最低仍是 10.30（故意与窗口最低不同）
+    alerts = run([reseal_quote(low=10.30)], st)
+    assert patterns_of(alerts) == ["reseal"]
+    a = alerts[0]
+
+    # 窗口口径：(11.00 - 10.90) / 11.00 * 100 = 0.909%
+    assert a.metrics["low"] == pytest.approx(10.90, abs=0.001), (
+        f"metrics['low'] 应为窗口内最低 10.90，实际 {a.metrics['low']}")
+    assert "最低 10.90 元" in a.detail, a.detail
+    assert "最低 10.30 元" not in a.detail, (
+        f"把当日最低说成了「近 10 分钟内」的最低：{a.detail!r}")
+    assert "较涨停价 0.91%" in a.detail, a.detail
+    # 当日最低仍要保留（只是不再冒充窗口最低）
+    assert a.metrics["day_low"] == pytest.approx(10.30, abs=0.001)
+    # 若用当日口径，落幅会是 (11.00-10.30)/11.00 = 6.36%，差了约 7 倍
+    assert "6.36%" not in a.detail, a.detail
+
+    # 关键对照：读**当日**口径的 low 会得到一个窗口内根本不存在的深度
+    day_gap = (11.00 - 10.30) / 11.00 * 100.0
+    win_gap = (11.00 - 10.90) / 11.00 * 100.0
+    assert day_gap > win_gap * 5, (
+        f"用例前提失效：两个口径要拉得开才验得出来（{day_gap:.2f} vs {win_gap:.2f}）")
+
+
 def test_reseal_negative_never_sealed_or_no_pullback():
     # 历史里从未触及涨停
     st = FakeState()

@@ -315,6 +315,102 @@ def test_limit_up_price_still_alerts_with_correct_to_limit():
     assert alerts[0].metrics["to_limit_pct"] == pytest.approx(0.0, abs=0.01)
 
 
+def _plunge_case(price=9.70):
+    """10.0 -> price 的一分钟急跌行情。"""
+    st = FakeState()
+    pts = ramp("600000", start_price=10.0, end_price=price, seconds=60,
+               step=10, start_vol=1000, vol_step=500)
+    st.feed("600000", pts)
+    q = make_quote(code="600000", price=price, prev_close=10.0, open=10.00,
+                   high=10.20, low=9.65, volume_lots=pts[-1][2],
+                   amount=pts[-1][2] * 100 * 9.85)
+    return build({}).evaluate(snap_of(q), mk_ctx(st))
+
+
+def test_plunge_reports_distance_to_limit_down_not_limit_up():
+    """急跌告警必须报「距跌停」，不能报「距涨停」。
+
+    这是一条真实的用户可见缺陷：``_mk`` 只算涨停口径的 ``to_limit``，
+    且急拉/急跌**共用同一行 detail**，于是急跌告警里印着
+    「距涨停 +13.40%」。一条 ``kind=plunge``、标题为负的告警带着「+」号，
+    在 A 股语境里「+」读作"涨"，与告警方向正好相反；
+    而用户真正需要的「距跌停」在整条告警里根本不存在。
+
+    数字本身都没算错，错的是**方向**。
+    """
+    alerts = _plunge_case(9.70)
+    assert len(alerts) == 1
+    a = alerts[0]
+    assert a.kind is AlertKind.PLUNGE
+
+    # (9.70 / 9.00 - 1) * 100 = +7.777…%
+    assert a.metrics["to_limit_pct"] == pytest.approx(7.78, abs=0.01), (
+        f"急跌应报距跌停 +7.78%，实际 {a.metrics['to_limit_pct']}")
+    assert "距跌停" in a.detail, a.detail
+    assert "距涨停" not in a.detail, (
+        f"急跌告警里出现了「距涨停」：{a.detail!r}")
+
+    # 涨停口径的 +13.40% 绝不能出现在这条告警里
+    assert "+13.40" not in a.detail, a.detail
+    assert a.metrics["to_limit_pct"] != pytest.approx(13.40, abs=0.01)
+
+
+def test_surge_still_reports_distance_to_limit_up():
+    """对照组：急拉仍然报「距涨停」—— 那里是对的，不能被一起改坏。
+
+    现价 10.90，涨停价 11.00 -> (11.00/10.90-1)*100 = +0.92%
+    """
+    st = FakeState()
+    pts = ramp("600000", start_price=10.0, end_price=10.9, seconds=180,
+               step=15, start_vol=1000, vol_step=300)
+    st.feed("600000", pts)
+    q = make_quote(code="600000", price=10.90, prev_close=10.0, open=10.00,
+                   high=10.95, low=10.00, volume_lots=pts[-1][2],
+                   amount=pts[-1][2] * 100 * 10.45)
+    alerts = build({}).evaluate(snap_of(q), mk_ctx(st))
+    assert alerts and alerts[0].kind is AlertKind.SURGE
+    a = alerts[0]
+    assert a.metrics["to_limit_pct"] == pytest.approx(0.92, abs=0.02)
+    assert "距涨停" in a.detail, a.detail
+    assert "距跌停" not in a.detail, a.detail
+
+
+def test_to_limit_is_omitted_when_limit_price_unavailable():
+    """拿不到真实限价时**省略**该字段，而不是打 0.00% 假装"贴着了"。
+
+    ⚠ 这是一个**防御性**分支，从 ``evaluate()`` 走不到：能算出 0 限价的
+    只有 ``prev_close <= 0``，而 ``Quote.is_suspended`` 恰好把这种行情
+    判为停牌并跳过。所以这里直接调 ``_make_alert`` 验渲染逻辑本身 ——
+    而不是伪造一条 evaluate 能过的行情（那样只是自欺）。
+
+    为什么仍然值得保留：``Quote.limit_up_price`` 会回落到
+    ``prev_close * (1 ± rate)``，一旦哪天这个兜底改了、或 is_suspended
+    的判据放宽，旧写法 ``to_limit = 0.0`` 就会印出「距涨停 +0.00%」——
+    看上去像"已经涨停了"，是危险的误导。宁可省略这个字段。
+    """
+    st = FakeState()
+    pts = ramp("600000", start_price=10.0, end_price=9.70, seconds=60,
+               step=10, start_vol=1000, vol_step=500)
+    st.feed("600000", pts)
+    q = make_quote(code="600000", price=9.70, prev_close=0.0, open=9.70,
+                   high=9.70, low=9.70, volume_lots=pts[-1][2],
+                   amount=pts[-1][2] * 100 * 9.85)
+    assert q.limit_up_price == 0.0 and q.limit_down_price == 0.0, (
+        "前提：prev_close=0 时两个限价都应为 0")
+
+    rule = build({})
+    a = rule._make_alert(q, mk_ctx(st), 60.0, -3.0, AlertKind.PLUNGE, None)
+
+    assert "距跌停" not in a.detail, a.detail
+    assert "距涨停" not in a.detail, a.detail
+    assert a.metrics["to_limit_pct"] == -1.0, "取不到限价时应为 -1.0（数据不足）"
+    # 其余信息不能因为省略这个字段而丢
+    assert "最高" in a.detail and "最低" in a.detail
+    # 省略后也不能留下"开头就是空格"这种残缺排版
+    last = a.detail.splitlines()[-1]
+    assert last.startswith("最高"), f"末行排版残缺：{last!r}"
+
+
 def test_cooldown_bucket_is_stable_within_window():
     st = FakeState()
     st.feed("600000", ramp("600000", start_price=10.0, end_price=10.4, seconds=180, vol_step=400))
