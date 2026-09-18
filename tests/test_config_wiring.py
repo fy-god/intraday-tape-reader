@@ -362,3 +362,38 @@ def test_readme_tool_list_matches_tools_dir():
     assert r.returncode == 0, (
         "README 工具清单与 tools/ 不一致（有工具没登记，或提到了不存在的）：\n"
         + (r.stdout or "") + (r.stderr or ""))
+
+
+def test_version_declarations_agree_and_changelog_covers_them():
+    """版本号只有一处真相：`arad.__version__`。`pyproject.toml` 必须跟它一致。
+
+    两处各写一遍版本号是典型的"迟早会漂移"：发版时改了 `pyproject.toml`
+    却忘了 `__init__.py`（或反过来），`arad --version` 与装出来的包
+    报的版本就对不上了 —— 而且**没有任何东西会报错**，直到有人拿着
+    错误的版本号去对 CHANGELOG。
+
+    顺带验 CHANGELOG 里有这个版本的条目：版本号涨了却忘了写更新日志，
+    等于把"改了什么"这件事丢掉了。
+    """
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    import arad
+
+    ver = arad.__version__
+    assert re.fullmatch(r"\d+\.\d+\.\d+", ver), f"版本号格式可疑：{ver!r}"
+
+    pyproject = (root / "pyproject.toml").read_text(encoding="utf-8")
+    m = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.M)
+    assert m, "pyproject.toml 里找不到 version"
+    assert m.group(1) == ver, (
+        f"版本号不一致：arad.__version__={ver!r}，"
+        f"pyproject.toml={m.group(1)!r}。两处必须一致（发版时最常漏改一处）。")
+
+    changelog = root / "CHANGELOG.md"
+    assert changelog.exists(), (
+        "没有 CHANGELOG.md —— 版本号涨了却没人知道改了什么")
+    text = changelog.read_text(encoding="utf-8")
+    assert f"## [{ver}]" in text, (
+        f"CHANGELOG.md 里没有 {ver} 的条目。发版时请补上（版本涨了却没人知道改了什么）。")
