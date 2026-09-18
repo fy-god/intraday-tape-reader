@@ -106,10 +106,23 @@ SIGNALS: dict[str, Signal] = {
                      "炸板后快速重新封上涨停"),
     "volume_burst": Signal("volume_burst", "放量", NEUTRAL, "pattern",
                            "成交量显著放大"),
-    # ---- limit_board 状态机的子阶段 ---------------------------------
-    "seal": Signal("seal", "封板", UP, "limit", "封住涨停/跌停"),
-    "break": Signal("break", "炸板", DOWN, "limit", "涨停被打开"),
-    "touch": Signal("touch", "触板", NEUTRAL, "limit", "触及涨跌停价"),
+    # ---- 注意：这里曾有三个"旧命名"信号 seal / break / touch --------------
+    # 它们是早期笼统命名（封板/炸板/触板），已被 limit_board 实际使用的
+    # 细分名取代：limit_up_seal / limit_down_seal / open_limit_up /
+    # open_limit_down / limit_up_touch / limit_down_touch。
+    #
+    # 三个旧名**没有任何产出点**，也不在 KIND_FALLBACK 里，所以永远不会出现；
+    # 但看板按 group 计数时会把它们算进「涨跌停 N 个信号」，虚报数量。
+    # 用户悬停读到「封板」「触板」这些名字、又从没见过，会怀疑自己的配置。
+    #
+    # 已删除（保留这段注释说明去向，避免日后有人以为是漏注册）：
+    #   seal  -> limit_up_seal / limit_down_seal
+    #   break -> open_limit_up / open_limit_down
+    #   touch -> limit_up_touch / limit_down_touch
+    #
+    # 而 ``limit_up`` / ``limit_down`` 保留：它们虽无 pattern 产出点，
+    # 但是 KIND_FALLBACK 的兜底名 —— 没有 pattern 的涨跌停告警会退回它们，
+    # 因此是**可达**的，不算虚报。
 }
 
 #: ``AlertKind`` -> 兜底信号名（告警没有 pattern 时用它）

@@ -20,6 +20,18 @@ from .base import RuleContext, bucket_of, fmt_pct
 
 __all__ = ["LimitBoardRule", "build", "RULE", "DEFAULT_CFG"]
 
+
+def at_limit_price(q: Quote, limit: float, rising: bool, tol: float) -> bool:
+    """现价是否还在限价上（含容差）。方向按涨/跌停镜像。
+
+    抽成模块级函数是因为 ``_check_side`` 和 ``_check_break`` 都要用，
+    而两处各写一遍方向判断极易把 ``>=`` / ``<=`` 写反 ——
+    方向写反会让跌停侧拿"高于跌停价"当"在跌停价上"，判据完全失效。
+    """
+    if limit <= 0 or q.price <= 0:
+        return False
+    return q.price >= limit - tol if rising else q.price <= limit + tol
+
 DEFAULT_CFG: dict = {
     "enabled": True,
     "detect_touch": True,
@@ -135,7 +147,7 @@ class LimitBoardRule:
         if limit <= 0:
             return None
         kind = AlertKind.LIMIT_UP if rising else AlertKind.LIMIT_DOWN
-        at_limit = (q.price >= limit - self.tol) if rising else (q.price <= limit + self.tol)
+        at_limit = at_limit_price(q, limit, rising, self.tol)
 
         tag = f"{q.code}:{'up' if rising else 'down'}"
         prev = self._state.get(tag, "away")
@@ -149,12 +161,18 @@ class LimitBoardRule:
                     if self.cfg.get("detect_seal", True) else None)
 
         # 未在限价：判断是否曾触及（触板 / 炸板）
-        # 跌停侧只识别"封跌停"：撬板（跌停被打开）不属于本规则口径，直接放过，
-        # 但状态必须复位为 away，否则"封跌停→撬开→再封跌停"不会再报（状态机卡住）。
-        if not rising:
-            self._state[tag] = "away"
-            return None
-        # detect_break / detect_touch 各自独立生效，不能要求两者同时为假才短路。
+        #
+        # 两个方向都要走完整状态机。跌停侧此前在这里直接 ``return None``，
+        # 于是 ``limit_down_touch``（触及跌停）与 ``open_limit_down``（打开跌停）
+        # 这两个已在注册表里、且带 hint 的信号**永远不可能出现**，而看板
+        # 仍宣称「涨跌停 11 个信号」。用户排查"为什么从没见过『打开跌停』"
+        # 会怀疑自己的配置或数据源 —— 实际是这里被短路了。
+        # 而 ``_make_touch`` 本来就已经支持 rising=False（会用 limit_down_touch
+        # 和"触及跌停"文案），所以这更像是漏做而非有意不做。
+        #
+        # 注：跌停侧"打开"的语义与涨停侧相反 —— 涨停打开是利空（封单被砸开），
+        # 跌停打开是利好（封单被撬开，有资金接）。方向色由 spirit.py 的
+        # direction 字段负责，这里只管识别。
         want_break = bool(self.cfg.get("detect_break", True))
         want_touch = bool(self.cfg.get("detect_touch", True))
         if not want_break and not want_touch:
@@ -164,12 +182,16 @@ class LimitBoardRule:
             self._state[tag] = "away"
             return None
 
-        retreat = (limit - q.price) / limit * 100.0
+        # 离开限价的幅度：涨停侧看"回落多少"，跌停侧看"回升多少"。
+        # 走到这里必然已离开限价（上面的 at_limit 分支不成立），
+        # 所以这个值一定 > 0，不需要再夹紧。
+        retreat = (limit - q.price) / limit * 100.0 if rising \
+            else (q.price - limit) / limit * 100.0
         if want_break and retreat >= self.break_retreat:
             if prev == "broken":
                 return None                      # 已报过炸板且仍在回落状态：不重播
             self._state[tag] = "broken"
-            return self._check_break(q, ctx, now, now_ep, limit)
+            return self._check_break(q, ctx, now, now_ep, limit, rising)
 
         # 轻度回落：触板
         if not want_touch:
@@ -190,12 +212,27 @@ class LimitBoardRule:
         return vol * 100.0 * q.price / 10000.0
 
     def _is_one_word(self, q: Quote, limit: float, rising: bool) -> bool:
+        """一字板：开盘即限价，且全天没有价格波动（high == low）。
+
+        两个方向都要判。跌停侧此前直接 ``return False``，于是 ``_make_seal``
+        必然把一字跌停印成「非一字」—— 而同一条 detail 的下一行就写着
+        「开盘 9.00（-10.00%）最高 9.00 最低 9.00 振幅 0.00%」，
+        用户在两行之间读到的是自相矛盾的话。
+        对做短线的人来说「一字跌停」（想卖卖不掉）与「盘中跌停」差别很大，
+        不该因为"跌停侧懒得判"就把这个信息丢掉。
+        """
+        if q.open <= 0 or abs(q.high - q.low) >= 1e-9:
+            return False
         if rising:
-            return q.open > 0 and q.open >= limit - self.tol and abs(q.high - q.low) < 1e-9
-        return False
+            return q.open >= limit - self.tol
+        return q.open <= limit + self.tol
 
     def _is_first_board(self, q: Quote, limit: float, rising: bool) -> bool:
-        """首板 = 开盘未涨停（非一字板）。"""
+        """首板 = 开盘未涨停（非一字板）。
+
+        只对涨停侧有意义：「首板」指连续涨停序列里的第一个板，
+        跌停侧没有对应概念，因此仍然恒为 ``False``（调用方据此不输出该文案）。
+        """
         if not rising:
             return False
         return not (q.open > 0 and q.open >= limit - self.tol)
@@ -210,12 +247,24 @@ class LimitBoardRule:
         seal_txt = f"封单{seal_wan / 10000:.2f}亿" if seal_wan >= 10000 else f"封单{seal_wan:.0f}万"
         one_word = self._is_one_word(q, limit, rising)
         first_board = self._is_first_board(q, limit, rising)
-        board_txt = "一字板" if one_word else ("首板" if first_board else "非一字")
+        # ⚠ 标签必须**只在真的判过**时才输出。跌停侧不判首板（没有这个概念），
+        # 所以它既不能显示"首板"，也不能显示"非一字"—— 后者是在断言一件
+        # 根本没检查过的事（一字跌停曾被印成「非一字」）。
+        # 对做短线的人来说「一字跌停」（想卖卖不掉）与「盘中跌停」差别很大，
+        # 宁可少一个标签，也不要一个错的标签。
+        if rising:
+            board_txt = "一字板" if one_word else ("首板" if first_board else "非一字")
+        else:
+            board_txt = "一字跌停" if one_word else ""
 
         bucket = bucket_of(now_ep, self.cooldown)
+        # board_txt 可能为空（跌停侧非一字时不输出标签），拼进去会留下两个
+        # 连续空格。用 filter 去掉空段，保证不会出现「封单2700万    换手」这种。
+        parts = [seal_txt, board_txt, f"换手 {q.turnover:.2f}%",
+                 f"成交额 {q.amount / 1e8:.2f}亿"]
         detail = "\n".join([
             f"现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  {'涨停价' if rising else '跌停价'} {limit:.2f}",
-            f"{seal_txt}  {board_txt}  换手 {q.turnover:.2f}%  成交额 {q.amount / 1e8:.2f}亿",
+            "  ".join(p for p in parts if p),
             f"开盘 {q.open:.2f}（{fmt_pct(q.open_pct)}）  最高 {q.high:.2f}  最低 {q.low:.2f}  振幅 {q.amplitude:.2f}%",
         ])
         return Alert(
@@ -306,47 +355,72 @@ class LimitBoardRule:
         return cnt
 
     def _check_break(self, q: Quote, ctx: RuleContext, now: datetime,
-                     now_ep: float, limit: float) -> Alert | None:
-        """炸板：曾涨停，现价回落超过阈值。
+                     now_ep: float, limit: float, rising: bool = True) -> Alert | None:
+        """开板：曾封/触限价，现已明显离开。
+
+        涨停侧叫「炸板」（封单被砸开，利空），跌停侧叫「撬板/打开跌停」
+        （封单被撬开，有资金接，利好）。两侧的判据是镜像的：
+
+        * 涨停侧：现价须**跌离**涨停价超过 ``break_retreat_pct``；
+        * 跌停侧：现价须**涨离**跌停价超过 ``break_retreat_pct``。
 
         幂等由 ``_check_side`` 的状态机保证（``broken`` 状态不重复报），
         本方法只负责判定与构造告警。
         """
-        if not self._touched_recently(q, ctx, now_ep, limit):
+        if not self._touched_recently(q, ctx, now_ep, limit, rising):
             return None
-        # 必须已明显跌离涨停价
-        if q.price > limit * (1.0 - self.break_retreat / 100.0):
+        # 必须已明显离开限价（方向按涨/跌停镜像）
+        moved = (limit - q.price) if rising else (q.price - limit)
+        if moved < limit * (self.break_retreat / 100.0):
             return None
-        # 一字板不开板不算炸板（价仍在涨停）
-        if q.price >= limit - self.tol:
+        # 一字板不开板不算开板（价仍在限价）
+        if at_limit_price(q, limit, rising, self.tol):
             return None
 
-        retreat = (limit - q.price) / limit * 100.0
-        kind = AlertKind.LIMIT_UP
+        retreat = moved / limit * 100.0
+        kind = AlertKind.LIMIT_UP if rising else AlertKind.LIMIT_DOWN
         bucket = bucket_of(now_ep, self.break_bucket)
-        seal_wan = self._seal_amount_wan(q, True)
+        # 板已经开了，此时**不存在封单**：留在买一/卖一上的只是普通挂单。
+        # 旧文案一律写「买一封单」，在炸板场景下是错的（板都开了哪来的封单）。
+        # 按方向取正确的一侧，并改称"买一挂单/卖一挂单"。
+        if rising:
+            side_txt = "买一挂单"
+            seal_wan = q.bid_vol * 100.0 * q.price / 10000.0
+            limit_txt = f"涨停价 {limit:.2f}"
+            extra = f"回落 {retreat:.2f}%"
+            title = f"炸板 -{retreat:.2f}%"
+        else:
+            side_txt = "卖一挂单"
+            seal_wan = q.ask_vol * 100.0 * q.price / 10000.0
+            limit_txt = f"跌停价 {limit:.2f}"
+            extra = f"回升 {retreat:.2f}%"
+            title = f"打开跌停 +{retreat:.2f}%"
         detail = "\n".join([
-            f"现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  涨停价 {limit:.2f}  回落 {retreat:.2f}%",
+            f"现价 {q.price:.2f}  涨跌 {fmt_pct(q.pct)}  {limit_txt}  {extra}",
             f"最高 {q.high:.2f}  最低 {q.low:.2f}  振幅 {q.amplitude:.2f}%",
-            f"换手 {q.turnover:.2f}%  成交额 {q.amount / 1e8:.2f}亿  买一封单 {seal_wan:.0f}万",
+            f"换手 {q.turnover:.2f}%  成交额 {q.amount / 1e8:.2f}亿  {side_txt} {seal_wan:.0f}万",
         ])
         return Alert(
             key=f"{q.code}:{kind.value}:break:{bucket}",
             kind=kind, code=q.code, name=q.name, ts=now, price=q.price, pct=q.pct,
-            title=f"炸板 -{retreat:.2f}%", detail=detail, severity=3,
+            title=title, detail=detail, severity=3,
             metrics={
                 "price": round(q.price, 3), "pct": round(q.pct, 3),
                 "limit_up": round(self._limit_up_price(q), 3),
                 "limit_down": round(self._limit_down_price(q), 3),
+                # 带符号的"距限价"：正 = 现价在限价之上，负 = 在限价之下。
+                # 同一个式子对两个方向都成立（涨停侧炸板必为负，跌停侧撬板必为正），
+                # 所以不要改成 abs —— 那会丢掉"在上还是在下"这个信息，
+                # 而且和既有断言（-4.545）冲突。
                 "distance_to_limit_pct": round((q.price / limit - 1.0) * 100.0, 3),
                 "seal_amount_wan": round(seal_wan, 1),
                 "one_word_board": 0.0,
-                "is_first_board": 1.0 if self._is_first_board(q, limit, True) else 0.0,
-                "touch_count": float(self._touch_count(q, ctx, now_ep, limit, True)),
+                "is_first_board": 1.0 if self._is_first_board(q, limit, rising) else 0.0,
+                "touch_count": float(self._touch_count(q, ctx, now_ep, limit, rising)),
                 "retreat_pct": round(retreat, 3),
                 "stage": 3.0,
-                "pattern": "open_limit_up",
-                "rising": 1.0,
+                "pattern": "open_limit_up" if rising else "open_limit_down",
+                "rising": 1.0 if rising else 0.0,
             },
         )
 

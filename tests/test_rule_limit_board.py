@@ -486,8 +486,22 @@ def test_limit_down_open_is_not_reported():
     assert rule.evaluate(snap_of(up), mk_ctx(st))[0].metrics["stage"] == 3.0
 
 
-def test_limit_down_never_breaks_even_with_history():
-    """即使历史里确实到过跌停价（_touched_recently 为 True），跌停打开也不告警。"""
+def test_limit_down_break_is_recognized():
+    """跌停被撬开（打开跌停）必须告警 —— 这是利好，不能漏报。
+
+    这是一条真实缺陷：``_check_side`` 在跌停侧直接 ``return None``，
+    于是 ``open_limit_down``（打开跌停）与 ``limit_down_touch``（触及跌停）
+    这两个已在 ``spirit.SIGNALS`` 注册表里、且带 hint 的信号
+    **永远不可能出现**，而看板仍宣称「涨跌停 11 个信号」。
+    用户排查"为什么从没见过『打开跌停』"会怀疑自己的配置或数据源。
+
+    而 ``_make_touch`` / ``_seal_amount_wan`` 本来就已经支持 rising=False
+    （会输出"触及跌停"文案、取卖一量），所以这更像是漏做而非有意不做。
+
+    语义与涨停侧相反，必须区分清楚：
+      涨停打开 = 封单被砸开 = 利空（DOWN）
+      跌停打开 = 封单被撬开 = 有资金接 = 利好（LIMIT_DOWN kind 但方向为 up）
+    """
     st = FakeState()
     st.feed("000001", [(T0 - 600.0, 9.0, 1000.0), (T0 - 300.0, 9.0, 2000.0),
                        (T0 - 60.0, 9.05, 3000.0)])
@@ -497,10 +511,26 @@ def test_limit_down_never_breaks_even_with_history():
     ctx = mk_ctx(st)
     assert rule._touched_recently(q, ctx, T0, 9.0, False) is True
     assert rule._touch_count(q, ctx, T0, 9.0) == 1
-    assert rule.evaluate(snap_of(q), ctx) == []
-    # 直接单独调用跌停侧：现价不在限价且打开 -> 也是 None（源码显式 return None）
-    assert rule._check_side(q, ctx, datetime.fromtimestamp(T0), T0,
-                            up=11.0, down=9.0, rising=False) is None
+
+    alerts = rule.evaluate(snap_of(q), ctx)
+    assert alerts, "跌停被撬开必须告警（曾触及跌停价，现价已回升到 9.2）"
+    a = alerts[0]
+    assert a.kind is AlertKind.LIMIT_DOWN
+    assert a.metrics["pattern"] == "open_limit_down"
+    assert a.metrics["rising"] == 0.0
+    assert a.metrics["stage"] == 3.0
+    assert a.severity == 3
+    # 回升幅度 = (9.2 / 9.0 - 1) * 100 = 2.22%
+    assert a.metrics["retreat_pct"] == pytest.approx(2.222, abs=0.01)
+    # 文案必须说"跌停价/回升"，不能沿用药涨停侧的"涨停价/回落"
+    assert "跌停价" in a.detail, a.detail
+    assert "回升" in a.detail, a.detail
+    assert "涨停" not in a.detail, f"跌停打开的文案里不该出现「涨停」：{a.detail!r}"
+
+    # 单独调用跌停侧（**新实例**，避免上面 evaluate 已把状态置为 broken）
+    # 旧代码在这里显式 return None，所以这行是"跌停侧真的会判"的直接证据。
+    assert build({})._check_side(q, ctx, datetime.fromtimestamp(T0), T0,
+                                 up=11.0, down=9.0, rising=False) is not None
 
 
 def test_limit_down_not_masked_by_break_for_the_same_stock():
@@ -663,15 +693,55 @@ def test_first_board_helper_semantics():
     assert rule._is_first_board(below, 9.0, False) is False
 
 
-def test_one_word_helper_is_disabled_for_limit_down():
-    """跌停侧不做一字板识别（源码直接 return False）。"""
+def test_one_word_limit_down_is_recognized():
+    """一字跌停必须被认出来，且**不能**被标成「非一字」。
+
+    这是一条真实的用户可见缺陷：``_is_one_word`` 在跌停侧直接
+    ``return False``，于是 ``_make_seal`` 必然把一字跌停印成「非一字」——
+    而同一条 detail 的下一行就写着「开盘 9.00（-10.00%）最高 9.00 最低 9.00
+    振幅 0.00%」，用户在两行之间读到自相矛盾的话。
+
+    对做短线的人来说「一字跌停」（想卖卖不掉）与「盘中跌停」差别很大，
+    不该因为"跌停侧懒得判"就把这个信息丢掉或说反。
+
+    注意 ``_is_first_board``（首板）仍然恒为 False：那是涨停侧的概念，
+    跌停侧没有对应物 —— 所以跌停侧非一字时**不输出标签**，
+    而不是输出一个没检查过的「非一字」。
+    """
     rule = build({})
     q = limit_down_quote(ask_vol=30000.0, open=9.0, high=9.0, low=9.0)
-    assert rule._is_one_word(q, 9.0, False) is False
+    assert rule._is_one_word(q, 9.0, False) is True
     assert rule._is_first_board(q, 9.0, False) is False
     a = rule.evaluate(snap_of(q), mk_ctx(FakeState()))[0]
-    assert a.metrics["one_word_board"] == 0.0
+    assert a.metrics["one_word_board"] == 1.0
     assert a.metrics["is_first_board"] == 0.0
+    assert "一字跌停" in a.detail, a.detail
+    assert "非一字" not in a.detail, (
+        f"一字跌停被标成「非一字」：{a.detail!r}")
+
+
+def test_non_one_word_limit_down_does_not_claim_non_one_word():
+    """半路封跌停：不输出「非一字」这种没检查过的断言。
+
+    「不识别」和「识别了并给出肯定结论」是两件事。跌停侧不做首板判定，
+    所以既不该显示「首板」，也不该显示「非一字」—— 后者等于宣称
+    "我检查过，它不是一字板"，而实际根本没检查。
+    """
+    rule = build({})
+    # 开在 9.80，盘中砸到跌停 9.00 —— 明显不是一字板
+    q = limit_down_quote(ask_vol=30000.0, open=9.8, high=9.8, low=9.0)
+    assert rule._is_one_word(q, 9.0, False) is False
+    a = rule.evaluate(snap_of(q), mk_ctx(FakeState()))[0]
+    assert a.metrics["one_word_board"] == 0.0
+    assert "非一字" not in a.detail, a.detail
+    assert "一字跌停" not in a.detail, a.detail
+    # 封单等信息不能因为去掉标签而丢
+    assert "封单" in a.detail
+    assert "换手" in a.detail
+    # 空标签被过滤掉后，不该留下"多余的一段空白"（字段间正常是 2 空格，
+    # 4 个及以上说明有个字段是空的却仍占位）
+    assert "    " not in a.detail.splitlines()[1], (
+        f"去掉空标签后留下了多余空白：{a.detail.splitlines()[1]!r}")
 
 
 # ==========================================================================
@@ -957,12 +1027,24 @@ def test_outside_continuous_session_is_silent_unless_disabled():
 
 
 def test_one_alert_per_code_per_round():
-    """一只股票一轮最多一条告警（先判涨停，涨停无果才判跌停）。"""
+    """同一方向每轮最多一条告警；天地板会有两条（方向不同，是既有设计）。
+
+    注意**不是**"每只股票只能有一条"：涨停侧与跌停侧是独立事件，
+    见 ``test_limit_down_not_masked_by_break_for_the_same_stock``
+    （现价躺在跌停价上、当日最高碰过涨停价 -> 官方要求炸板与封跌停都报）。
+
+    这条用例的行情是"现价在涨停价、当日最低碰过跌停价" —— 跌停侧此时**正在**
+    跌停价上（at_limit），会正常报封跌停，所以两方向各一条是对的。
+    """
     st = FakeState()
     q = limit_up_quote(bid_vol=30000.0, low=9.0)     # low 也碰到了跌停价
     alerts = build({}).evaluate(snap_of(q), mk_ctx(st))
-    assert [a.kind for a in alerts] == [AlertKind.LIMIT_UP]
-    assert len({a.code for a in alerts}) == len(alerts)
+    # 两个方向各一条，且方向不重复
+    kinds = [a.kind for a in alerts]
+    assert kinds.count(AlertKind.LIMIT_UP) == 1
+    assert len(kinds) == len(set(kinds)) == len(alerts), f"同方向重复：{kinds}"
+    # 同一方向的 key 不会重复
+    assert len({a.key for a in alerts}) == len(alerts)
 
 
 def test_result_sorted_by_severity_then_abs_pct():

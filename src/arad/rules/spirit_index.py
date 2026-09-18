@@ -270,7 +270,13 @@ class SpiritIndexRule:
         detail = "\n".join([
             f"{q.name or q.code} · 现价 {q.price:,.2f}  {fmt_pct(change_pct)}"
             f"  窗口 {self._fmt_s(seconds)} {delta:+.2f}点",
-            f"5 分钟{direction_cn} {abs(delta):.2f} 点（{abs(change_bp):.2f}bp），"
+            # ⚠ 窗口文案必须用 _fmt_s(seconds)，不能写死「5 分钟」。
+            # 上一行已经用 _fmt_s 渲染了窗口，这里写死会出现**相邻两行
+            # 对同一个窗口给出不同说法**：windows=[60] 时行1 说「窗口 1分钟」、
+            # 行2 说「5 分钟拉升」，用户无法判断该信哪个。
+            # 默认 windows=[300] 正好等于 5 分钟，所以这个硬编码长期没被发现 ——
+            # 只有把窗口改成别的值才会暴露（已实测 60/120/600 三档都会矛盾）。
+            f"{self._fmt_s(seconds)}{direction_cn} {abs(delta):.2f} 点（{abs(change_bp):.2f}bp），"
             f"命中阈值：{hit_desc}",
             f"当日 {fmt_pct((q.price / q.prev_close - 1.0) * 100.0 if q.prev_close else 0.0)}"
             f"  昨收 {q.prev_close:,.2f}  今开 {q.open:,.2f}",

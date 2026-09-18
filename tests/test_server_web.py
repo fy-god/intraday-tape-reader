@@ -1218,6 +1218,45 @@ def test_spirit_groups_come_from_registry():
     assert counts["limit"] == len([s for s in sp.SIGNALS.values() if s.group == "limit"])
 
 
+def test_no_registered_signal_is_unreachable():
+    """注册表里不能有**永远不会出现**的信号。
+
+    这是一条真实缺陷（告警文案审计 D7）：``spirit.SIGNALS`` 曾注册
+    ``seal`` / ``break`` / ``touch`` 三个早期笼统命名，而 limit_board 实际
+    产出的是细分名（limit_up_seal / open_limit_up / limit_up_touch …）。
+    三个旧名既无任何产出点、也不在 ``KIND_FALLBACK`` 里，所以永远不可能出现；
+    但看板按 group 计数时把它们算进「涨跌停 11 个信号」—— 虚报数量。
+    用户悬停读到「封板」「触板」这些名字、又从没见过，会怀疑自己的配置或数据源。
+
+    判定口径：一个信号名要么有 ``pattern`` 产出点，要么能在 ``KIND_FALLBACK``
+    里兜底（没有 pattern 的告警会退回它），否则就是死信号。
+    """
+    import re
+    from pathlib import Path
+
+    from arad import spirit as sp
+
+    rules_dir = Path(sp.__file__).resolve().parent / "rules"
+    assert rules_dir.is_dir(), f"找不到规则目录：{rules_dir}"
+
+    # 收集所有规则的产出名：既包括 "pattern": "xxx" 字面量，
+    # 也包括 PATTERNS = (...) 这种元组声明（spirit_order / unusual 用后者）。
+    emitted: set[str] = set()
+    for p in sorted(rules_dir.glob("*.py")):
+        for line in p.read_text(encoding="utf-8-sig").splitlines():
+            for name in re.findall(r'["\']([a-z_][a-z0-9_]*)["\']', line):
+                if name in sp.SIGNALS:
+                    emitted.add(name)
+
+    fallback = {v for v in sp.KIND_FALLBACK.values()}
+    unreachable = sorted(
+        n for n in sp.SIGNALS if n not in emitted and n not in fallback)
+
+    assert not unreachable, (
+        f"这些信号注册了但永远不可能出现（看板却会把它算进分组计数、虚报数量）："
+        f"{unreachable}。要么接上产出点，要么从 SIGNALS 里删掉。")
+
+
 def test_feed_item_is_json_safe_for_hostile_numbers():
     """出网的 feed item 必须是**合法 JSON**：不许出现裸 NaN/Infinity。
 

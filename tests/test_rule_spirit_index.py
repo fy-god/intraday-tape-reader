@@ -526,6 +526,38 @@ def test_alert_to_dict_is_json_safe():
     json.dumps(a.to_dict(), allow_nan=False)   # 不允许 NaN/Infinity
 
 
+def test_detail_window_wording_follows_config_not_hardcoded():
+    """详情里两处提到窗口的地方必须**都说实话**，且互相一致。
+
+    这是一条真实缺陷：detail 第 1 行用 ``_fmt_s(seconds)`` 渲染窗口，
+    第 2 行却把「5 分钟」写死在字符串里。默认窗口恰好是 300 秒（= 5 分钟），
+    所以两行看起来一致 —— 一旦把窗口配成别的值就会**相邻两行自相矛盾**：
+
+        windows=[60]  行1「窗口 1分钟」  行2「5 分钟拉升」
+        windows=[600] 行1「窗口 10分钟」 行2「5 分钟拉升」
+
+    用户无法判断该信哪个。所以这里必须用非默认窗口来验，
+    并且要**同时**检查两行 —— 只查一行的话，写死的那行会漏网。
+    """
+    for win, want in ((60, "1分钟"), (120, "2分钟"), (600, "10分钟")):
+        pts = move(start=LEVEL, end=LEVEL + 10.0, span=float(win), n=5)
+        q = idx(price=LEVEL + 10.0)
+        st = state_with(q, pts)
+        out = run(st, {"enabled": True, "windows": [win],
+                       "pull_points": 0.5, "pull_bp": 0.0,
+                       "only_continuous": False})
+        assert out, f"windows=[{win}] 应触发拉升指数"
+        lines = out[0].detail.splitlines()
+        assert len(lines) >= 2
+        assert want in lines[0], (
+            f"windows=[{win}] 第 1 行应写「{want}」，实际：{lines[0]!r}")
+        assert want in lines[1], (
+            f"windows=[{win}] 第 2 行也应写「{want}」（不能写死 5 分钟），"
+            f"实际：{lines[1]!r}")
+        assert "5 分钟" not in lines[1] or win == 300, (
+            f"windows=[{win}] 第 2 行出现了写死的「5 分钟」：{lines[1]!r}")
+
+
 # ==========================================================================
 # 与引擎的协作
 # ==========================================================================
