@@ -10,4 +10,4 @@
 回归：全量 **1064 passed / 0 failed**；7 个 `check_*.py` 与 `dash_render_check.js`
 全部 exit 0；`selftest` / `check` exit 0。两个修复点均已用「回退验牙」证明测试有效。
 
-本轮报告提交：`PENDING`（提交后回填）
+本轮报告提交：`e6ed35204cc82b9e072a9a27a2e8d6ad3acab089`
