@@ -1,32 +1,53 @@
 # 最新审计
 
-最新完整报告：[`2026-09-19_04-04-37_JST.md`](./2026-09-19_04-04-37_JST.md)
+最新完整报告：[`2026-09-19_16-06-05_JST.md`](./2026-09-19_16-06-05_JST.md)
 
-## 版本与归档性质
+## 版本与本轮性质
 
-- 仓库与审计分支：`fy-god/intraday-tape-reader` / `main`。
+- 仓库与分支：`fy-god/intraday-tape-reader` / `main`。
+- 审计时间：2026-09-19 16:06:05 JST。
 - `reviewed_source_sha`：`f695102f8794b0b235d5f6ebf24564520d663ad8`。
-- 对应产品修复基线：`e6ed35204cc82b9e072a9a27a2e8d6ad3acab089`；其后至审计 HEAD 仅审计文档变化。
-- 原报告自记封存时点：2026-09-19 04:04:37 JST；本次未独立复核历史时钟，文件名沿用原记录。
-- 本次补传准备时点：2026-09-19 13:18:50 JST；实际发布时点以 GitHub 提交记录为准。
-- `report_commit_sha`：[`fb941cf1d068e24739dad6412867338cab19f4c2`](https://github.com/fy-god/intraday-tape-reader/commit/fb941cf1d068e24739dad6412867338cab19f4c2)。
+- 最后产品修复基线：`e6ed35204cc82b9e072a9a27a2e8d6ad3acab089`。
+- 本轮开始 HEAD：`e37ed7c4990050b011465b84af51d965b5f6f24a`；从 `f695102...` 到该 HEAD 只有审计文档提交，没有 `src/`、`tests/`、`config/`、`tools/` 产品变化。
+- 本轮报告提交：[`4e2228e4510ecd0c2ddf646d874020b7a90fef88`](https://github.com/fy-god/intraday-tape-reader/commit/4e2228e4510ecd0c2ddf646d874020b7a90fef88)。
 
-本次是用户授权后的**既有完整报告补传**，不是新增产品审计或产品修复。归档正文包含错误证据、有效观测主改造、八个依赖工作包、实验矩阵与本地 agent 任务书。原审计采用源码控制流摘录加替身的有限离线探针；18 项观测检查包括缺陷复现，不能视为修复验收。没有完整仓库 pytest、真浏览器交付闭环、实盘精确率或全天稳定性新成绩；本次补传没有重跑原实验。
+本轮是**无新增产品源码的深化审计**，重点把“provider soft-partial → 累积缓存冒充 current Snapshot → `spirit_order` 长缺口被洗短 → soak 仍可能显示满覆盖”贯通到同一份 Round Observation Contract。当前 PR 列表为空。本轮没有全量仓库 pytest、真实浏览器断线测试或新实盘运行；机制级离线探针 5/5 表示问题控制流被复现，不是产品修复验收。
 
-## 优先开放问题
+## 本轮新增/深化问题
 
-`IT-P0-003`（旧缓存进入本轮快照并刷新下游差分时间）、`IT-P0-002`（事件时间/乱序/未来点）、`IT-P1-WINDOW-001`（横盘新鲜观测压缩后缺窗口锚点）、`IT-P1-006` 残留（分页上限截断或未知元数据冒充完整）、`IT-P1-SOURCE-EMPTY-001`（未知空返回不触发备用）。
+- `IT-P0-003`：规则 Snapshot 仍从累计 `state.quotes` 构造，缺失代码可继续作为“当前”进入规则；同时会让 `spirit_order` 的 stale-cache 清理失效，并把真实长 gap 洗短。
+- `IT-P0-002`：窗口缺少 `<= now` 上界，provider 时间也没有形成写前质量门控；未来点/乱序仍是开放问题。
+- `IT-P1-SOURCE-EMPTY-001`：扩大为 **soft-partial success**——腾讯/新浪/东财指定代码快照缺少 requested-vs-returned 完整性合同，无异常的少行结果会被当成功。
+- `IT-P2-OBS-001`：本轮新增。`tools/live_session.py` 用累计 cache key 数与 universe 配置规模做代理，不能证明每轮当前观测覆盖。
+- `IT-P1-WINDOW-001`：继续开放。本轮候选收敛为“有效观测区间压缩”，同时保留横盘 freshness 证据和真实 gap。
+- `IT-P1-LIMIT-001`：本轮新增。价格一直在限价、封单从低于门槛变为高于门槛时，状态先写 `sealed` 会吞掉第二轮首次合格封板事件。
+- `IT-P0-001`：官方资料复核后继续开放；股票 14:57-15:00 应按收盘集合竞价而非连续竞价处理。
 
-输出可靠性继续追踪 `IT-P1-008`（SSE恢复缺补账）、`IT-P1-009`（队列静默丢失）、`IT-P1-003`（series主体容量），其余状态见完整报告。历史 `IT-P1-002` 作为 `IT-P1-008` 同问题别名，不双重统计。保留并回归 `IT-P1-007` 已有分路由修复。
+继续开放但本轮不重复展开：`IT-P1-008`（SSE 重连补账）、`IT-P1-009`（慢客户端满队列静默 drop-oldest）、`IT-P1-003`（series 主体容量）。继续保留并回归已修 `IT-P1-007` 分路由故障转移记账。
 
-## 下一轮实验与产物
+## 主改造与优先实验
 
-优先实验：`EXP-IT-OBS-001`——固定快照、固定阈值下比较值变更压缩与有效观测环；先验证特征、再验证逻辑事件，不用合成特征结果冒充真实信号质量。
+主改造：**Round Observation Contract v1**。将 `latest_cache`、`round_observations` 与 `admitted_current` 分离；新增 BatchResult/ObservationDecision/RoundObservationSet，显式记录 requested、returned、explicit_unavailable、unknown_missing、source epoch、provider/receive/process 时间；规则只消费 admitted current，soak 按 admitted/requested 报覆盖。
 
-按完整报告 WP1→WP8 推进并回传：基准 SHA、实现 diff、真实仓库缺陷回归及负控制日志、固定输入/重放/配置 hash、旧新质量决定、服务端提交/发送与客户端接收/应用事件对账、同机器同负载性能表及回滚记录。无标签的 Precision/Recall 标为不可用；未执行的测试明确 not_run。
+优先实验：`EXP-IT-OBS-001 v2`——同一固定输入比较 current change-only、save-all admitted oracle 与 interval-compressed admitted。固定矩阵包含 quiet、横盘后跳变、真断线、重复、乱序、future point、source switch、午休和跨日。候选若无限前填真实断线、吞同秒合法修订、跨 source epoch 做累计差分或真实仓库成本不可接受，则淘汰。
 
-## 前轮线索与交付方式
+## 下一轮必须检查的产物
 
-上一份 GitHub 报告：[`2026-09-19_00-58-13_JST.md`](./2026-09-19_00-58-13_JST.md)，报告提交 `67f764baa1f08de8d0f0f2ff1e56691b8f4808a7`。
+按报告 WP1→WP9 接续，优先要求本地 agent 回传：
 
-后续每轮在原对话交付完整中文报告，并通过授权 GitHub 连接器同步本目录及本索引。报告发布不改产品源码、配置、测试、Actions 或 PR；文档提交不算模型/产品升级。排程由原对话现有任务执行，报告文档不是排程生效证据。
+1. 真实仓库类上的红测/负控制：soft-partial、stale current Snapshot、180s gap laundering、future point、横盘 anchor、封单 100→300 万、14:57 边界；
+2. 三源 requested/returned/missing 分类与 source epoch；
+3. Engine `latest_cache` / `admitted_current` 分离后的事件 diff；
+4. 固定 fixture/replay/config hash；
+5. old/new feature 与 event 对账；
+6. server committed/sent/client received/applied 对账；
+7. 同机器、同负载的 p50/p95/p99、CPU/RSS 与覆盖表；
+8. 验收失败时的 trace 与回滚说明。
+
+没有独立真实标注时 Precision/Recall 继续标为不可用；未执行的测试明确 `not_run`，不能用旧归档结果冒充本轮验证。
+
+## 前轮线索
+
+上一份完整报告：[`2026-09-19_04-04-37_JST.md`](./2026-09-19_04-04-37_JST.md)，其报告提交 `fb941cf1d068e24739dad6412867338cab19f4c2`，后续索引提交 `e37ed7c4990050b011465b84af51d965b5f6f24a`。
+
+后续报告仍只在本目录新增 Markdown 报告并更新本索引；报告提交不计作产品源码升级，不修改产品代码、测试、配置、README、CHANGELOG、Actions 或 PR。
