@@ -126,13 +126,19 @@ def make_round_sample(
     max_deque: int,
     history_maxlen: int,
     watchlist_only: bool,
+    observation: dict | None = None,
 ) -> dict:
     """把一轮的观测值收敛成一个 plain dict（纯函数，便于离线造样本）。
 
     ``alerts`` 接受 Alert 对象、dict 或裸 kind 字符串：真实运行给的是 Alert，
     测试里手写样本时不必构造一整个 Alert。
+
+    ``observation`` 是本轮的 ``RoundObservationSet.as_dict()``（WP02）。
+    以前这里只有 ``quotes=len(state.quotes)`` —— 那是**累计缓存**的 key 数，
+    不是本轮真实观测数，休市/切源时会把旧值冒充成本轮覆盖（IT-P2-OBS-001）。
     """
-    return {
+    obs = dict(observation or {})
+    out = {
         "index": int(index),
         "latency_ms": float(latency_ms),
         "kinds": [_kind_of(a) for a in (alerts or [])],
@@ -145,6 +151,23 @@ def make_round_sample(
         "history_maxlen": int(history_maxlen),
         "watchlist_only": bool(watchlist_only),
     }
+    # 本轮真实观测账本（有则并入；离线造样本不传时保持旧形状）。
+    # 全部走 _safe_int/_safe_float：可观测性字段脏了不能让 soak 崩，
+    # 报告宁可少几项也不能因为一个 None/字符串把整场 soak 打断。
+    if obs:
+        out["requested"] = _safe_int(obs.get("requested"))
+        out["returned"] = _safe_int(obs.get("returned"))
+        out["admitted"] = _safe_int(obs.get("admitted"))
+        out["coverage"] = _safe_float(obs.get("coverage"))
+        out["source"] = str(obs.get("source") or "")
+        out["future_rejected"] = _safe_int(obs.get("stale_rejected"))
+        out["out_of_order_rejected"] = _safe_int(obs.get("out_of_order_rejected"))
+        missing = obs.get("unknown_missing")
+        out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
+        out["unavailable_capability"] = _safe_int(obs.get("unavailable_capability"))
+        caps = obs.get("capabilities")
+        out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
+    return out
 
 
 def summarize_rounds(rounds: Sequence[dict]) -> dict:
@@ -454,6 +477,32 @@ def _kind_of(item: Any) -> str:
     if raw is None:
         return "unknown"
     return str(getattr(raw, "value", raw))
+
+
+def _safe_int(v: Any) -> int:
+    """可观测性计数转 int；None/脏值一律 0（**不抛**）。
+
+    这些字段来自 Store 汇总，理论上都是干净的 int，但 soak 是要连续跑几小时
+    的，任何一个脏值把整场 soak 打断都得不偿失 —— 报告少一项远好过全丢。
+    """
+    if isinstance(v, bool) or v is None:
+        return 0
+    if isinstance(v, int):
+        return v
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _safe_float(v: Any) -> float:
+    """可观测性比率转 float；None/脏值一律 0.0（**不抛**）。"""
+    if isinstance(v, bool) or v is None:
+        return 0.0
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 # ==========================================================================
@@ -816,6 +865,17 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
         history = getattr(state, "history", {}) or {}
         maxlen = max([getattr(h, "maxlen", 0) or 0 for h in history.values()]
                      + [int(getattr(state, "history_len", 0) or 0), 30])
+        # 本轮真实观测账本（WP02 / IT-P2-OBS-001）。Store 里存的是**最近一轮**
+        # 的有界汇总；拿不到就退化为不含 observation 的旧形状。
+        obs_snapshot: dict = {}
+        try:
+            store = getattr(engine, "store", None)
+            get_obs = getattr(store, "observation", None)
+            if isinstance(get_obs, dict) and get_obs:
+                obs_snapshot = get_obs
+        except Exception:                            # noqa: BLE001
+            obs_snapshot = {}
+
         sample = make_round_sample(
             index=len(rounds) + 1,
             latency_ms=latency_ms,
@@ -828,6 +888,7 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
             max_deque=max((len(h) for h in history.values()), default=0),
             history_maxlen=maxlen,
             watchlist_only=bool(codes) and len(codes) <= len(watch),
+            observation=obs_snapshot,
         )
         rounds.append(sample)
 

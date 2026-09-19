@@ -115,8 +115,8 @@ class EngineState:
         return min((p[1] for p in pts), default=None)
 
     # ---- 写入 ---------------------------------------------------------
-    def update(self, quotes: Iterable[Quote], now: datetime) -> None:
-        """把一轮快照并入状态。
+    def update(self, quotes: Iterable[Quote], now: datetime) -> dict[str, Quote]:
+        """把一轮快照并入状态，**返回本轮真正被准入的标的**。
 
         曾经有个 ``eligible=`` 关键字参数，但函数体从未读过它 —— 调用方以为
         "只更新合格标的"会生效，实际全量写入。与其留一个静默失效的承诺，
@@ -128,11 +128,19 @@ class EngineState:
         没发生的涨幅）。现在改为写前判断：
 
         * ``q.ts > now + FUTURE_TOLERANCE``（远超时钟偏差）→ 整只丢弃；
-        * 迟到且比已记录的最后一点还旧的观测 → 不顺延追加，避免窗口首尾倒挂；
+        * 迟到且比已记录的最后一点还旧的观测 → 不覆盖 latest cache、
+          不追加 history、不更新 ``last_price``，计入
+          ``stats["t_reject:out_of_order"]``；
         * 轻微超前（时钟抖动范围内）→ 把时间戳夹到 ``now``，保留数据。
+
+        IT-P0-002-R1：返回值是**准入结果的单一事实来源**。上一版修在 State
+        内部，但 ``poll_once()`` 随后又从原始 ``quotes`` 重建 Snapshot ——
+        被这里拒绝的 far-future 照样进了规则，迟到旧价照样覆盖了缓存。
+        现在调用方必须消费本函数的返回值，而不是自己重算。
         """
         ep = now.timestamp()
         self.seq += 1
+        admitted: dict[str, Quote] = {}
         for q in quotes:
             if q.price <= 0:
                 continue
@@ -143,6 +151,15 @@ class EngineState:
                 self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
                 continue
 
+            # --- 乱序准入：必须在任何写入之前判定 ------------------------
+            # 旧代码先写 state.quotes，之后才判乱序，于是"不顺延 history"
+            # 只保护了 history，latest cache 与 last_price 仍被迟到旧价倒退。
+            h = self.history.get(q.code)
+            if h and q_ep < h[-1][0]:
+                self.stats["t_reject:out_of_order"] = \
+                    self.stats.get("t_reject:out_of_order", 0) + 1
+                continue
+
             self.quotes[q.code] = q
             if q.code not in self.first_seen:
                 self.first_seen[q.code] = q
@@ -150,17 +167,14 @@ class EngineState:
                 self.day_open[q.code] = q.open
             # 只在价格/成交量真正变化时追加，避免重复点污染窗口
             prev = self.last_price.get(q.code)
-            h = self.history.get(q.code)
             if h is None:
                 h = deque(maxlen=max(int(self.history_len), 30))
                 self.history[q.code] = h
-            # 迟到观测：比窗口里最后一点还旧就不追加（否则乱序会污染首尾）
-            if h and q_ep < h[-1][0]:
-                self.stats["t_reject:out_of_order"] = \
-                    self.stats.get("t_reject:out_of_order", 0) + 1
-            elif prev is None or prev != q.price or not h or h[-1][2] != q.volume_lots:
+            if prev is None or prev != q.price or not h or h[-1][2] != q.volume_lots:
                 h.append((q_ep, q.price, q.volume_lots))
             self.last_price[q.code] = q.price
+            admitted[q.code] = q
+        return admitted
 
     def _admit_time(self, q: Quote, now: datetime,
                     ep: float) -> tuple[bool, float, str]:
@@ -820,11 +834,14 @@ class Engine:
         if not quotes and not idx_quotes:
             return []
 
-        if idx_quotes:
-            self.state.update(idx_quotes, now)
-        self.state.update(quotes, now)
+        # 指数与个股共用同一准入合同（IT-P0-002-R1：股票和指数不得两套口径）。
+        # 先记准入计数基线，用来算"本轮"拒绝数（stats 是累计值）。
+        _t0_future = int(self.state.stats.get("t_reject:future", 0))
+        _t0_ooo = int(self.state.stats.get("t_reject:out_of_order", 0))
+        idx_admitted = self.state.update(idx_quotes, now) if idx_quotes else {}
+        admitted = self.state.update(quotes, now)
 
-        # 粗筛：只有**本轮真正返回**且合格的标的进入规则。
+        # 粗筛：只有**本轮真正被准入**且合格的标的进入规则。
         #
         # IT-P0-003：这里以前遍历 ``self.state.quotes``（累计"最近已知值"缓存），
         # 于是 provider 本轮少返回的代码会带着旧价、旧量冒充"本轮观测"进入规则。
@@ -832,8 +849,13 @@ class Engine:
         # Snapshot 里不存在"来清理缓存，而缓存代码每轮都进 Snapshot，缺席永远
         # 看不见；``_check_trades()`` 又先刷新 ``_prev[code]`` 的时间戳再判
         # gap，于是 180 秒的真实缺口会被洗成 5 秒，长缺口安全阀失效。
-        # 现在规则只消费本轮 returned；state.quotes 退化为仅供看板/历史的缓存。
-        returned = {q.code: q for q in quotes if q.price > 0}
+        #
+        # IT-P0-002-R1：从``quotes``（provider 原始输出）改为消费
+        # ``state.update()`` 的返回值。旧写法自己重算 `price > 0`，把
+        # far-future / out-of-order 这些**已被准入拒绝**的点又捞回 Snapshot，
+        # 等于准入只保护了 State、没保护规则。现在准入结果是单一事实来源。
+        # 注意：``admitted`` 只含通过时间准入的，`price > 0` 已在 update 内判过。
+        returned = dict(admitted)
         eligible = {
             c: q for c, q in returned.items()
             if self.filters.accept(q, now.date()) and c not in self.ignore
@@ -864,15 +886,27 @@ class Engine:
         else:
             serving_src = self.sources.sources[serving_idx]
         caps = capabilities_for(serving_src)
+        # 账本口径（IT-P0-002-R1 / WP02）：
+        #   requested = 本轮请求的代码数（个股 + 指数）
+        #   returned  = provider 原始返回且 price>0 的（未经时间准入）
+        #   admitted  = 通过时间准入后真正进入规则的
+        # returned 与 admitted 的差额就是被时间准入拒掉的（future / out_of_order），
+        # 这两个 rejection 计数直接取自 state.stats 的差分，不另起一套口径。
+        req_stocks = len(self._codes)
+        raw_returned = sum(1 for q in quotes if q.price > 0)
+        future_rej = int(self.state.stats.get("t_reject:future", 0)) - _t0_future
+        ooo_rej = int(self.state.stats.get("t_reject:out_of_order", 0)) - _t0_ooo
         observation = RoundObservationSet(
             source=str(getattr(serving_src, "name", "")),
             capabilities=caps,
-            requested=len(self._codes),
-            returned=len(returned),
-            admitted=len(eligible),
+            requested=req_stocks + len(self.index_codes),
+            returned=raw_returned + sum(1 for q in idx_quotes if q.price > 0),
+            admitted=len(eligible) + len(idx_admitted),
             unknown_missing=tuple(
                 c for c in self._codes if c not in returned
             ),
+            stale_rejected=max(future_rej, 0),
+            out_of_order_rejected=max(ooo_rej, 0),
         )
 
         ctx = RuleContext(
@@ -934,7 +968,7 @@ class Engine:
 
         self.store.set_poll_stats(
             poll_ms=int((time.perf_counter() - t0) * 1000), count=self._poll_count,
-            health=self.sources.health(), now=now)
+            health=self.sources.health(), now=now, observation=observation)
         return fresh
 
     def _dispatch_many(self, alerts: list[Alert]) -> None:

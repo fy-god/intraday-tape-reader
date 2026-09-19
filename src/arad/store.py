@@ -68,6 +68,8 @@ class AlertStore:
         self._poll_count: int = 0
         self._source_health: list[dict] = []
         self._notes: list[str] = []
+        #: 最近一轮的观测账本（有界汇总，见 set_poll_stats）。WP02。
+        self._observation: dict = {}
 
     # ------------------------------------------------------------------
     # 引擎接入
@@ -116,13 +118,34 @@ class AlertStore:
 
     def set_poll_stats(self, *, poll_ms: int, count: int,
                        health: list[dict] | None = None,
-                       now: datetime | None = None) -> None:
+                       now: datetime | None = None,
+                       observation: Any = None) -> None:
+        """记录本轮统计。
+
+        ``observation`` 是 ``RoundObservationSet``（IT-P0-002-R1 / WP02）。
+        以前它只活在 ``poll_once()`` 局部，Store/status/live_session 都看不到，
+        于是"Sina 期间放量规则不可评估"这类事实无人能查。这里只保留**有界的
+        汇总**（计数 + 能力位 + 来源），不持久化逐股明细。
+        """
         with self._lock:
             self._last_poll_ms = int(poll_ms)
             self._poll_count = int(count)
             self._last_poll_ts = (now or datetime.now()).strftime("%H:%M:%S")
             if health is not None:
                 self._source_health = list(health)
+            if observation is not None:
+                as_dict = getattr(observation, "as_dict", None)
+                if callable(as_dict):
+                    try:
+                        self._observation = as_dict()
+                    except Exception:  # noqa: BLE001  可观测性不得影响主流程
+                        pass
+
+    @property
+    def observation(self) -> dict:
+        """最近一轮的观测账本（没有则为空 dict）。"""
+        with self._lock:
+            return dict(self._observation)
 
     def add_note(self, msg: str) -> None:
         with self._lock:
@@ -178,6 +201,8 @@ class AlertStore:
             last_poll_ts = self._last_poll_ts
         quotes = getattr(state, "quotes", {}) if state is not None else {}
         watch = list(getattr(self._engine, "watchlist", []) or []) if self._engine else []
+        with self._lock:
+            observation = dict(self._observation)
         return {
             "phase": phase.value,
             "session": PHASE_CN.get(phase, phase.value),
@@ -197,6 +222,10 @@ class AlertStore:
             "replay": self.settings.replay,
             "subscribers": self.subscriber_count,
             "notes": notes,
+            # 本轮观测账本：requested/returned/admitted/future_rejected/… +
+            # capability 集合。让"Sina 期间放量规则不可评估"能被查到，
+            # 而不是只看到 alerts=0（IT-P0-002-R1 / WP02）。
+            "observation": observation,
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 
