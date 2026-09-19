@@ -1,8 +1,63 @@
 # 最新审计
 
-最新完整报告：[`2026-09-20_05-16-58_JST.md`](./2026-09-20_05-16-58_JST.md)
+最新完整报告：[`2026-09-20_05-30-48_JST.md`](./2026-09-20_05-30-48_JST.md)
 
-## 版本与证据边界
+## 版本与证据边界（2026-09-20 05:30 JST）
+
+- 仓库与分支：`fy-god/intraday-tape-reader` / `main`。
+- 审计时间：2026-09-20 05:30 JST（本地 04:30 CST）。
+- 本轮开始 HEAD：`a88094e915340b4eaec534af2826b5ffef68fe0e`（04:18 CST，就在本轮触发前约 2 分钟前进）。
+- 上游审计 `reviewed_source_sha`：`a3cfd567fb07e414c1d553e5fc478e50892abea8`。
+- 本轮性质：**本地 checkout 真实执行**，全部结论在本机复现，含实验/对照。
+- 真实多日连续 A 股语料：仍 `blocked`。
+- `execution_status`: `COMPLETED`；`research_verdict`: `NOT_EVALUATED`；`evidence_status`: `VERIFIED`。
+- 未启动任何真实通知、长期采集、交易或付费训练。
+
+## 本轮最高优先：`IT-P0-002-R2`（同一缺陷类残留，未完全闭合）
+
+`a88094e` 声称修复的 `IT-P0-002-R1`（迟到旧价不得倒退 `quotes`/`last_price`、不得进规则）**主路径确实修好**（我独立复现：R1 10.0 → R2 10.5 → R3 旧价 8.0 后 `last_price=10.5`、`ooo=1`、规则 Snapshot 空）。
+
+**但同一缺陷类以"水位线滞后"形态残留**：乱序守卫用 `history[-1][0]`（最后一次 **append** 的点）作基准，而 `history` 仅在价格或量变化时才追加；`quotes`/`last_price` 却每次准入都推进。于是：
+
+- **实验组**（R2 同价同量，history 不追加）：R3 送 t+30（旧于已接受的 t+60）→ `last_price` 从 10.0 **倒退到 9.8**、**进入规则 Snapshot**、`ooo=0`。
+- **对照组**（仅把 R2 改成 10.5，history 推进到 t+60）：同一 R3 **被正确拒绝**，`last_price=10.5`、规则 Snapshot 空、`ooo=1`。
+
+两组唯一差异是 history 是否推进 ⇒ 残留归因于水位线。修法：每票维护 `last_accepted_ep`，每次准入均更新，不复用 `history[-1][0]`。
+
+## 本轮其余已确认
+
+1. **`IT-P2-OBS-002`（本轮新引入的回归）**：`unknown_missing` 语义被 `returned = dict(admitted)`（`engine.py:858`）连带改变。旧版 `a3cfd567` 用**原始返回集**，同一场景得 `()`（正确）；新版得 `('600000',)`。被时间拒绝的票**同时**落入 `unknown_missing` 与 `stale_rejected`，恒等式 `1+1+1=3 ≠ 7` 不成立。`capabilities.py:135` 定义为"请求了但本轮没返回"，与事实矛盾。
+2. **`IT-P2-OBS-003`**：`admitted` 混装两套口径（个股走 `filters.accept+ignore`，指数只走时间准入）。单只 `0.01` 价票得 `returned-admitted=1` 而时间拒绝为 0，直接反驳 `engine.py:893-894` 的注释。
+3. **`IT-P2-OBS-004`**：失败轮（`engine.py:822-824` 不传 `observation`）不更新账本，`store.py:136` 只在非 `None` 时覆盖 ⇒ `/api/status` 持续展示上一轮数字，且 `as_dict()` **无任何轮次/时间戳 identity**，陈旧性下游不可检测。
+4. **`IT-P0-001` 仍开放**：`session.py:39/58/65` 把 13:00–15:00 全判为 `CONTINUOUS`，而文件自身 L4 写明 14:57–15:00 是深市收盘集合竞价。
+
+## 已修好并复核（不重复报错）
+
+`IT-P0-002-R1` 主路径、远未来不进规则、写入前判定（三个 `continue` 均在全部写入之前）、规则不再从原始 `quotes` 重建 —— 四项均由我独立复现确认。
+
+## 测试与门禁（本机真实执行）
+
+```text
+python -m pytest -p no:cacheprovider   -> 1155 passed / 0 failed  (50.06s)  exit 0
+三个新测试文件                          -> 15 + 11 + 10 = 36 个 test 函数
+tools/check_*.py（8 个）                -> 全部 exit 0
+node tools/dash_render_check.js         -> exit 0
+python tools/check_bom.py               -> exit 0
+```
+
+与提交信息核对：`1155 passed / 0 failed` 与"绿测 15 项"**均实测一致**。提交声称的"红测 12 项失败"与"WP02 回退 8 项失败"我**未在仓库内回退文件**（遵守只读纪律），**未独立复现 → 标未复现**。子 agent 报告的"自选股进 Snapshot 但不计数"在本机**未复现**，已降级不写入。
+
+## 流程观察（非代码缺陷）
+
+`a88094e` **把源码修复、自证报告与 `LATEST.md` 索引放进同一个提交**（该仓库惯例是文档另行单独提交并带 `[skip ci]`），导致索引里的 `reviewed_source_sha = a3cfd567` 落后于它自己所在提交的 HEAD。
+
+## 真实模型增益
+
+**零。** 真实多日语料仍 `blocked`；本轮 1155 与 8 个门禁是**软件回归证据**，不构成模型有效性证据。本轮未改源码、未动排程。
+
+---
+
+## 版本与证据边界（2026-09-20 05:16 JST，上一轮）
 
 - 仓库与分支：`fy-god/intraday-tape-reader` / `main`。
 - 审计时间：2026-09-20 05:16 JST（本地 04:16 CST）。
