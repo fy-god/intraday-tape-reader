@@ -1,68 +1,66 @@
-﻿# 最新审计
+# 最新审计
 
-最新完整报告：[`2026-09-19_17-59-54_JST.md`](./2026-09-19_17-59-54_JST.md)
+最新完整报告：[`2026-09-19_20-10-46_JST.md`](./2026-09-19_20-10-46_JST.md)
+
+本轮本地 Agent 任务书：[`2026-09-19_20-10-46_JST_AGENT_TASK.md`](./2026-09-19_20-10-46_JST_AGENT_TASK.md)
 
 ## 版本与本轮性质
 
 - 仓库与分支：`fy-god/intraday-tape-reader` / `main`。
-- 审计时间：2026-09-19 17:59 JST。
-- `reviewed_source_sha`：`f695102f8794b0b235d5f6ebf24564520d663ad8`（网页版 16:06 JST 报告所审源码）。
-- 上轮产品修复基线：`e6ed35204cc82b9e072a9a27a2e8d6ad3acab089`。
-- 本轮开始 HEAD：`b04dd3e`（含网页版 16:06 JST 审计报告与索引提交）。
-- 本轮报告提交：`34778204dee41575697357f5d2e20a40aad3bc9d`。
+- 审计时间：2026-09-19 20:10 JST。
+- 本轮开始 HEAD：`6d92f50e317de9b8ff4a34a84766347c3de3d041`。
+- `reviewed_source_sha`：`34778204dee41575697357f5d2e20a40aad3bc9d`。
+- 报告与本轮任务书发布提交：`e34ab87641ff738e35fe48f1698966feba04488f`。
+- `3477820 -> 6d92f50` 经 compare 只有审计文档变化，所以本轮没有把文档提交当产品升级。
+- 本轮无相关 PR。
 
-本轮**有产品源码修复**：读取网页版 GPT Pro 提交的 16:06 JST 审计报告，复现并修复
-其中的 `IT-P0-003`（累积缓存被包装成本轮 Snapshot），新增 4 项回归测试并做回退验牙。
-全量 1068 passed / 0 failed。
+本轮性质：**工程审计 + 隔离沙箱研发闭环**。没有修改远端产品代码、测试、配置、Actions 或 PR；没有真实通知、交易或真实行情常驻抓取。
 
-## 本轮已修复
+## 已修复并保留回归
 
-- `IT-P0-003`：`Engine.poll_once()` 的规则 Snapshot 改从**本轮实际返回**的观测构造，
-  不再遍历累计缓存 `state.quotes`。修复前，provider 少返回的代码会带旧价旧量进入规则，
-  使 `SpiritOrderRule._drop_stale()` 看不到缺席、`_check_trades()` 把 180 秒真实缺口
-  洗成 5 秒，长缺口安全阀失效。
+- `IT-P0-003`：`3477820` 已将个股规则 Snapshot 改为只消费本轮 `returned`；本轮不再把它重复列为未修。
+- `IT-P1-006` 主体保护与 `IT-P1-007` 分路由故障转移记账继续保留。
 
-## 继续开放（本轮未复现，维持风险等级）
+## 本轮确认/推进的开放问题
 
-- `IT-P0-002`：窗口缺 `<= now` 上界、provider 时间未做写前质量门控。
-- `IT-P0-001`：14:57-15:00 应按收盘集合竞价而非连续竞价处理。
-- `IT-P1-SOURCE-EMPTY-001`：三源缺 requested-vs-returned 完整性合同。
-- `IT-P1-WINDOW-001`：change-only 压缩导致横盘后跳变算不出。
-- `IT-P1-LIMIT-001`：封单跨越门槛时状态先写 `sealed` 吞掉首次合格封板事件。
-- `IT-P2-OBS-001`：`tools/live_session.py` 用累计 cache key 数冒充每轮覆盖。
-- `IT-P1-008`（SSE 重连补账）、`IT-P1-009`（慢客户端静默 drop-oldest）、
-  `IT-P1-003`（series 主体容量）。
+- `IT-P0-002`：window 缺 `<= now` 上界，provider 时间没有写前质量门控；机制探针已复现 future point 进入当前窗口。
+- `IT-P0-001`：`session.py` 仍把 14:57–15:00 归入连续竞价；SSE/SZSE 官方规则均为收盘集合竞价。
+- `IT-P1-SOURCE-EMPTY-001`：Tencent/Sina/Eastmoney 指定代码抓取缺 requested-vs-returned 完整性合同；soft-partial 不会自动补洞。
+- `IT-P1-WINDOW-001`：change-only history 压缩会删除“横盘但持续新鲜”的 anchor，横盘后跳变可算不出窗口涨幅。
+- `IT-P1-LIMIT-001`：封单未达门槛也先写 `sealed`，后续 100万→300万首次合格封板可被吞。
+- `IT-P1-006-R1`：Eastmoney `total` 需要页数超过 `max_pages` 时仍可能 `complete=True`；这是旧完整性修复的残留分支，不是否定主体修复。
+- `IT-P2-OBS-001`：`tools/live_session.py` 仍用累计 cache 数和目标 universe 数，不能度量本轮 current coverage。
+- `IT-P1-008/009/003/004` 继续开放：SSE补账、慢客户端静默 drop-oldest、series 主体容量、Tencent 默认不安全 TLS fallback。
 
-已修并保留回归：`IT-P1-006`、`IT-P1-007`（分路由故障转移记账 + 拒绝部分池覆盖完整池）。
+## 本轮研发执行结果
 
-## 下一轮必须检查的产物
+真实多日连续训练数据没有挂载；仓库可读 raw fixture 只有单股单日分钟趋势等少量样本，因此真实模型训练仍为 `blocked_real_data`。为验证研发链实际可执行，本轮仅以 `synthetic_fixture` 跑通：
 
-1. 按 R2 把 180s 缺口负控制迁入 `tests/test_full_day_simulation.py`（该文件至今 `not_run`）。
-2. `IT-P0-002`：窗口上界 + 真实未来点/乱序数据复现。
-3. `IT-P1-SOURCE-EMPTY-001`：单源 requested/returned 计数日志，观察真实缺失率。
+- 30 模拟股票 ×20 模拟交易日 ×220 个5秒 tick，共132,000行；仅为 pipeline execution。
+- 35 个候选因子、8 个家族；做 50 次未来字段扰动因果性检查，当前时刻因子 0 项变化。
+- Rule / Logistic / HGB / MLP / causal TCN 全部完成 fit→checkpoint→reload→predict→evaluate；checkpoint 重载预测差均为0。
+- 负控制、6组消融、10组 tune-only 粗筛、3个 expanding walk-forward、seeds 17/29/43 已执行。
+- synthetic 初始 HGB ROC/PR AUC = 0.6647/0.7076；TCN 只有213条 synthetic test sequence 且 ROC≈0.503，当前没有扩大神经网络的证据。所有数值都**不是实盘成绩**，真实 Precision/Recall 仍不可用。
+- 成功训练脚本 wall 15.54s，Max RSS 821,516KB；粗筛/前推脚本 wall 19.22s，Max RSS 279,340KB。
 
-没有独立真实标注时 Precision/Recall 继续标为不可用；未执行的测试明确 `not_run`，
-不能用旧归档结果冒充本轮验证。
+本轮 `RUN_MANIFEST.json` SHA256：`f570d6a6e54ff21a4931bb0d8e6c77f8094ddb0ef600213bc1fd81900e17abe0`。
 
-## 前轮线索
+## 主实验与下一轮产物
 
-上一份完整报告：[`2026-09-19_16-06-05_JST.md`](./2026-09-19_16-06-05_JST.md)，
-其报告提交 `4e2228e4510ecd0c2ddf646d874020b7a90fef88`，
-索引提交 `b04dd3e`（=`e37ed7c` 之后的索引）。
+主实验继续 `EXP-IT-OBS-001 v3`：先完成真实 `Round Observation Contract` 的 requested/returned/admitted/unknown_missing/stale/out_of_order/source_mix 影子统计，再把 35 因子迁移到真实字段和真实数据。模型默认只 shadow，不影响正式告警。
 
-后续报告仍只在本目录新增 Markdown 报告并更新本索引；报告提交不计作产品源码升级，
-不修改产品代码以外的部署、Actions 或 PR。
+下一轮优先核查：
 
-## 本地研发执行任务书 v2（任务要求更新，非新一轮审计）
+1. 真实 checkout 上 `IT-P0-002`、`IT-P1-WINDOW-001`、`IT-P1-LIMIT-001`、`IT-P1-006-R1`、soft-partial 的修前红/修后绿/回退验牙日志；
+2. 真实 `dataset_manifest.json / task_spec.json / split_manifest.json`；
+3. 真实字段因子目录、因果性测试、单因子/家族诊断和 trial 台账；
+4. 真实数据就绪后同切分的 Rule/Logistic/HGB/MLP/TCN 训练、checkpoint hash、predictions、ablation、walk-forward、多种子；
+5. `live_session.py` 的 current coverage 与 committed/sent/received/applied 事件对账。
 
-新增任务书：[`2026-09-19_19-19-04_JST_AGENT_TASK.md`](./2026-09-19_19-19-04_JST_AGENT_TASK.md)。
+不存在的 `tests/test_full_day_simulation.py` 已在本轮实际核对为 404；后续如果采用该路径必须标记“待新增”，不能继续写成“已有但 not_run”。
 
-- 任务书生成时间：2026-09-19 19:19:04 JST。
-- 任务书提交：`6d471270ccd2cce522f196d4d37092b6f1ae48fe`。
-- 配置时读取的源码 HEAD：`9bf4a7f1d46419ce67dd94dc237d38d0a61a04b6`。
-- 原有最新源码审计主指针和历史证据保持不变；本次没有重新运行全仓测试或模型训练。
-- 执行要求扩展为工程修复与研究双主线：真实数据/标签、24—48个候选因子、Logistic/树模型/MLP/因果TCN、有限参数搜索、时间前推/多种子消融、故障重放和离线影子接入。
-- 本地agent需按十个依赖工作包接续，不以修一个问题或写完设计说明作为全部完成；实际资源或数据受阻时保留blocked原因并推进独立可执行工作。
-- 下一轮新增验收产物：数据/标签/切分清单、因子目录与诊断、trial账本、训练日志、checkpoint hash、预测表、消融表、事件对账、延迟/内存表、RUN_MANIFEST与NEXT_STEPS。
-- 新增训练与研究结果当前为待执行，不将合成测试、规则伪标签或未核验本地结果写成真实市场成绩。
-- 本地候选代码和离线训练不等于远端发布；GitHub仍仅同步授权Markdown报告/任务书及本索引。
+## 历史线索
+
+上一份完整报告：[`2026-09-19_17-59-54_JST.md`](./2026-09-19_17-59-54_JST.md)，其产品修复提交为 `34778204dee41575697357f5d2e20a40aad3bc9d`。
+
+上一次本地研发任务要求更新：[`2026-09-19_19-19-04_JST_AGENT_TASK.md`](./2026-09-19_19-19-04_JST_AGENT_TASK.md)，提交 `6d471270ccd2cce522f196d4d37092b6f1ae48fe`；该任务书更新不是产品修复。
