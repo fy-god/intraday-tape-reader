@@ -1,10 +1,10 @@
-[build-system]
+﻿[build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "intraday-tape-reader"
-version = "1.0.2"
+version = "1.0.3"
 description = "盘中短线精灵 — A股盘中实盘急拉急跌预警系统（纯标准库实现）"
 readme = "README.md"
 requires-python = ">=3.11"

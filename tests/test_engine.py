@@ -994,6 +994,137 @@ def test_poll_once_uses_watchlist_not_silent_when_universe_empty(monkeypatch):
 
 
 # ==========================================================================
+# IT-P0-003：累积缓存不得冒充"本轮观测"
+#
+# 真实缺陷（2026-09-19 16:06 JST 审计 IT-P0-003）：
+# poll_once 曾遍历 self.state.quotes（累计"最近已知值"）构造 Snapshot，
+# 于是 provider 本轮少返回的代码会带着旧价、旧量进入规则。危害不只是
+# 看板显示旧价 —— SpiritOrderRule._drop_stale() 依赖"本轮 Snapshot 中
+# 不存在"来清缓存，而缓存代码每轮都进 Snapshot，缺席永远看不见；
+# _check_trades() 又先刷新 _prev[code] 的时间戳再判 gap，于是 180 秒的
+# 真实缺口被洗成 5 秒，长缺口安全阀失效。
+# ==========================================================================
+class _ShrinkingSource:
+    """前 ``full_rounds`` 轮返回全部代码，之后只返回第一只（模拟 provider 少行）。
+
+    成交量必须足够大以通过 ``Filters.min_amount``（默认 800 万元），
+    否则代码会被粗筛拦掉，测不到"缺席"这条路径。
+    """
+
+    name = "shrinking"
+
+    def __init__(self, codes, *, full_rounds: int = 1):
+        self.codes = list(codes)
+        self.full_rounds = full_rounds
+        self.round = 0
+
+    def universe(self):
+        return []
+
+    def snapshots(self, codes):
+        self.round += 1
+        want = self.codes if self.round <= self.full_rounds else self.codes[:1]
+        return [make_quote(code=c, price=10.0 + self.round * 0.01,
+                           volume_lots=200_000.0 * self.round) for c in want]
+
+    def health(self):
+        return {"name": self.name, "ok": True}
+
+
+class _CapturingRule:
+    """记录每轮 Snapshot 里到底有哪些代码。"""
+
+    name = "capture"
+
+    def __init__(self):
+        self.seen: list[list[str]] = []
+
+    def evaluate(self, snap, ctx):
+        self.seen.append(sorted(snap.quotes))
+        return []
+
+
+def _capture_engine(codes, *, full_rounds: int = 1):
+    rule = _CapturingRule()
+    eng = Engine(source=_ShrinkingSource(codes, full_rounds=full_rounds),
+                 settings=_settings(), rules=[rule], notifiers=[],
+                 calendar=_morning_cal())
+    eng._codes = list(codes)
+    # 固化股票池：否则 _maybe_refresh_universe() 会用空 universe + 空 watchlist
+    # 把 _codes 清空，规则根本跑不到（这正是第一版测试失败的原因）。
+    eng._codes_pinned = True
+    eng.watchlist = []
+    return eng, rule
+
+
+def test_snapshot_excludes_codes_absent_from_this_round(monkeypatch):
+    """provider 本轮没返回的代码，绝不能进 Snapshot（即使缓存里还有）。"""
+    eng, rule = _capture_engine(["600000", "600001", "600002"])
+    monkeypatch.setattr(eng, "refresh_universe", lambda *a, **k: 0)
+
+    eng.poll_once(force=True)                     # 第 1 轮：三只都返回
+    assert rule.seen[-1] == ["600000", "600001", "600002"]
+    # 累计缓存确实还留着旧值 —— 这是允许的，它现在只是缓存
+    assert "600001" in eng.state.quotes
+
+    eng.poll_once(force=True)                     # 第 2 轮：只返回 600000
+    assert rule.seen[-1] == ["600000"], (
+        "缺席代码不得进入规则 Snapshot；否则 _drop_stale 永远看不到缺席、"
+        "长缺口会被洗短")
+
+
+def test_snapshot_is_current_only_even_when_cache_is_large(monkeypatch):
+    """缓存里堆了很多历史代码，本轮只返回一只时 Snapshot 也只能有一只。"""
+    eng, rule = _capture_engine(["600000", "600001", "600002", "600003"],
+                                full_rounds=1)
+    monkeypatch.setattr(eng, "refresh_universe", lambda *a, **k: 0)
+    for _ in range(4):
+        eng.poll_once(force=True)
+
+    assert len(eng.state.quotes) == 4, "缓存应保留全部历史代码"
+    assert rule.seen[-1] == ["600000"], "但规则只看得到本轮返回的那一只"
+
+
+def test_snapshot_excludes_zero_price_that_blocks_cache_update(monkeypatch):
+    """零价被 update() 跳过（缓存留旧值），但也绝不能作为"当前"进规则。"""
+    rule = _CapturingRule()
+    src = _ShrinkingSource(["600000", "600001"], full_rounds=99)
+    eng = Engine(source=src, settings=_settings(), rules=[rule],
+                 notifiers=[], calendar=_morning_cal())
+    eng._codes = ["600000", "600001"]
+    eng._codes_pinned = True
+    eng.watchlist = []
+    monkeypatch.setattr(eng, "refresh_universe", lambda *a, **k: 0)
+
+    eng.poll_once(force=True)
+    assert "600001" in rule.seen[-1]
+
+    # 第 2 轮 600001 变成零价（停牌/坏行）：update() 会 continue 保留旧缓存
+    src.snapshots = lambda codes: [
+        make_quote(code="600000", price=10.5, volume_lots=400_000.0),
+        make_quote(code="600001", price=0.0, prev_close=0.0, volume_lots=0.0),
+    ]
+    eng.poll_once(force=True)
+
+    assert "600001" not in rule.seen[-1], (
+        "零价必须让该股退出本轮观测，而不是继续拿着旧的有效值喂规则")
+    assert "600001" in eng.state.quotes, "缓存仍保留旧值（供看板/诊断）"
+
+
+def test_watchlist_codes_absent_this_round_do_not_enter_snapshot(monkeypatch):
+    """自选股也必须是本轮真的返回了才进 Snapshot。"""
+    eng, rule = _capture_engine(["600000", "600001"])
+    eng.watchlist = ["600001"]           # 自选，但第 2 轮起不再返回
+    monkeypatch.setattr(eng, "refresh_universe", lambda *a, **k: 0)
+
+    eng.poll_once(force=True)
+    assert "600001" in rule.seen[-1]
+    eng.poll_once(force=True)
+    assert rule.seen[-1] == ["600000"], (
+        "自选股缺席时不得用缓存旧值继续喂规则")
+
+
+# ==========================================================================
 # AlertBus 冷却：跨桶只差 1 秒的真实缺陷
 # ==========================================================================
 def _alert(key: str, *, cd_key: str = "", cd: float = 0.0, kind=AlertKind.SURGE):

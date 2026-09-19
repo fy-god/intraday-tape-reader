@@ -2,6 +2,64 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.0.3] — 2026-09-19
+
+第六轮审计修复了 `IT-P0-003`：**累积缓存被包装成"本轮观测"进入规则**。
+这是本轮之前所有"少行/缺数据"类缺陷的**共同上游**——系统性、且完全静默。
+
+### 修复
+
+* **规则 Snapshot 不再从累计缓存构造**（`IT-P0-003`）。
+  `Engine.poll_once()` 原先用 `self.state.quotes`（累计"最近已知值"）做粗筛
+  并灌进 `Snapshot.quotes`。而 `EngineState.update()` 对 `price <= 0` 直接
+  `continue`，不会把旧缓存显式标为"当前不可用"。于是**任一来源本轮少返回的代码**，
+  都会带着旧价、旧量继续作为"当前观测"喂给规则。
+
+  危害不止"看板显示旧价"，它同时废掉了两个已有保护：
+
+  1. `SpiritOrderRule._drop_stale()` 靠"本轮 Snapshot 中不存在"清理缓存。
+     缓存代码每轮都进 Snapshot，**缺席永远看不见**——规则级测试
+     `test_stale_code_cache_dropped_between_rounds` 钉住的语义
+     与生产 Engine 的实际行为早已不一致。
+  2. `SpiritOrderRule._check_trades()` 先写
+     `self._prev[code] = (..., now_epoch)` 再判 `now_epoch - p_epoch > max_gap`。
+     stale 代码每轮都把 `_prev` 时间刷新成当前轮，**真实长缺口被"洗短"**：
+     `10:00:00` 最后一次真实观测、`10:00:05~10:02:55` 持续缺失但缓存每 5 秒进入
+     Snapshot、`10:03:00` 恢复时，真实观测间隔 180 秒被看成 5 秒，
+     长缺口安全阀（默认 300 秒）不生效，可能产出**无中生有的大笔买入/卖出告警**。
+
+  现分层为：`state.quotes` 退化为仅供看板/历史的 `latest_cache`，
+  规则 Snapshot **只**消费本轮实际返回且解析成功的观测：
+
+  ```python
+  returned = {q.code: q for q in quotes if q.price > 0}
+  eligible = {c: q for c, q in returned.items()
+              if self.filters.accept(q, now.date()) and c not in self.ignore}
+  ```
+
+  自选股同样必须是本轮返回的，不再用缓存旧值兜底。
+
+### 新增 — 回归护栏（4 条，均经"回退验牙"）
+
+* `test_snapshot_excludes_codes_absent_from_this_round` —— provider 本轮没返回的
+  代码不得进 Snapshot，即使缓存里还有。
+* `test_snapshot_is_current_only_even_when_cache_is_large` —— 缓存 4 只、
+  本轮只返回 1 只时 Snapshot 必须只有 1 只。
+* `test_snapshot_excludes_zero_price_that_blocks_cache_update` —— 零价必须让该股
+  退出本轮观测，不能拿旧有效值喂规则。
+* `test_watchlist_codes_absent_this_round_do_not_enter_snapshot` —— 自选股缺席时
+  不得用缓存旧值继续喂规则。
+
+**回退验牙**：把 `returned` 改回 `self.state.quotes`（恢复缺陷）后，
+上述 4 项**全部变红**（`assert ['600000','600001'] == ['600000']`），
+`pytest` exit 1；还原后重新全绿。
+
+### 验证
+
+* 全量测试：**1068 passed / 0 failed / 0 error / 0 skipped**（`time=62.046s`）。
+  基线 1064（1.0.2）+ 本轮新增 4 = 1068，数字自洽。
+* 未改动：`session.py` 时段边界、通知、部署、SSE 传输、前端看板。
+
 ## [1.0.2] — 2026-09-18
 
 第五轮审计（盘中预警线轮审）修复了**两个"数据静默出错但不报错"的缺陷**。
@@ -141,6 +199,7 @@
 * 交易日历与各板块涨跌幅限制（主板 ±10%、双创 ±20%、北交所 ±30%、
   主板 ST ±5%）。
 
+[1.0.3]: https://github.com/fy-god/intraday-tape-reader/compare/v1.0.2...v1.0.3
 [1.0.2]: https://github.com/fy-god/intraday-tape-reader/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/fy-god/intraday-tape-reader/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/fy-god/intraday-tape-reader/releases/tag/v1.0.0

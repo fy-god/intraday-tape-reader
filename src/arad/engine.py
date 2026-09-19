@@ -771,11 +771,24 @@ class Engine:
             self.state.update(idx_quotes, now)
         self.state.update(quotes, now)
 
-        # 粗筛：只有合格标的进入规则
+        # 粗筛：只有**本轮真正返回**且合格的标的进入规则。
+        #
+        # IT-P0-003：这里以前遍历 ``self.state.quotes``（累计"最近已知值"缓存），
+        # 于是 provider 本轮少返回的代码会带着旧价、旧量冒充"本轮观测"进入规则。
+        # 后果不只是看板显示旧价：``SpiritOrderRule._drop_stale()`` 靠"本轮
+        # Snapshot 里不存在"来清理缓存，而缓存代码每轮都进 Snapshot，缺席永远
+        # 看不见；``_check_trades()`` 又先刷新 ``_prev[code]`` 的时间戳再判
+        # gap，于是 180 秒的真实缺口会被洗成 5 秒，长缺口安全阀失效。
+        # 现在规则只消费本轮 returned；state.quotes 退化为仅供看板/历史的缓存。
+        returned = {q.code: q for q in quotes if q.price > 0}
         eligible = {
-            c: q for c, q in self.state.quotes.items()
+            c: q for c, q in returned.items()
             if self.filters.accept(q, now.date()) and c not in self.ignore
         }
+        # watchlist 里的代码即使被粗筛拦掉也要跑规则（这是既有语义），
+        # 但同样必须是本轮真的返回了，否则就是在拿旧数据喂规则。
+        watch_cur = {c: returned[c] for c in self.watchlist if c in returned}
+
         keep = set(eligible)
         keep.update(self.watchlist)
         # 指数不进 eligible（被 exclude_boards 拦掉），但必须保住它们的历史，
@@ -784,8 +797,7 @@ class Engine:
         if len(self.state.history) > len(keep) * 2:
             self.state.prune(keep)
 
-        snap = Snapshot(ts=now, seq=self.state.seq,
-                        quotes={c: self.state.quotes[c] for c in self.watchlist if c in self.state.quotes})
+        snap = Snapshot(ts=now, seq=self.state.seq, quotes=dict(watch_cur))
         snap.quotes.update(eligible)
         # 指数**不进 snap.quotes**（它是"个股快照"），spirit_index 从
         # ctx.state.quotes 自取，见其模块文档。
