@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ..capabilities import ObservationDecision
 from ..models import Alert, AlertKind, Snapshot
 from ..session import CONTINUOUS
 from .base import RuleContext, bucket_of, fmt_pct
@@ -88,6 +89,30 @@ class VolumeBurstRule:
         return default
 
     # ------------------------------------------------------------------
+    def _mark_unavailable(self, ctx: RuleContext, code: str, field: str) -> None:
+        """记一次「能力缺失导致该项无法评估」。
+
+        只做记账，供 live_session / 看板显示"放量规则在 Sina 期间不可评估"，
+        而不是让用户以为"这段时间没放量"。没有挂 observation 时静默跳过。
+        """
+        obs = getattr(ctx, "observation", None)
+        if obs is None:
+            return
+        try:
+            codes = getattr(obs, "unavailable_codes", None)
+            if isinstance(codes, set):
+                codes.add(code)          # 按标的去重，不按字段次数
+            decisions = getattr(obs, "decisions", None)
+            if isinstance(decisions, list):
+                decisions.append(ObservationDecision(
+                    code=code, status="unavailable_capability",
+                    rule=self.name, reason=f"{field}_not_provided",
+                    missing=(field,),
+                ))
+        except Exception:  # noqa: BLE001  可观测性绝不能影响主流程
+            pass
+
+    # ------------------------------------------------------------------
     def evaluate(self, snap: Snapshot, ctx: RuleContext) -> list[Alert]:
         if not bool(self._get(ctx, "enabled", True)):
             return []
@@ -128,13 +153,30 @@ class VolumeBurstRule:
             pct = float(q.pct)
             if min_abs_pct > 0.0 and abs(pct) < min_abs_pct:
                 continue                                    # 纯放量不波动 -> 不报
+
+            # --- 换手率门槛 -------------------------------------------------
+            # IT-P1-CAPABILITY-001：Sina 解析器用 turnover=0.0 表示"本源不提供
+            # 该字段"。原来的 `q.turnover < min_turnover` 会把它当真实业务零值，
+            # 于是 Sina 服务期间**所有**股票都在这里被判不达标：SourceManager
+            # 认为调用成功、health 也正常，用户却只看到放量告警整类消失。
+            #
+            # 第一阶段只**记账**，不擅自改成"缺字段就跳过门槛"——那会改变误报率
+            # （见本轮审计报告 §3.4）。所以下面仍保留原门槛判定，行为与改动前
+            # 逐字一致；新增的只是把这种情况记成 unavailable_capability，使
+            # "Sina 期间放量规则不可评估"从静默变为可见。降级口径等真实数据。
+            if min_turnover > 0.0 and not ctx.provides("turnover"):
+                self._mark_unavailable(ctx, code, "turnover")
             if min_turnover > 0.0 and float(q.turnover) < min_turnover:
                 continue
             if min_amount > 0.0 and float(q.amount) < min_amount:
                 continue
 
             # --- 条件 1：量比（数据源缺失时跳过该项） --------------------
+            # 同样只加记账：源不提供量比时标记 unavailable，门槛判定保持原样
+            # （vr 为占位 0.0 时 `vr > 0.0` 本来就不成立，即既有的"缺失即跳过"）。
             vr = _num(q.volume_ratio, 0.0)
+            if vr_thr > 0.0 and not ctx.provides("volume_ratio"):
+                self._mark_unavailable(ctx, code, "volume_ratio")
             if vr_thr > 0.0 and vr > 0.0 and vr < vr_thr:
                 continue
 

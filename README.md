@@ -304,10 +304,12 @@ python -m arad.cli selftest          # 全链路自检（植入剧本，随时�
 | `bench_round.py` | 全市场规模真实耗时 + 线性度（`--offline` 只测纯 CPU 成本） |
 | `probe_live_ready.py` | 盘中可用性总检：股票池、单轮耗时、五档/内外盘可用率 |
 | `live_session.py` | 限时实盘 soak：抓取失败率、看板健康、SSE 断流、内存有界，给出结论 |
+| `run_daemon.py` | **常驻守护**：免配置启动看板 + 崩溃自拉 + 单实例锁；`--status` 查状态 |
 | `probe_memory_day.py` | 把**一整天**压进十几秒跑完，量内存是收敛还是泄漏（见 `docs/MEMORY_AUDIT.md`） |
 | `probe_history_bound.py` | 验引擎侧 `state.history` 单只受 maxlen 约束、键数靠 `prune` 收敛 |
 | `check_config_consumed.py` | 找"声明了但没人读"的配置键（改了不生效那种）；`check_orphan_config.py` 抓不到这类 |
 | `check_readme_tools.py` | 核对上面的工具清单与 `tools/` 实际内容是否一致（新增工具忘登记就报错） |
+| `check_bom.py` | 查文本文件是否带 UTF-8 BOM；**独立于 pytest**（BOM 会让 pytest 起不来，用它守） |
 | `probe_nan_safety.py` | 非有限值不会让 `/api/spirit` 或 SSE 流出非法 JSON |
 | `probe_sources.py` | 逐端点探数据源；东财被限流时**自动降级到新浪**继续探 |
 | `probe_spirit_fields.py` | 验腾讯源的盘口/内外盘字段真实可用（内外盘之和 ≈ 成交量） |

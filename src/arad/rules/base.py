@@ -38,6 +38,11 @@ class RuleContext:
     minutes_to_close: float = 0.0
     watchlist: tuple[str, ...] = ()
     focus: tuple[str, ...] = ()
+    # 本轮供数源的能力声明（IT-P1-CAPABILITY-001）。为 None 时表示"未知"，
+    # 规则必须按"字段不提供"保守处理，绝不能把占位 0.0 当真实业务零。
+    capabilities: object | None = None
+    # 本轮观测账本（requested/returned/…），供规则写可观测性用。
+    observation: object | None = None
 
     @property
     def now_epoch(self) -> float:
@@ -47,6 +52,20 @@ class RuleContext:
         """取配置项，缺省或 None 时用 default。"""
         v = self.cfg.get(key, default)
         return default if v is None else v
+
+    def provides(self, key: str) -> bool:
+        """本轮供数源是否**提供** ``key`` 这个字段。
+
+        没挂 capability（老调用方/单测）时返回 True —— 即保持改动前的
+        行为（把字段当真实值），避免影响不涉及多源切换的既有路径。
+        """
+        caps = self.capabilities
+        if caps is None:
+            return True
+        fn = getattr(caps, "supports", None)
+        if callable(fn):
+            return bool(fn(key))
+        return True
 
 
 @runtime_checkable

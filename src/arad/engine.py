@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Callable, Iterable
 
+from .capabilities import RoundObservationSet, capabilities_for
 from .config import PROJECT_ROOT, Settings, load_settings, load_watchlist
 from .filters import Filters
 from .models import Alert, Quote, Snapshot
@@ -34,6 +35,11 @@ RULE_MODULES = (
     "spirit_price", "spirit_order", "spirit_index",
 )
 NOTIFIER_MODULES = ("console", "file_jsonl", "webhook", "serverchan", "dingtalk", "feishu", "windows_toast")
+
+#: provider 事件时间超前多少秒算"不可信"（超过就整只丢弃，见 EngineState.update）。
+#: 取 120s：足以容纳正常的 NTP 抖动与交易所时间戳精度，又能挡住真正跑飞的
+#: 未来数据。IT-P0-002。
+FUTURE_TOLERANCE_SECONDS = 120.0
 
 
 # ==========================================================================
@@ -60,13 +66,23 @@ class EngineState:
 
     # ---- 窗口查询 -----------------------------------------------------
     def window(self, code: str, seconds: float, now_epoch: float) -> list[tuple[float, float, float]]:
-        """返回 ``[now-seconds, now]`` 内的 (ts, price, cum_volume_lots) 列表（时间升序）。"""
+        """返回 ``[now-seconds, now]`` 内的 (ts, price, cum_volume_lots) 列表（时间升序）。
+
+        IT-P0-002：这里以前只过滤 ``p[0] >= cutoff``，**没有上界**。文档说
+        是闭区间 ``[now-seconds, now]``，实现却允许 ``p[0] > now`` 的未来点
+        进入窗口，于是 provider 时间超前时 ``price_change`` 会算出"还没发生
+        的涨幅"。现在补上 ``<= now_epoch`` 上界，并把结果按时间排序 ——
+        deque 是按**插入序**追加的，迟到的乱序点会排在尾部，导致
+        ``pts[0]/pts[-1]`` 首尾倒挂、涨跌幅算反（见下面 update 的准入）。
+        """
         h = self.history.get(code)
         if not h:
             return []
         cutoff = now_epoch - float(seconds)
-        # deque 有序，从右往左找即可；样本量小，直接过滤更简单可靠
-        return [p for p in h if p[0] >= cutoff]
+        return sorted(
+            (p for p in h if cutoff <= p[0] <= now_epoch),
+            key=lambda p: p[0],
+        )
 
     def price_change(self, code: str, seconds: float, now_epoch: float) -> float | None:
         """窗口内涨跌幅（%），以窗口内首个价格为基准。数据不足返回 None。"""
@@ -105,12 +121,28 @@ class EngineState:
         曾经有个 ``eligible=`` 关键字参数，但函数体从未读过它 —— 调用方以为
         "只更新合格标的"会生效，实际全量写入。与其留一个静默失效的承诺，
         不如删掉：粗筛由 ``poll_once`` 在读取侧做（见 ``eligible`` 字典）。
+
+        IT-P0-002：provider 时间质量必须**写前准入**。旧代码先把 quote 写进
+        ``quotes/history``，之后遇到 ``q.ts > now`` 只执行 ``pass`` —— 那是空
+        操作，超前数据其实已经污染了状态（``price_change`` 会算出真实世界还
+        没发生的涨幅）。现在改为写前判断：
+
+        * ``q.ts > now + FUTURE_TOLERANCE``（远超时钟偏差）→ 整只丢弃；
+        * 迟到且比已记录的最后一点还旧的观测 → 不顺延追加，避免窗口首尾倒挂；
+        * 轻微超前（时钟抖动范围内）→ 把时间戳夹到 ``now``，保留数据。
         """
         ep = now.timestamp()
         self.seq += 1
         for q in quotes:
             if q.price <= 0:
                 continue
+
+            # --- 写前时间准入 -------------------------------------------
+            ts_ok, q_ep, why = self._admit_time(q, now, ep)
+            if not ts_ok:
+                self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
+                continue
+
             self.quotes[q.code] = q
             if q.code not in self.first_seen:
                 self.first_seen[q.code] = q
@@ -122,11 +154,32 @@ class EngineState:
             if h is None:
                 h = deque(maxlen=max(int(self.history_len), 30))
                 self.history[q.code] = h
-            if prev is None or prev != q.price or not h or h[-1][2] != q.volume_lots:
-                h.append((ep, q.price, q.volume_lots))
+            # 迟到观测：比窗口里最后一点还旧就不追加（否则乱序会污染首尾）
+            if h and q_ep < h[-1][0]:
+                self.stats["t_reject:out_of_order"] = \
+                    self.stats.get("t_reject:out_of_order", 0) + 1
+            elif prev is None or prev != q.price or not h or h[-1][2] != q.volume_lots:
+                h.append((q_ep, q.price, q.volume_lots))
             self.last_price[q.code] = q.price
-            if q.ts is not None and q.ts > now:
-                pass  # 行情时间戳超前（时钟偏差），忽略
+
+    def _admit_time(self, q: Quote, now: datetime,
+                    ep: float) -> tuple[bool, float, str]:
+        """写前时间准入。返回 ``(是否接纳, 用于入库的时间戳, 拒绝原因)``。
+
+        事件时间缺失时按"接收时间"处理（视作准时），这是兼容既有行为：
+        多数 source 不填 ``ts``。
+        """
+        if q.ts is None:
+            return True, ep, ""
+        try:
+            q_ep = float(q.ts.timestamp())
+        except (AttributeError, OSError, ValueError):
+            return True, ep, ""
+        if q_ep > ep + FUTURE_TOLERANCE_SECONDS:
+            return False, q_ep, "future"
+        if q_ep > ep:
+            return True, ep, ""          # 轻微超前 -> 夹到 now，保留数据
+        return True, q_ep, ""
 
     def prune(self, keep_codes: set[str] | None = None) -> int:
         """丢弃不再关注的股票历史，控制内存。返回清理条数。"""
@@ -802,6 +855,26 @@ class Engine:
         # 指数**不进 snap.quotes**（它是"个股快照"），spirit_index 从
         # ctx.state.quotes 自取，见其模块文档。
 
+        # 本轮是谁在供数？能力声明跟着走（IT-P1-CAPABILITY-001）。
+        # 用 serving_of 而不是 current：热备期间由备用源实际供数，
+        # current 仍是主源，用错就会把 Sina 的数据按 Tencent 的能力判定。
+        serving_idx = self.sources.serving_of(ROUTE_STOCKS)
+        if serving_idx is None:
+            serving_src = self.sources.current
+        else:
+            serving_src = self.sources.sources[serving_idx]
+        caps = capabilities_for(serving_src)
+        observation = RoundObservationSet(
+            source=str(getattr(serving_src, "name", "")),
+            capabilities=caps,
+            requested=len(self._codes),
+            returned=len(returned),
+            admitted=len(eligible),
+            unknown_missing=tuple(
+                c for c in self._codes if c not in returned
+            ),
+        )
+
         ctx = RuleContext(
             state=self.state,
             cfg={},
@@ -811,6 +884,8 @@ class Engine:
             minutes_to_close=self.calendar.minutes_to_close(now),
             watchlist=tuple(self.watchlist),
             focus=self.focus,
+            capabilities=caps,
+            observation=observation,
         )
 
         now_ep = now.timestamp()
