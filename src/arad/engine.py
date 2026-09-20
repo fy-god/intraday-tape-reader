@@ -41,6 +41,20 @@ NOTIFIER_MODULES = ("console", "file_jsonl", "webhook", "serverchan", "dingtalk"
 #: 未来数据。IT-P0-002。
 FUTURE_TOLERANCE_SECONDS = 120.0
 
+#: IT-P1-TIME-ROLE-003：首见码的**保守**陈旧下限（秒）。
+#:
+#: 修复前 ``_admit_time()`` 对任何早于 now 的 ts 都无条件接受，首见码甚至接受
+#: 数天前的时间戳 —— 跨源切换（新码首现）时可能把 3 天前的价格当新鲜行情。
+#:
+#: 取值必须**保守**：A 股冷门股可能几十分钟才成交一次，它的 ``ts`` 表示"最后
+#: 成交时间"，本身就是旧的。若下限设成几分钟，会把正常冷门股的报价全部误杀。
+#: 4 小时 = 一个交易日的上午+下午连续竞价时长，足以挡住"隔日/数日前"的陈旧
+#: 数据，又不会碰到当日的最后成交时间。
+#:
+#: 依赖 provider 时间角色的真实语义（见 ``source_time_contract.json``）—— 若
+#: 某源根本不是"事件时间"，应先在该合同里标 ``unknown``，而不是靠这个下限兜底。
+STALE_TOLERANCE_SECONDS = 4 * 3600.0
+
 
 # ==========================================================================
 # 状态
@@ -58,6 +72,32 @@ class EngineState:
     #: 采样），若借用它的尾部时间当水位线，平价新鲜观测就不推进水位线，
     #: 迟到的旧点会被误准入（IT-P0-002-R2）。
     accepted_watermark: dict[str, float] = field(default_factory=dict)
+    #: IT-P1-TIME-ROLE-001：当前**实际供数源**的 epoch 标签。
+    #:
+    #: 水位线按来源分段：供数源一变就开新 epoch，新 epoch 的水位线从该 epoch
+    #: 自己的数据重新起算，不被上一个 epoch 的硬水位线否决。
+    #:
+    #: 为什么必须有这个：``accepted_watermark`` 是 ``code -> timestamp``，
+    #: **不含来源**。A 源先接受 10:30:40；供数切到 B 源、B 首包 10:30:05 ——
+    #: 按事件时间它比水位线旧，于是被当"乱序"静默丢弃（实测
+    #: ``admitted=[]``、``t_reject:out_of_order=1``）。但 B 的时间轴是**另一个
+    #: epoch 的起点**，不是倒退。epoch **之内**的真实乱序仍然照拒。
+    #:
+    #: 注意 A→B→A 是**三个** epoch，不能复用最早 A 的水位线 —— 所以这里存标签
+    #: 而不是布尔，且同一来源连续上报是幂等的。
+    source_epoch: str = ""
+    #: IT-P1-TIME-ROLE-002：``code -> provider 原始 ts``（秒）。
+    #:
+    #: 轻微超前（时钟抖动内）的点会被夹到 ``now`` 入库 —— 那是既有且被测试
+    #: 固定的契约（``test_engine_time_admission.py`` 断言 ``h[-1][0] == EP``），
+    #: 保留它以免把未来点喂进窗口。但**原始值不能因此消失**：这里留痕，供
+    #: 诊断"该源的时间是否可信"与跨源对账用。
+    provider_ts_raw: dict[str, float] = field(default_factory=dict)
+    #: IT-P1-TIME-ROLE-002：``code -> 实际用于入库的生效时间``（秒）。
+    effective_event_time: dict[str, float] = field(default_factory=dict)
+    #: IT-P1-TIME-ROLE-002：``code -> 本地接收时刻``（秒）。
+    #: 与 ``effective_event_time`` 分开，跨源比较才有依据。
+    received_at: dict[str, float] = field(default_factory=dict)
     day_open: dict[str, float] = field(default_factory=dict)
     last_alert: dict[str, float] = field(default_factory=dict)
     #: cooldown_key -> 上次放行时刻。用于"同类告警至少间隔 N 秒"的时间距离判断，
@@ -158,14 +198,28 @@ class EngineState:
                 continue
 
             # --- 写前时间准入 -------------------------------------------
-            ts_ok, q_ep, why = self._admit_time(q, now, ep)
+            # first_seen 在**准入之前**取：陈旧下限只对首见码生效。
+            ts_ok, q_ep, why = self._admit_time(
+                q, now, ep, first_seen=q.code not in self.first_seen)
             if not ts_ok:
                 self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
                 continue
 
+            # IT-P1-TIME-ROLE-002：留痕 provider 原始 ts，并区分"生效时间"与
+            # "接收时间"。入库仍用夹过的 q_ep（既有契约），但原始值不丢。
+            if q.ts is not None:
+                try:
+                    self.provider_ts_raw[q.code] = float(q.ts.timestamp())
+                except (AttributeError, OSError, ValueError):
+                    pass
+            self.effective_event_time[q.code] = q_ep
+            self.received_at[q.code] = ep
+
             # --- 乱序准入：用显式水位线，必须在任何写入之前判定 ----------
             # 水位线在每次准入成功时无条件推进（见函数末尾），因此"平价新鲜
             # 观测"也会推高它，迟到的旧点就再也钻不过去（IT-P0-002-R2）。
+            # IT-P1-TIME-ROLE-001：水位线**按 source epoch 分段**，跨 epoch 的
+            # 旧时间戳不算"倒退"（见 begin_source_epoch）。
             wm = self.accepted_watermark.get(q.code)
             if wm is not None and q_ep < wm:
                 self.stats["t_reject:out_of_order"] = \
@@ -191,12 +245,17 @@ class EngineState:
             admitted[q.code] = q
         return admitted
 
-    def _admit_time(self, q: Quote, now: datetime,
-                    ep: float) -> tuple[bool, float, str]:
+    def _admit_time(self, q: Quote, now: datetime, ep: float,
+                    *, first_seen: bool = False) -> tuple[bool, float, str]:
         """写前时间准入。返回 ``(是否接纳, 用于入库的时间戳, 拒绝原因)``。
 
         事件时间缺失时按"接收时间"处理（视作准时），这是兼容既有行为：
         多数 source 不填 ``ts``。
+
+        ``first_seen`` 为真时才施加**陈旧下限**（IT-P1-TIME-ROLE-003）：首见码
+        如果带着数天前的 ``ts``，说明这个源的时间轴与本地时钟不同源（或数据
+        本身陈旧），此时把它当新鲜行情接纳是错的。**已有水位线的码不走这条**：
+        它的陈旧由 epoch 内乱序判定负责，重复加下限只会互相干扰。
         """
         if q.ts is None:
             return True, ep, ""
@@ -206,9 +265,31 @@ class EngineState:
             return True, ep, ""
         if q_ep > ep + FUTURE_TOLERANCE_SECONDS:
             return False, q_ep, "future"
+        if first_seen and q_ep < ep - STALE_TOLERANCE_SECONDS:
+            return False, q_ep, "stale"
         if q_ep > ep:
             return True, ep, ""          # 轻微超前 -> 夹到 now，保留数据
         return True, q_ep, ""
+
+    def begin_source_epoch(self, source: str) -> bool:
+        """IT-P1-TIME-ROLE-001：供数源变化时开一个新 epoch。
+
+        返回是否真的开了新 epoch。同一来源重复上报是**幂等**的（返回 False）——
+        否则每次轮询都把水位线清掉，epoch 内的真实乱序就再也拒不住了。
+
+        由调用方传入**实际 serving source**（``SourceManager.serving_of(route)``），
+        而不是 ``SourceManager.current``：热备期间由备用源实际供数，
+        ``current`` 还是主源，按它分 epoch 会把两段混成一段。
+        """
+        tag = str(source or "")
+        if tag == self.source_epoch:
+            return False
+        self.source_epoch = tag
+        # 新 epoch：水位线必须从该 epoch 自己的数据重新起算。
+        # 这里**清空**所有码的水位线，而不是逐码比较 —— 逐码比较无法处理
+        # "该码在新 epoch 还没出现过"的情况，而那正是跨源首包的场景。
+        self.accepted_watermark.clear()
+        return True
 
     def prune(self, keep_codes: set[str] | None = None) -> int:
         """丢弃不再关注的股票历史，控制内存。返回清理条数。"""
@@ -222,6 +303,11 @@ class EngineState:
             # 会让重新关注的代码被旧水位线误判为"迟到"。
             self.accepted_watermark.pop(c, None)
             self.first_seen.pop(c, None)
+            # IT-P1-TIME-ROLE-002 的留痕表必须与 history 一起回收，
+            # 否则长时间运行会随着关注池轮换而无界增长。
+            self.provider_ts_raw.pop(c, None)
+            self.effective_event_time.pop(c, None)
+            self.received_at.pop(c, None)
         # 冷却表按时间过期
         cutoff = time.time() - 3600
         stale = [k for k, v in self.last_alert.items() if v < cutoff]
@@ -862,6 +948,22 @@ class Engine:
             return []
 
         # 指数与个股共用同一准入合同（IT-P0-002-R1：股票和指数不得两套口径）。
+        #
+        # IT-P1-TIME-ROLE-001：准入前先按**实际供数源**开 epoch。
+        # 用 serving_of 而不是 current —— 热备期间由备用源实际供数，current
+        # 还是主源，按它分段会把两个 epoch 混成一段，跨源首包照样被误杀。
+        #
+        # epoch 标签用「下标 + 名字」而不是只用名字：若配置里两个源重名
+        # （例如都叫 sina），只用名字会让切换前后标签相同，begin_source_epoch
+        # 判为幂等而不重置水位线 —— 跨源误杀就原样回来了。
+        _serving_idx = self.sources.serving_of(ROUTE_STOCKS)
+        if _serving_idx is not None:
+            try:
+                _serving_name = self.sources.sources[_serving_idx].name
+            except (IndexError, AttributeError):
+                _serving_name = "?"
+            self.state.begin_source_epoch(f"{_serving_name}#{_serving_idx}")
+
         # 先记准入计数基线，用来算"本轮"拒绝数（stats 是累计值）。
         _t0_future = int(self.state.stats.get("t_reject:future", 0))
         _t0_ooo = int(self.state.stats.get("t_reject:out_of_order", 0))

@@ -119,7 +119,7 @@ flowchart TD
 | `cli.py` | 命令行入口 | `main` / `build_parser` / `cmd_check` / `cmd_once` / `cmd_serve` / `cmd_replay` / `cmd_selftest` / `_setup_stdout` |
 | `rules/base.py` | 规则协议与共享上下文 | `Rule` / `RuleContext`（`now_epoch` / `opt`）/ `clamp` / `bucket_of` / `fmt_pct` |
 | `rules/tick_surge.py` | 急拉 / 急跌 | `TickSurgeRule` / `DEFAULT_CFG` / `_scan` / `_make_alert` / `_covered` |
-| `rules/limit_board.py` | 触板 / 封板 / 炸板状态机 | `LimitBoardRule` / `DEFAULT_CFG` / `_check_side` / `_make_seal` / `_make_touch` / `_check_break` / `_seal_amount_wan` |
+| `rules/limit_board.py` | 触板 / 封板 / 炸板状态机 | `LimitBoardRule` / `DEFAULT_CFG` / `_check_side` / `_seal_qualified` / `_make_seal` / `_make_touch` / `_check_break` / `_seal_amount_wan` |
 | `rules/volume_burst.py` | 放量异动 | `VolumeBurstRule` / `DEFAULTS` / `evaluate` |
 | `rules/unusual.py` | 形态类异动 | `UnusualRule` / `PATTERNS` / `PATTERN_CN` / `_edge` / `_check_reseal` / `_mk` |
 | `rules/spirit_price.py` | 火箭发射 / 快速反弹 / 高台跳水 / 加速下跌 | `SpiritPriceRule` / `SIGNALS` / `DEFAULTS` / `_sig_rocket` / `_sig_rebound` / `_sig_dive` / `_sig_accel_down` |
@@ -209,14 +209,30 @@ if cd > 0.0 and ck:
 `limit_board` 是状态型的参考实现，状态机每只股票每个方向独立，按自然日清空：
 
 ```text
-away ──触限价──► sealed ──跌离──► broken ──回落到位──► broken（已报，不重播）
-  ▲                 │                │
-  └─────回落──── near ◄──────────────┘
+away ──触限价──► at_limit_unqualified ──封单达标──► sealed ──跌离──► broken
+                        ▲                                │
+                        └────────封单回落至门槛下───────────┘
+                                     │
+                                     └──► near ◄──（回落到位）
 ```
 
-细节：`prev == "sealed"` 且仍在限价上 → `return None`（状态没变）；重新封回会把状态置回 `sealed`，
-所以"快速回封后再炸板"能再报一次。跌停侧只识别"封跌停"——**撬板（跌停被打开）不属于本规则口径**，
-直接放过，但状态必须复位为 `away`，否则"封跌停 → 撬开 → 再封跌停"就不会再报（状态机卡住）。
+细节（IT-P1-LIMIT-001 修正后）：
+
+- **贴板 ≠ 已封板。** 触到限价但封单量未达 `min_seal_amount_wan` 时，状态记为
+  `at_limit_unqualified`，**不写** `sealed`。修复前这里是**无条件**先写 `sealed`
+  再判门槛，于是"首次达标"那一轮命中 `prev == "sealed"` 而被 `return None` 吞掉 ——
+  实测封单 100 万 → 300 万（门槛 200 万）两轮都是 `[None, None]`，应为 `[None, Alert]`。
+- 资格判定统一走 `_seal_qualified()`，它是 `min_seal_amount_wan` 门槛的**唯一来源**
+  （`_make_seal` 内部也调它），避免两处判据漂移。
+- `prev == "sealed"` 且**仍达标** → `return None`（持续封板不重播）；重新封回会把状态
+  置回 `sealed`，所以"快速回封后再炸板"能再报一次。
+- 封单从达标**回落**到门槛之下 → 退回 `at_limit_unqualified`，于是"300 万 → 100 万 →
+  300 万"允许**重新告警**（用户视角：封单被抽走又补回来是第二次真实封板）。
+  ⚠ 这是**有意的产品口径选择**，不是实现细节：若业务要求"同一自然日每只票只报一次
+  有效封板"，需要改这一处判据。审计文档 2026-09-19 报告 §4 要求把该口径写进合同 ——
+  本节即该口径的落点。钉在 `test_seal_refires_after_amount_falls_back_below_threshold`。
+- 跌停侧只识别"封跌停"——**撬板（跌停被打开）不属于本规则口径**，直接放过，但状态必须
+  复位为 `away`，否则"封跌停 → 撬开 → 再封跌停"就不会再报（状态机卡住）。
 
 `unusual._edge` / `spirit_order._edge` 是同一套思路的轻量版：`on` 是进入形态的条件，`off` 是
 "已明确恢复"的条件，两者之间留迟滞，避免数值在阈值附近抖动导致反复上报；`off` 恒为 `False`

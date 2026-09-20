@@ -1210,3 +1210,241 @@ def test_performance_1000_stocks():
     elapsed = time.perf_counter() - t0
     assert len(alerts) == 800
     assert elapsed < 0.2, f"evaluate 太慢: {elapsed * 1000:.1f}ms"
+
+
+# ==========================================================================
+# IT-P1-LIMIT-001：封单资格状态与价格状态必须分开
+#
+# 缺陷：``_check_side`` 在 ``at_limit`` 分支**无条件先写** ``_state = "sealed"``，
+# 而封单门槛（``min_seal_amount_wan``）是在 ``_make_seal`` 里才检查的。
+# 于是"价格贴板、封单只有 100 万（门槛 200 万）"的那一轮也留下了 "已封板"
+# 记忆，下一轮封单涨到 300 万时命中 ``prev == "sealed"`` 直接 ``return None``
+# —— **首次达标被永久吞掉，永远不发告警**（实测两轮均为 [None, None]，
+# 应为 [None, Alert]）。
+#
+# 修复把状态拆成 ``at_limit_unqualified``（价格到板但封单不足）与
+# ``sealed``（封单已达标），门槛判据收敛到 ``_seal_qualified`` 单一来源。
+# 对外契约（kind / severity / key / metrics 键名）一律未变。
+#
+# 标记说明（三类，已按**实测**的回退验牙结果如实标注，不臆断）：
+#   * 【验牙】修复前必红，且红在**告警丢失**这个核心行为上；
+#   * 【回归保护】修复前后都绿，用于挡住未来的语义回退；
+#   * 【结构性】修复前红，但红在状态名 / 新 helper 上（旧代码没有这些符号），
+#     不是"告警被吞"的直接证据 —— 不冒充验牙用例。
+# ==========================================================================
+def vol_for_seal_wan(wan: float, price: float) -> float:
+    """反解封单额（万元）-> 买一/卖一手数。
+
+    ``seal_wan = vol * 100 * price / 1e4``，故 ``vol = wan * 1e4 / (100 * price)``。
+    乘 1.000001 是为了避开浮点落在门槛**下方**一丝点的假失败
+    （例如 909.0909... 手 × 100 × 11 / 1e4 = 99.99999... 万 < 100 万）。
+    """
+    return wan * 1e4 / (100.0 * price) * 1.000001
+
+
+def test_seal_first_qualified_after_amount_crosses_threshold():
+    """封单 100 万 -> 300 万（门槛 200 万）：第二轮首次达标**必须**发告警。
+
+    IT-P1-LIMIT-001 的核心验收。价格全程贴在涨停价上，只有封单量在变 ——
+    这正是一个状态机用例，必须用**同一个 Rule 实例**跨轮求值（每轮新建实例
+    会把状态清零，永远测不出这个缺陷，既有用例就是因此漏掉的）。
+
+    验牙：修复前 ``[None, None]``，本用例必红。
+    """
+    st = FakeState()
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))    # 100 万 < 200 万
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))      # 300 万 >= 200 万
+    rule = build({"min_seal_amount_wan": 200})
+
+    # 前提：两轮价格都在涨停价上，只有封单额不同
+    assert weak.price == ok.price == pytest.approx(11.0)
+    assert rule._seal_amount_wan(weak, True) == pytest.approx(100.0, abs=0.1)
+    assert rule._seal_amount_wan(ok, True) == pytest.approx(300.0, abs=0.1)
+
+    first = rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0))
+    assert first == [], "封单未达门槛时不该报封板"
+
+    second = rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60))
+    assert len(second) == 1, (
+        "封单首次跨过门槛必须发告警；被吞掉说明写 sealed 的时机仍在门槛检查之前")
+    a = second[0]
+    # 对外契约不得变化
+    assert a.kind is AlertKind.LIMIT_UP
+    assert a.severity == 3
+    assert a.metrics["stage"] == 2.0
+    assert a.metrics["pattern"] == "limit_up_seal"
+    assert set(a.metrics) == SEAL_METRIC_KEYS
+    assert a.metrics["seal_amount_wan"] == pytest.approx(300.0, abs=0.1)
+    assert a.code == "600000"
+    assert a.title.startswith("封涨停")
+    assert a.key == f"600000:limit_up:seal:{bucket_of(T0 + 60, 300)}"
+
+    # 状态此时才真正是 sealed（第一轮只是 at_limit_unqualified）
+    assert rule._state["600000:up"] == "sealed"
+
+
+def test_seal_first_qualified_limit_down_mirror():
+    """跌停侧镜像：卖一封单 100 万 -> 300 万，首次达标必须发封跌停。
+
+    验牙：修复前 ``[None, None]``，本用例必红。
+    """
+    st = FakeState()
+    weak = limit_down_quote(code="000001", name="平安银行",
+                            ask_vol=vol_for_seal_wan(100.0, 9.0))
+    ok = limit_down_quote(code="000001", name="平安银行",
+                          ask_vol=vol_for_seal_wan(300.0, 9.0))
+    rule = build({"min_seal_amount_wan": 200})
+
+    assert rule._seal_amount_wan(weak, False) == pytest.approx(100.0, abs=0.1)
+    assert rule._seal_amount_wan(ok, False) == pytest.approx(300.0, abs=0.1)
+
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0)) == []
+    second = rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60))
+    assert len(second) == 1, "跌停侧封单首次达标也必须发告警（涨跌停镜像）"
+    a = second[0]
+    assert a.kind is AlertKind.LIMIT_DOWN
+    assert a.severity == 3
+    assert a.metrics["stage"] == 2.0
+    assert a.metrics["pattern"] == "limit_down_seal"
+    assert a.metrics["rising"] == 0.0
+    assert a.title.startswith("封跌停")
+
+
+def test_seal_cross_then_continuous_rounds_do_not_repeat():
+    """跨过门槛那一轮报一次，之后持续达标不重复（幂等去重语义必须保留）。
+
+    验牙：修复前 ``[None, None, None, None]``，本用例必红（第 2 轮就该有告警）。
+    """
+    st = FakeState()
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200, "cooldown_seconds": 300})
+
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0)) == []
+    assert len(rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60))) == 1
+    for dt in (0, 5, 60, 299, 300, 301, 3600, 7200):
+        assert rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60 + dt)) == [], \
+            f"+{dt}s 重报封板：去重语义被破坏"
+    assert rule._state["600000:up"] == "sealed"
+
+
+def test_seal_starts_qualified_is_reported_once():
+    """第一轮封单就已达标 -> 立即报，之后连续轮次不重报。
+
+    回归保护：修复前后都绿。它钉住的是"幂等去重"这一半语义，
+    防止修 IT-P1-LIMIT-001 时把去重一起删掉（每次求值都重报）。
+    """
+    st = FakeState()
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200})
+    assert len(rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0))) == 1
+    for dt in (5, 60, 299, 300, 301, 1800):
+        assert rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + dt)) == [], f"+{dt}s"
+
+
+def test_seal_refires_after_amount_falls_back_below_threshold():
+    """封单回落到门槛之下、再达标 -> 重新发告警（状态必须能复位）。
+
+    这是 IT-P1-LIMIT-001 修复引入的关键语义：``sealed`` 必须能退回
+    ``at_limit_unqualified``，否则"封单被抽走又补回来"这第二次有效封板
+    会像首次达标一样被吞掉。价格全程不动，只有封单量变化。
+
+    验牙：修复前 ``[None, None, None, None, None]``（全程被吞），本用例必红。
+    """
+    st = FakeState()
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200, "cooldown_seconds": 300})
+
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0)) == []
+    assert len(rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60))) == 1
+
+    # 封单被抽走（100 万 < 200 万）：不告警，但状态必须离开 sealed
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0 + 120)) == []
+    assert rule._state["600000:up"] == "at_limit_unqualified", \
+        "封单跌破门槛后状态必须复位，否则再次达标永远不会被报出来"
+
+    # 封单补回 -> 新事件，必须再报
+    again = rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 400))
+    assert len(again) == 1, "封单回落门槛之下后再达标必须重新发告警"
+    assert again[0].metrics["stage"] == 2.0
+    assert again[0].key != f"600000:limit_up:seal:{bucket_of(T0 + 60, 300)}"
+
+
+def test_seal_refires_after_price_leaves_and_returns_qualified():
+    """价格离开限价区后再回来且封单达标 -> 再报（原有"回封可重报"语义不变）。
+
+    回归保护：修复前**也绿**。因为离开限价那一轮会把状态复位成 ``away``，
+    "回封可重报"这条既有语义本来就没坏 —— 本用例的价值是挡住修复时的回退。
+    """
+    st = FakeState()                       # 无历史，且 high < 涨停价 -> 状态复位为 away
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))
+    away = limit_up_quote(price=10.5, bid_vol=0.0, high=10.6, low=10.2)
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200})
+
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0)) == []
+    # 离开限价：既没触板也没炸板（历史与快照 high 都没碰过涨停价）-> 静默复位
+    assert rule.evaluate(snap_of(away), mk_ctx(st, now_ep=T0 + 60)) == []
+    assert rule._state["600000:up"] == "away"
+
+    again = rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 120))
+    assert len(again) == 1, "重新封回且封单达标必须再报一次"
+    assert again[0].metrics["stage"] == 2.0
+
+
+def test_seal_never_reports_while_amount_stays_unqualified():
+    """封单始终不达标 -> 一直不发告警（回归保护 + 结构性）。
+
+    告警侧断言修复前后都绿（防止把门槛判断挪位置时顺手放宽成"贴板即封板"）；
+    末尾的状态断言在修复前红，但红在**状态名**（旧代码写的是 ``sealed``），
+    不是"告警被吞"的直接证据，所以只算结构性。
+    """
+    st = FakeState()
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200})
+    for dt in (0, 60, 120, 600, 3600):
+        assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0 + dt)) == [], f"+{dt}s"
+    assert rule._state["600000:up"] == "at_limit_unqualified"
+
+
+def test_seal_threshold_boundary_through_state_machine():
+    """门槛边界（等于门槛放行、差一点拒绝）在跨轮状态机里同样成立。
+
+    结构性：修复前红，但红在旧代码**没有** ``_seal_qualified`` 这个符号
+    （AttributeError），不是"告警被吞"的证据，故不冒充验牙用例。
+    它钉住的是门槛判据单一来源 —— ``_seal_qualified`` 与 ``_make_seal``
+    两处若有 ``<=`` / ``<`` 漂移，这条会立刻红。
+    """
+    st = FakeState()
+    rule = build({"min_seal_amount_wan": 200})
+    just_below = limit_up_quote(bid_vol=vol_for_seal_wan(199.9, 11.0))
+    exactly = limit_up_quote(bid_vol=vol_for_seal_wan(200.0, 11.0))
+
+    assert rule._seal_qualified(just_below, True) is False
+    assert rule._seal_qualified(exactly, True) is True
+    assert rule.evaluate(snap_of(just_below), mk_ctx(st, now_ep=T0)) == []
+    assert len(rule.evaluate(snap_of(exactly), mk_ctx(st, now_ep=T0 + 60))) == 1
+
+    # min_seal_amount_wan=0 = 不设门槛 -> 任何贴板行情都算达标
+    loose = build({"min_seal_amount_wan": 0})
+    assert loose._seal_qualified(limit_up_quote(bid_vol=1.0), True) is True
+
+
+def test_detect_seal_off_records_qualified_state_without_alerting():
+    """detect_seal=False 只是不告警，"已达标封板"的状态仍要正确记账。
+
+    回归保护 + 结构性：告警侧断言（两轮都静默）修复前后都绿；末尾状态断言
+    修复前红在状态名，不是告警行为。若把资格判断和告警开关缠在一起
+    （例如"不告警就干脆不写状态"），状态机会在每轮重复求值，
+    一旦开关被打开就会暴出一串重复封板。
+    """
+    st = FakeState()
+    weak = limit_up_quote(bid_vol=vol_for_seal_wan(100.0, 11.0))
+    ok = limit_up_quote(bid_vol=vol_for_seal_wan(300.0, 11.0))
+    rule = build({"min_seal_amount_wan": 200, "detect_seal": False})
+
+    assert rule.evaluate(snap_of(weak), mk_ctx(st, now_ep=T0)) == []
+    assert rule._state["600000:up"] == "at_limit_unqualified"
+    assert rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60)) == []
+    assert rule._state["600000:up"] == "sealed", "达标与否必须照实记账，与告警开关无关"

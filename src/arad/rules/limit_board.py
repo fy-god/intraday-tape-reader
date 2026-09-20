@@ -69,8 +69,11 @@ class LimitBoardRule:
         self.break_retreat = float(merged.get("break_retreat_pct", 0.3) or 0.3)
         self.break_bucket = float(merged.get("break_bucket_seconds", 60) or 60)
         self.max_per_round = int(merged.get("max_per_round", 20) or 0)
-        # 状态机记忆：key = f"{code}:{'up'|'down'}" -> away | near | broken | sealed。
+        # 状态机记忆：key = f"{code}:{'up'|'down'}"
+        #   -> away | at_limit_unqualified | sealed | broken | near。
         # 只在**状态跃迁**时告警：封板/触板/炸板都是事件，不是可以每轮重播的状态。
+        # 注意 ``at_limit_unqualified``（价格贴限价但封单不足）必须与 ``sealed``
+        # 分开：两者都"在限价上"，但只有后者才是"已封板"。
         self._state: dict[str, str] = {}
         self._state_day: str = ""
 
@@ -139,9 +142,16 @@ class LimitBoardRule:
 
         状态机（每只股票每个方向独立）::
 
-            away ──触限价──► sealed ──跌离──► broken ──回落到位──► broken(已报)
-              ▲                 │                │
-              └─────回落──── near ◄────────────┘
+            away ──触限价──► at_limit_unqualified ──封单达标──► sealed ──跌离──► broken
+              ▲                      │                          │              │
+              │                      └──────回落──────┐         │              │
+              └──────────回落─────────── near ◄────────┴─────────┘──────────────┘
+
+        「在限价上」与「封单达标」是两件事：``at_limit_unqualified`` 表示价格已经
+        贴在限价上，但封单额还没到 ``min_seal_amount_wan`` 门槛 —— 此时**不能**
+        记成 ``sealed``。否则封单首次跨过门槛那一轮会因为 ``prev == "sealed"``
+        直接 ``return None``，首次达标被永久吞掉（IT-P1-LIMIT-001）。
+        封单回落跌破门槛会退回 ``at_limit_unqualified``，再次达标即可重新告警。
         """
         limit = up if rising else down
         if limit <= 0:
@@ -153,10 +163,28 @@ class LimitBoardRule:
         prev = self._state.get(tag, "away")
 
         if at_limit:
-            # 重新封回 -> 状态置为 sealed，并重新武装（快速回封后再炸板要能再报）
+            # ⚠ 顺序至关重要：**先**判封单是否达标，**再**决定写哪个状态。
+            #
+            # 过去这里无条件写 ``self._state[tag] = "sealed"``，而封单门槛是在
+            # ``_make_seal`` 里才检查的。于是"价格贴板但封单只有 100 万（门槛
+            # 200 万）"的那一轮也留下了 ``sealed`` 记忆，下一轮封单涨到 300 万
+            # 时命中 ``prev == "sealed"`` 直接 ``return None`` ——
+            # **首次达标被永久吞掉，永远不发告警**（IT-P1-LIMIT-001，实测两轮
+            # 均为 ``[None, None]``，应为 ``[None, Alert]``）。
+            #
+            # 现在两种情形分开记：封单不足记 ``at_limit_unqualified``（不是
+            # "已封板"），达标才记 ``sealed``。这样既保住了"连续封板只报一次"
+            # 的幂等语义，又让"首次跨过门槛"成为一次真正的状态跃迁。
+            qualified = self._seal_qualified(q, rising)
+            if prev == "sealed" and qualified:
+                return None                      # 一直在有效封板：状态未变，不重复报
+            if not qualified:
+                # 价格在限价上但封单不足：既不是 sealed 也不重复报触板，
+                # 但状态必须从 sealed/broken/near 退回，封单补上来时才有跃迁可报。
+                # 注意这**不是**"已封板"，所以不能写 sealed —— 那正是本缺陷的根因。
+                self._state[tag] = "at_limit_unqualified"
+                return None
             self._state[tag] = "sealed"
-            if prev == "sealed":
-                return None                      # 一直在封板：状态未变，不重复报
             return (self._make_seal(q, ctx, now, now_ep, limit, kind, rising)
                     if self.cfg.get("detect_seal", True) else None)
 
@@ -211,6 +239,21 @@ class LimitBoardRule:
             vol = q.ask_vol if q.ask_vol > 0 else 0.0
         return vol * 100.0 * q.price / 10000.0
 
+    def _seal_qualified(self, q: Quote, rising: bool, seal_wan: float | None = None) -> bool:
+        """封单额是否达到 ``min_seal_amount_wan`` 门槛（0 表示不设门槛）。
+
+        抽成独立方法是因为 ``_check_side`` 必须在**写状态之前**知道封单是否达标，
+        而 ``_make_seal`` 内部也判同一个门槛。两处各写一遍极易判据漂移
+        （例如一边用 ``<=`` 一边用 ``<``），所以门槛只有一个来源。
+
+        判据与 ``_make_seal`` 完全一致：**小于**门槛才算不达标，等于门槛放行。
+        ``seal_wan`` 可传入已算好的封单额，避免重复计算。
+        """
+        if self.min_seal_wan <= 0:
+            return True
+        amount = self._seal_amount_wan(q, rising) if seal_wan is None else seal_wan
+        return amount >= self.min_seal_wan
+
     def _is_one_word(self, q: Quote, limit: float, rising: bool) -> bool:
         """一字板：开盘即限价，且全天没有价格波动（high == low）。
 
@@ -240,7 +283,9 @@ class LimitBoardRule:
     def _make_seal(self, q: Quote, ctx: RuleContext, now: datetime, now_ep: float,
                    limit: float, kind: AlertKind, rising: bool) -> Alert | None:
         seal_wan = self._seal_amount_wan(q, rising)
-        if self.min_seal_wan > 0 and seal_wan < self.min_seal_wan:
+        # 门槛的唯一来源是 ``_seal_qualified``。这里保留同一道校验作为兜底：
+        # ``_make_seal`` 也可能被直接调用，绝不能凭封单不足的行情造出封板事件。
+        if not self._seal_qualified(q, rising, seal_wan):
             return None
 
         noun = "封涨停" if rising else "封跌停"

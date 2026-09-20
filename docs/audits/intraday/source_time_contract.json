@@ -1,0 +1,67 @@
+{
+  "_doc": "IT-P1-TIME-ROLE-001：provider 时间字段的语义合同。每条都必须有可核查的仓内证据；证据不足以判定语义时写 unknown，禁止猜测。",
+  "_generated_at_jst": "2026-09-20T17:00:43+09:00",
+  "_reviewed_source_sha": "f6a064bc787b1bea5e8edfa521b9575a8047d47c",
+  "_schema": {
+    "provider_field": "解析进 Quote.ts 的原始字段名/下标",
+    "role": "该字段的语义角色：event_time | publish_time | last_trade_time | update_time | unknown",
+    "evidence": "该判定的仓内证据（文件:行号）。没有权威证据时必须写 unknown。",
+    "strict_ordering_allowed": "是否允许用该 ts 在同一 source epoch 内拒绝乱序包",
+    "freshness_allowed": "是否允许用该 ts 判断数据新鲜度（陈旧拒绝）",
+    "notes": "已知局限"
+  },
+  "sources": {
+    "tencent": {
+      "provider_field": "fields[30] (FIELD_INDEX['timestamp'])",
+      "role": "unknown",
+      "evidence": [
+        "src/arad/sources/tencent.py:133 I_TIMESTAMP = FIELD_INDEX['timestamp'] -> 30",
+        "src/arad/sources/tencent.py:397 ts=_parse_ts(fields[I_TIMESTAMP])",
+        "src/arad/capabilities.py:93 provider_time=False"
+      ],
+      "strict_ordering_allowed": true,
+      "freshness_allowed": false,
+      "notes": "字段名在仓内只叫 'timestamp'，没有权威字段规范证明它是 snapshot publish time、last trade time 还是 data update time。社区资料常称字段 30 为『数据更新时间』，但该说法在仓内无可核查来源，故 role=unknown。strict_ordering_allowed=true 仅限**同一 source epoch 内**：同一来源的单调序号是可比的前提；跨 epoch 比较无依据。freshness_allowed=false 是因为无法从该字段判定『这条数据有多旧』。"
+    },
+    "sina": {
+      "provider_field": "fields[30] + fields[31]（日期 + 时间，拼成 naive datetime）",
+      "role": "unknown",
+      "evidence": [
+        "src/arad/sources/sina.py:_ts_of 读 fields[30]/fields[31] 并用 '%Y-%m-%d %H:%M:%S' 解析",
+        "src/arad/sources/sina.py:232 ts=_ts_of(fields)",
+        "src/arad/capabilities.py:98 provider_time=False"
+      ],
+      "strict_ordering_allowed": true,
+      "freshness_allowed": false,
+      "notes": "字段 30/31 明确是『日期/时间』，但仓内没有任何权威资料说明它是成交时间、快照发布时间还是更新时间。另有已知限制：解析粒度到秒且格式为 naive 本地时间，无时区信息。同样只允许 epoch 内排序。"
+    },
+    "eastmoney": {
+      "provider_field": "f124",
+      "role": "unknown",
+      "evidence": [
+        "src/arad/sources/eastmoney.py:55 CLIST_FIELDS 含 f124",
+        "src/arad/sources/eastmoney.py:142 注释『f124 = 行情时间戳（秒）』",
+        "src/arad/sources/eastmoney.py:227 ts=_ts_of(row.get('f124'))",
+        "src/arad/capabilities.py:103 provider_time=False"
+      ],
+      "strict_ordering_allowed": true,
+      "freshness_allowed": false,
+      "notes": "仓内注释只说『行情时间戳』，未区分 event time / publish time。注释本身不是权威字段规范，故 role=unknown。"
+    }
+  },
+  "consequences": {
+    "cross_source_comparison": "禁止。三家 role 均为 unknown，跨源比较 ts 无依据；实测同一代码跨源 ts 相差 2328s / 2400s（见 13:39 报告）。",
+    "cross_source_watermark_sharing": "禁止。这正是 IT-P1-TIME-ROLE-001：水位线必须按实际 serving source 分段（source epoch）。",
+    "within_epoch_ordering": "允许。同一来源同一 epoch 内的单调 ts 可比 —— 但若将来某源被证实 role 不是事件时间，该许可必须重新评估。",
+    "freshness_judgement": "禁止基于 provider ts 判定新鲜度。STALE_TOLERANCE_SECONDS 只在**首见码**上作为保守兜底（4 小时），它不是基于 provider 语义的判定，而是防止『数天前的陈旧数据被当新鲜行情』的最后一道闸。",
+    "provider_ts_raw": "必须留存。轻微超前会被夹到 now 入库（既有契约），原始值经 EngineState.provider_ts_raw 保留，否则跨源对账无据。"
+  },
+  "verification": {
+    "file": "tests/test_source_time_contract.py",
+    "checks": [
+      "合同文件的 provider_field 必须与各 parser 的真实取值位置一致（防止合同与代码漂移）",
+      "三家 role 必须显式给出，且 evidence 非空",
+      "role=unknown 时 strict_ordering_allowed 不得被解读为允许跨源比较"
+    ]
+  }
+}
