@@ -33,6 +33,40 @@
 **只用绝对量阈值**，不整体跳过 —— 否则自选股降级模式（数据源不给流通市值）
 下这 8 个信号会全部失效。
 
+**能力声明 / 逐 signal 可评估性（IT-P1-CAPABILITY-004）**
+------------------------------------------------------
+本规则已接入 ``RoundObservationSet`` 的**逐 signal** 账本，signal 名形如
+``spirit_order.institution_buy``。**8 个 pattern 的依赖不同，共用一个整类
+分母必然失真**，所以每个 pattern 单独记账：
+
+| pattern | 硬依赖（缺 -> ``mark_blocked``） | 可跳过的缺失（缺 -> ``mark_advisory_missing``） |
+|---|---|---|
+| ``big_buy`` / ``big_sell`` | ``outer_inner``、``float_cap`` | — |
+| ``institution_buy`` / ``institution_sell`` | ``depth_l1`` **或** ``depth_l5`` | ``float_cap`` |
+| ``institution_eat`` / ``institution_vomit`` | ``outer_inner`` | ``float_cap`` |
+| ``big_bid_wall`` / ``big_ask_wall`` | ``depth_l5`` | ``float_cap`` |
+
+* **硬依赖缺失 = 该 pattern 真的无法判定**（进 blocked 分母）。例如 Sina 没有
+  五档 -> ``big_bid_wall`` / ``big_ask_wall`` 不可评估；Sina 没有内外盘 ->
+  4 个成交类 pattern 不可评估。
+* 机构买单/卖单是「**或**」不是「与」：单档判定走五档数组**或**走买一/卖一
+  都能算，所以 ``depth_l1`` 与 ``depth_l5`` **同组**，任一可用即不算缺失。
+  写成「与」会把"只有五档的源"和"只有一档的源"其中之一误判成不可评估。
+* **``float_cap`` 对多数 pattern 只是"一个「或」分支失效"**：单档/五档合计的
+  绝对量口径照样能命中，所以是 advisory 而**不是** blocking。把两者记成同一个
+  状态正是 IT-P1-CAPABILITY-003 的缺陷。
+  （例外：``big_buy`` / ``big_sell`` 官方口径**只有**换手率一个比例条件，没有
+  绝对量兜底，所以缺 ``float_cap`` 对它们是硬阻断。）
+* ``depth_l1`` 只给 level-1（Sina）时，``_best_order`` 用**真实的**买一/卖一
+  挂单量 ``bid_vol`` / ``ask_vol``（手）当唯一一档；**绝不拿价格冒充数量**。
+  数量门控在 ``provides("depth_l1")``：源声明不提供时，``bid_vol`` 里放的是
+  占位 0.0，采信它会凭空造出信号并与账本的 blocked 自相矛盾。
+* 能力声明与真实用法的一致性由 :func:`check_capability_declaration` 自检
+  （"用到就必须声明"、"声明可用就不得记缺失"），测试逐条钉住。
+
+账本调用一律经 ``_obs_mark`` 防御式包裹：可观测性坏掉绝不能把异常抛进信号
+主链路（见 ``test_broken_observation_does_not_break_rule``）。
+
 key：``f"{code}:{kind.value}:{pattern}:{bucket}"``，``bucket = bucket_of(now_epoch, cooldown)``。
 **``pattern`` 分段不可省**：8 个信号共用一个 AlertKind，缺少分段时同桶内
 「大笔买入」会把「机构吃货」等别的信号吞掉（本项目刚修过同类缺陷）。
@@ -50,18 +84,25 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 
+from ..capabilities import ObservationDecision
 from ..models import Alert, AlertKind, Quote, Snapshot
 from ..session import CONTINUOUS
 from .base import RuleContext, bucket_of, fmt_pct
 
 __all__ = [
+    "ADVISORY_DEPS",
+    "BLOCKING_DEPS",
+    "CAPS_OF",
     "DEFAULTS",
     "PATTERNS",
     "PATTERN_CN",
     "RULE",
     "SIGNALS",
+    "SIGNAL_PREFIX",
     "SpiritOrderRule",
     "build",
+    "check_capability_declaration",
+    "signal_name",
 ]
 
 #: 信号名（稳定标识，写日志/存库/前端筛选用它，不要改）
@@ -172,6 +213,170 @@ _RANK_OF: dict[str, int] = {
 #: 手 -> 股
 _LOT_SHARES = 100.0
 
+#: 成交类（事件型）4 个 pattern：判定完全依赖**相邻两轮快照的增量**。
+#: 本轮区间不可判时（首轮无上轮 / 间隔过长 / 成交量回退）它们**不能**被记为
+#: "评估过但没命中" —— 那样会把"这一轮根本没测"夸大成"测了，就是没量"。
+TRADE_PATTERNS: frozenset[str] = frozenset(
+    ("big_buy", "big_sell", "institution_eat", "institution_vomit"))
+
+#: 成交类里**只**依赖流通盘比例的那两个 pattern。
+#:
+#: ``big_buy`` / ``big_sell`` 的官方口径只有"外/内盘增量占流通盘比例"一条，
+#: 没有绝对量/绝对额兜底（见 ``_check_trades``）。所以这一票 ``float_cap <= 0``
+#: 时它俩**没有可判区间**，必须记 not measured 而不是"评估过、没命中"。
+#: 另外两个（吃货/吐货）有绝对量与绝对额分支，不在这里。
+_FLOAT_ONLY_PATTERNS: frozenset[str] = frozenset(("big_buy", "big_sell"))
+
+#: 逐 signal 账本的 signal 名前缀。8 个 pattern 共用一个 ``AlertKind``，
+#: 但**依赖的 capability 各不相同**，所以账本必须到 pattern 粒度才有意义
+#: （``spirit_order.institution_buy`` 而不是 ``spirit_order``）。
+#: 这与 ``capabilities.RoundObservationSet`` 注释里的键形状一致。
+SIGNAL_PREFIX = "spirit_order"
+
+#: 每个 pattern 的**硬依赖**（缺 -> ``mark_blocked``）。
+#:
+#: 形状：``pattern -> ((字段A, 字段B), (字段C,), ...)``
+#: * **外层 tuple 是「与」**：每一组都必须满足；
+#: * **内层 tuple 是「或」**：组内任一字段可用即算满足。
+#:
+#: 为什么这么写：``institution_buy`` 的单档判定既可以走五档数组
+#: （``depth_l5``）也可以走买一（``depth_l1``），**有任意一个就能评估**；
+#: 写死成 ``depth_l1`` 会把"只有五档的源"误判成不可评估。三门已知源里
+#: 没有这种形态，但表要表达真实语义，不能只在今天的样本上凑对。
+#:
+#: ``big_buy`` / ``big_sell`` 把 ``float_cap`` 记为**硬依赖**是有依据的：
+#: 官方口径只有"外/内盘成交占流通盘比例"一条（见模块文档），没有绝对量
+#: 兜底分支，``float_shares <= 0`` 时该信号**永远不可能成立**。
+#: 其余 pattern 的绝对量口径仍可独立命中 -> ``float_cap`` 只记 advisory。
+BLOCKING_DEPS: dict[str, tuple[tuple[str, ...], ...]] = {
+    "big_buy": (("outer_inner",), ("float_cap",)),
+    "big_sell": (("outer_inner",), ("float_cap",)),
+    "institution_buy": (("depth_l1", "depth_l5"),),
+    "institution_sell": (("depth_l1", "depth_l5"),),
+    "institution_eat": (("outer_inner",),),
+    "institution_vomit": (("outer_inner",),),
+    "big_bid_wall": (("depth_l5",),),
+    "big_ask_wall": (("depth_l5",),),
+}
+
+#: 每个 pattern 缺了**仍能命中**的字段（缺 -> ``mark_advisory_missing``）。
+#:
+#: 全部是 ``float_cap``：比例口径失效，但绝对量/绝对额口径照常工作
+#: （``_eat_hits`` / ``_best_order`` / ``_wall_hits`` 都显式处理
+#: ``float_shares <= 0``）。把它记成 blocking 就是把"少判一项"夸大成
+#: "整类不可评估" —— 正是 IT-P1-CAPABILITY-003 的缺陷。
+ADVISORY_DEPS: dict[str, tuple[str, ...]] = {
+    "institution_buy": ("float_cap",),
+    "institution_sell": ("float_cap",),
+    "institution_eat": ("float_cap",),
+    "institution_vomit": ("float_cap",),
+    "big_bid_wall": ("float_cap",),
+    "big_ask_wall": ("float_cap",),
+}
+
+
+def _caps_of() -> dict[str, tuple[str, ...]]:
+    """``pattern -> 该 pattern 判据**用到**的 capability 字段（扁平、去重、有序）。
+
+    为什么要有它（IT-P1-CAPABILITY-004 的第 (c) 项「声明一致性」）：
+    ``BLOCKING_DEPS`` / ``ADVISORY_DEPS`` 用嵌套 tuple 表达「与/或」，可读性
+    好，但**没法直接和源声明做集合比较** —— 于是很容易出现"某个 pattern 明明
+    要五档，依赖表里却漏写 ``depth_l5``"这种**声明与用法不一致**的缺陷
+    （审计的原始形态）。这里给出一份扁平视图，并配一条
+    ``check_capability_declaration()`` 自检，让"漏声明"变成会红的断言。
+    """
+    out: dict[str, tuple[str, ...]] = {}
+    for pat in PATTERNS:
+        fields: list[str] = []
+        for group in BLOCKING_DEPS.get(pat, ()):
+            for f in group:
+                if f not in fields:
+                    fields.append(f)
+        for f in ADVISORY_DEPS.get(pat, ()):
+            if f not in fields:
+                fields.append(f)
+        out[pat] = tuple(fields)
+    return out
+
+
+#: ``pattern -> 声明的 capability 字段``（扁平视图，供自检与工具消费）。
+CAPS_OF: dict[str, tuple[str, ...]] = _caps_of()
+
+
+def check_capability_declaration() -> list[str]:
+    """声明一致性自检：返回不一致项列表（空 = 全一致）。
+
+    两条规则（IT-P1-CAPABILITY-004(c)）：
+
+    1. **用到就必须声明**：某 pattern 的判据真的读了某个字段，依赖表里就必须
+       有它。反面例子正是审计缺陷 —— 大墙类只跑五档合计（``_depth_total``）
+       却在依赖表里漏掉 ``depth_l5``，于是缺五档时账本显示"评估过、没命中"，
+       而不是"根本没法判"。
+    2. **声明了就不能再说它缺失**：``depth_l1`` 明明可用时，绝不能把同一
+       pattern 记成 blocked（那是把"判据完整"报成"无法评估"）。
+       这条由 :func:`capability_gaps` 的「或」语义保证：组内任一字段可用即放行，
+       这里再机械地复核一遍，防止将来有人把内层 tuple 拆成外层。
+    """
+    bad: list[str] = []
+    #: pattern -> 该 pattern 在代码里**实际读取**的 capability 字段。
+    used: dict[str, tuple[str, ...]] = {
+        "big_buy": ("outer_inner", "float_cap"),
+        "big_sell": ("outer_inner", "float_cap"),
+        "institution_buy": ("depth_l1", "depth_l5", "float_cap"),
+        "institution_sell": ("depth_l1", "depth_l5", "float_cap"),
+        "institution_eat": ("outer_inner", "float_cap"),
+        "institution_vomit": ("outer_inner", "float_cap"),
+        "big_bid_wall": ("depth_l5", "float_cap"),
+        "big_ask_wall": ("depth_l5", "float_cap"),
+    }
+    for pat in PATTERNS:
+        declared = set(CAPS_OF.get(pat, ()))
+        for f in used.get(pat, ()):
+            if f not in declared:
+                bad.append(f"{pat}: 判据用到 {f} 但依赖表未声明")
+    # 规则 2：只有单一深度字段的"或"组必须真的以「或」表达。
+    for pat in ("institution_buy", "institution_sell"):
+        groups = BLOCKING_DEPS.get(pat, ())
+        if not any(set(g) == {"depth_l1", "depth_l5"} for g in groups):
+            bad.append(f"{pat}: depth_l1/depth_l5 必须同组（任一可用即可判）")
+    for pat in ("big_bid_wall", "big_ask_wall"):
+        flat = {f for g in BLOCKING_DEPS.get(pat, ()) for f in g}
+        if "depth_l1" in flat:
+            bad.append(f"{pat}: 五档合计不得声明成只需 depth_l1")
+    return bad
+
+
+def signal_name(pattern: str) -> str:
+    """``pattern`` -> 账本里的 signal 名（``spirit_order.<pattern>``）。"""
+    return f"{SIGNAL_PREFIX}.{pattern}"
+
+
+def capability_gaps(provides, active_patterns) -> tuple[dict, dict]:
+    """按 pattern 算出「硬依赖缺失」与「可跳过依赖缺失」。
+
+    ``provides`` 是 ``ctx.provides``（未挂 capability 时恒 True）；``active_patterns``
+    是本轮配置下**确实启用**的 pattern（阈值全 0 / 分组开关关掉的 pattern
+    不进账本 —— 它没被判据覆盖，既不该算 evaluable 也不该算 blocked）。
+
+    返回 ``({pattern: (reason, capability)}, {pattern: (capability, ...)})``。
+    reason 取组内**第一个**缺失字段（``xxx_not_provided``），与
+    volume_burst 的 ``turnover_not_provided`` 命名一致。
+    """
+    blocked: dict = {}
+    advisory: dict = {}
+    for pat in active_patterns:
+        missing: list[str] = []
+        for group in BLOCKING_DEPS.get(pat, ()):
+            if not any(provides(k) for k in group):
+                missing.append(group[0])
+        if missing:
+            blocked[pat] = (f"{missing[0]}_not_provided", missing[0])
+            continue        # 已判 blocked 的 pattern 不再记 advisory（互斥）
+        miss_a = tuple(k for k in ADVISORY_DEPS.get(pat, ()) if not provides(k))
+        if miss_a:
+            advisory[pat] = miss_a
+    return blocked, advisory
+
 
 def _num(v, default: float = 0.0) -> float:
     """宽松转 float：None / 非法值 / 空串 -> default。"""
@@ -245,6 +450,88 @@ class SpiritOrderRule:
                 if v is not None:
                     return v
         return default
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _obs_mark(obs: object, method: str, *args: object) -> None:
+        """防御式调用 ``RoundObservationSet`` 的记账方法。
+
+        **可观测性绝不能影响主流程** —— 这是本仓既有纪律（见
+        ``test_broken_observation_does_not_break_rule``）。账本对象可能是
+        旧版本、被替换成坏桩、或永远没挂上，任何一种都只能静默降级，
+        不允许把异常抛进信号主链路。
+        """
+        if obs is None:
+            return
+        try:
+            fn = getattr(obs, method, None)
+            if callable(fn):
+                fn(*args)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mark_unavailable(self, ctx: RuleContext, code: str, field: str) -> None:
+        """记一次「能力缺失导致该项**无法评估**」（硬阻断）。
+
+        只做记账，供 live_session / 看板显示"短线精灵某个信号在当前源下
+        不可评估"，而不是让用户以为"这段时间就是没信号"。
+        """
+        obs = getattr(ctx, "observation", None)
+        if obs is None:
+            return
+        try:
+            codes = getattr(obs, "unavailable_codes", None)
+            if isinstance(codes, set):
+                codes.add(code)
+            decisions = getattr(obs, "decisions", None)
+            if isinstance(decisions, list):
+                decisions.append(ObservationDecision(
+                    code=code, status="unavailable_capability",
+                    rule=self.name, reason=f"{field}_not_provided",
+                    missing=(field,),
+                ))
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _mark_advisory(self, ctx: RuleContext, code: str, field: str) -> None:
+        """记一次「缺了这一项，但当前语义**允许跳过**」。
+
+        **绝不能**写进 ``unavailable_codes`` —— 那会让
+        ``unavailable_capability`` 同时表达两种互斥语义。该票仍可评估，
+        只是判据少了一项；明细以 ``advisory_missing`` 状态单独留存。
+        """
+        obs = getattr(ctx, "observation", None)
+        if obs is None:
+            return
+        try:
+            decisions = getattr(obs, "decisions", None)
+            if isinstance(decisions, list):
+                decisions.append(ObservationDecision(
+                    code=code, status="advisory_missing",
+                    rule=self.name, reason=f"{field}_not_provided",
+                    missing=(field,),
+                ))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _obs_considered(obs: object, signal: str, code: str) -> bool:
+        """``mark_considered`` 的防御式调用：返回"是否本轮首次登记"。
+
+        ``mark_advisory_missing`` 本身**不是**幂等的（它只加计数，不落终态桶），
+        所以必须借 ``mark_considered`` 的幂等返回值把关，否则同一账本被
+        ``evaluate`` 调用两次时 ``advisory_missing`` 会超过 ``evaluable``，
+        机械不变量当场破裂。账本不可用/没有该方法时返回 False（不记账）。
+        """
+        if obs is None:
+            return False
+        try:
+            fn = getattr(obs, "mark_considered", None)
+            if callable(fn):
+                return bool(fn(signal, code))
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     # ------------------------------------------------------------------
     def evaluate(self, snap: Snapshot, ctx: RuleContext) -> list[Alert]:
@@ -322,7 +609,46 @@ class SpiritOrderRule:
         detect_order: bool,
         detect_trade: bool,
     ) -> list[Alert]:
-        """逐票求值 + 排序 + 截断。"""
+        """逐票求值 + 排序 + 截断 + 逐 signal 记账。
+
+        **记账纪律（IT-P1-CAPABILITY-004）**：8 个 pattern 依赖的 capability
+        不同，账本按 ``spirit_order.<pattern>`` 分开记 —— 共用一个整类分母
+        正是审计指出的缺陷。三种去向互斥：
+
+        * ``mark_blocked``：该 pattern 在当前源下**真的不能判**（缺硬依赖）；
+        * ``mark_evaluated(hit=...)``：判据完整、真的评估过（含被截断的命中）；
+        * 两者都不记：本轮对这只票**没有可判区间**（例如首轮无上轮、五档
+          缺失导致大墙类跳过）—— 那是 "not measured"，既不是 blocked 也不是
+          "评估过没命中"。
+
+        所有账本调用都经 ``_obs_mark`` 防御式包裹，账本坏掉不影响告警。
+        """
+        obs = getattr(ctx, "observation", None)
+        _mark = self._obs_mark
+
+        # --- 本轮真正启用的 pattern（阈值全 0 / 分组开关关掉的不进账本）------
+        check_order = order_shares > 0.0 or order_amount > 0.0 or order_float_pct > 0.0
+        check_wall = wall_shares > 0.0 or wall_float_pct > 0.0
+        check_big = big_turnover_pct > 0.0
+        check_eat = eat_shares > 0.0 or eat_amount > 0.0 or eat_float_pct > 0.0
+        active: list[str] = []
+        if detect_order:
+            if check_order:
+                active += ["institution_buy", "institution_sell"]
+            if check_wall:
+                active += ["big_bid_wall", "big_ask_wall"]
+        if detect_trade:
+            if check_big:
+                active += ["big_buy", "big_sell"]
+            if check_eat:
+                active += ["institution_eat", "institution_vomit"]
+
+        provides = getattr(ctx, "provides", None)
+        if not callable(provides):
+            def provides(_key: str) -> bool:      # 老调用方：按"提供"处理
+                return True
+        blocked, advisory = capability_gaps(provides, active)
+
         picked: list[tuple] = []
         for code, q in snap.quotes.items():
             if q is None:
@@ -334,20 +660,70 @@ class SpiritOrderRule:
             if q.price <= 0.0 or q.prev_close <= 0.0 or q.is_suspended:
                 continue
 
+            #: 本票**真的被评估过**的 pattern。
+            evaluated: list[str] = []
+
             # --- 盘口类：机构买单/卖单、大买盘/大卖盘（不依赖上一轮快照）--
             if detect_order:
-                picked += self._check_orders(
+                out = self._check_orders(
                     q, code,
                     order_shares, order_amount, order_float_pct, wall_shares, wall_float_pct,
+                    provides("depth_l1"), provides("depth_l5"),
                 )
+                picked += out
+                hits = {c[5] for c in out}
+                if check_order:
+                    evaluated += ["institution_buy", "institution_sell"]
+                # 大墙类要**真的**有五档才谈得上评估；源声明有、这一票却没有
+                # （脏数据/降级）属数据质量问题，记 not measured 而不是伪造结论。
+                if check_wall and q.has_depth:
+                    evaluated += ["big_bid_wall", "big_ask_wall"]
+            else:
+                hits = set()
 
             # --- 成交类：大笔买入/卖出、机构吃货/吐货（需要上一轮快照）----
             if detect_trade:
-                picked += self._check_trades(
+                out, judgeable = self._check_trades(
                     q, code, now_epoch,
                     max_gap, min_delta, big_turnover_pct,
                     eat_shares, eat_amount, eat_float_pct,
+                    provides("outer_inner"),
                 )
+                picked += out
+                hits |= {c[5] for c in out}
+                # 区间不可判（首轮/间隔过长/回退）时**四类都不记**：这一轮没有
+                # 可判区间，记成"评估过没命中"会把 not_measured 夸大成结论。
+                # ``TRADE_PATTERNS`` 是这四类的权威清单，直接用它筛 ——
+                # 手写两份 pattern 名单迟早会漂移。
+                if judgeable:
+                    evaluated += [
+                        p for p in active
+                        if p in TRADE_PATTERNS
+                        # 「大笔买入/卖出」官方口径只有比例一条，缺流通盘
+                        # （这一票 float_cap<=0）时同样没有可判区间
+                        # -> 也按 not measured，不记成"评估过没命中"。
+                        and (q.float_shares > 0.0 or p not in _FLOAT_ONLY_PATTERNS)
+                    ]
+
+            # --- 逐 signal 落账（blocked 与 evaluated 互斥，先到先得）------
+            for pat in active:
+                sig = signal_name(pat)
+                if pat in blocked:
+                    reason, cap = blocked[pat]
+                    self._mark_unavailable(ctx, code, cap)
+                    _mark(obs, "mark_blocked", sig, code, reason, cap)
+                    continue
+                if pat not in evaluated:
+                    continue            # not measured：本轮没有可判区间
+                # advisory 只记一次（同一轮同一 signal 同一 code）：
+                # 借 mark_considered 的幂等返回值把关，否则同一账本被
+                # evaluate 两次时 advisory_missing 会超过 evaluable。
+                if pat in advisory and self._obs_considered(obs, sig, code):
+                    for f in advisory[pat]:
+                        self._mark_advisory(ctx, code, f)
+                        _mark(obs, "mark_advisory_missing", sig, code,
+                              f"{f}_skipped", f)
+                _mark(obs, "mark_evaluated", sig, code, pat in hits)
 
         # 确定性排序：severity 降序 -> 信号优先级 -> |pct| 降序 -> code 升序。
         # 每只票每轮每个信号至多一条，所以这里只会砍掉排名靠后的信号。
@@ -359,6 +735,10 @@ class SpiritOrderRule:
         picked.sort(key=lambda p: (-p[0], p[1], -p[2], p[3]))
         if max_per_round > 0:
             picked = picked[:max_per_round]
+        # 只有**真的进了返回列表**的才算 published；被 max_per_round 截掉的
+        # 保持 hit_candidate 身份，机械不变量 published <= hit_candidates 成立。
+        for c in picked:
+            _mark(obs, "mark_published", signal_name(c[5]), c[3])
         return [self._materialize(p) for p in picked]
 
     # ------------------------------------------------------------------
@@ -373,13 +753,21 @@ class SpiritOrderRule:
         eat_shares: float,
         eat_amount: float,
         eat_float_pct: float,
-    ) -> list[tuple]:
+        oi_ok: bool = True,
+    ) -> tuple[list[tuple], bool]:
         """成交类 4 个信号：用**相邻两轮快照的增量**近似本区间的主动买卖。
 
-        返回轻量候选列表（0~4 条，见 ``_mk``）。
+        返回 ``(轻量候选列表, 本轮区间是否可判)`` —— 0~4 条候选见 ``_mk``。
 
-        任何一条"不可信"的路径都只更新缓存、不产告警：
-        首轮无上轮、间隔过长、成交量回退、主动量为 0。
+        **第二项是 IT-P1-CAPABILITY-004 新增的诚实性出口**：任何一条"不可信"
+        的路径（首轮无上轮、间隔过长、成交量回退、主动量为 0）都只更新缓存、
+        不产告警；此时必须告诉账本"这一轮**没有可判区间**"，而不是让它把
+        "根本没测"记成"评估过、就是没量"。两者在 health 上是天壤之别。
+
+        ``oi_ok`` = ``ctx.provides("outer_inner")``。这 4 个 pattern **全部**
+        建立在内外盘增量之上，源声明不提供时 ``outer_vol``/``inner_vol`` 是
+        占位 0.0（Sina 从不写这两个字段），此时按"区间不可判"处理 ——
+        既避免拿占位值下结论，也让行为与账本记的 ``blocked`` 一致。
         """
         outer = _num(q.outer_vol, 0.0)
         inner = _num(q.inner_vol, 0.0)
@@ -390,17 +778,20 @@ class SpiritOrderRule:
         # 无论本轮是否产生告警，都要把最新值写回缓存（下一轮要拿它做差）
         self._prev[code] = (outer, inner, amount, volume, now_epoch)
 
+        if not oi_ok:
+            return [], False        # 源不提供内外盘 -> 本区间没有可判依据
+
         if prev is None:
-            return []                       # 首轮：没有上轮，绝不猜
+            return [], False                # 首轮：没有上轮，绝不猜
         p_outer, p_inner, p_amount, p_volume, p_epoch = prev
 
         # 间隔过长（数据源断线 / 跨午休）：整段累积量会被误判成一笔巨单 -> 跳过
         if max_gap > 0.0 and (now_epoch - float(p_epoch)) > max_gap:
-            return []
+            return [], False
 
         # 成交量回退（数据源重置 / 跨日）：增量是负的，任何比例都无意义 -> 跳过
         if volume < float(p_volume) or outer < float(p_outer) or inner < float(p_inner):
-            return []
+            return [], False
 
         d_outer = outer - float(p_outer)
         d_inner = inner - float(p_inner)
@@ -408,9 +799,9 @@ class SpiritOrderRule:
         d_amount = amount - float(p_amount)
         d_act = d_outer + d_inner
         if d_volume <= 0.0 or d_act <= 0.0:
-            return []                       # 本轮没有成交（或内外盘没更新）
+            return [], False                # 本轮没有成交（或内外盘没更新）
         if min_delta > 0.0 and d_act < min_delta:
-            return []
+            return [], False
 
         # 区间成交额按内外盘比例归因：主动买占 d_outer/d_act，主动卖占 d_inner/d_act。
         # 注意这是**近似**：真实资金流还受撤单、大单拆分影响，见模块文档。
@@ -483,7 +874,7 @@ class SpiritOrderRule:
                 ))
 
         # 每类信号各留一条（同一只票同一轮最多同时出现这 4 条）
-        return out
+        return out, True
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -530,23 +921,48 @@ class SpiritOrderRule:
         order_float_pct: float,
         wall_shares: float,
         wall_float_pct: float,
+        l1_ok: bool = True,
+        l5_ok: bool = True,
     ) -> list[tuple]:
         """盘口类 4 个信号：机构买单/卖单（单档）、大买盘/大卖盘（五档合计）。
 
         ``ts`` 不在这里传：边沿状态按自然日重置，日期取自 ``self._ts``
         （``evaluate`` 每轮填好），而 ``_mk`` 造的候选要到 ``_materialize``
         才需要时间戳。
+
+        ``l1_ok`` / ``l5_ok`` = ``ctx.provides("depth_l1"/"depth_l5")``。
+        **为什么必须门控**：源声明"不提供"某字段时，Quote 里放的是**占位
+        0.0**（Eastmoney 的 depth 全 0，Sina 的 five-level 数组为空），不是
+        真实业务值。不看声明就采信会两头出错：
+
+        * 拿占位 0.0 当真实值 -> 账本说"无法评估"，规则却照样发告警，
+          机械不变量 ``published <= hit_candidates`` 当场破裂 ——
+          "记账"与"行为"两张皮，正是本缺陷要消灭的东西；
+        * 反过来，声明缺失却被脏数据喂出五档 -> 规则按"只有一档"冒充
+          "五档合计"误报（见 ``test_big_bid_wall_skipped_without_depth``）。
+
+        所以能力声明在这里是**硬门**：不声明提供，就一律按"没有该数据"处理。
         """
         ts = self._ts
         out: list[tuple] = []
         float_shares = float(q.float_shares)
 
+        # L1 数量门控：源不声明提供 depth_l1 -> 一律按"没有 L1 数据"处理。
+        # 数量字段绝不能用价格冒充，也绝不采信未声明来源的占位值。
+        l1_bid = _num(q.bid_vol, 0.0) if l1_ok else 0.0
+        l1_ask = _num(q.ask_vol, 0.0) if l1_ok else 0.0
+
         # --- 机构买单 / 机构卖单：买/卖队列中**存在单档**满足「或」条件 ---
         # 用"存在"而不是"合计"：官方口径就是某一档挂出巨单。
+        #
+        # IT-P1-CAPABILITY-004：``l1_lots`` 传的是**真实的买一/卖一挂单量**
+        # （``bid_vol`` / ``ask_vol``，单位手）。旧代码这个位置只传了价格
+        # ``_num(q.bid1, 0.0)``，于是**只有 level-1 的源（Sina）永远找不到
+        # 任何一档** -> 静默 0 告警。数量必须来自数量字段，绝不能用价格冒充。
         check_order = order_shares > 0.0 or order_amount > 0.0 or order_float_pct > 0.0
         bid_hit = (self._best_order(q.bid_vols, q.bid_prices, float_shares,
                                     order_shares, order_amount, order_float_pct,
-                                    _num(q.bid1, 0.0))
+                                    _num(q.bid1, 0.0), l1_bid)
                    if check_order else None)
         # on = 条件成立；off = 条件已消失 -> 解除武装，下次再出现才能重报。
         # 传 ``off=hit is None`` 而不是恒 True：恒 True 会在"持续成立"的每一轮
@@ -563,7 +979,7 @@ class SpiritOrderRule:
             ))
         ask_hit = (self._best_order(q.ask_vols, q.ask_prices, float_shares,
                                     order_shares, order_amount, order_float_pct,
-                                    _num(q.ask1, 0.0))
+                                    _num(q.ask1, 0.0), l1_ask)
                    if check_order else None)
         if self._edge(ts, code, "institution_sell", on=ask_hit is not None, off=ask_hit is None):
             lots, px, hits, shares, amt = ask_hit
@@ -579,8 +995,12 @@ class SpiritOrderRule:
         # --- 有大买盘 / 有大卖盘：五档合计；**没有五档必须跳过** ----------
         # 为什么必须跳过：bid_total_vol 在没有五档时会退回买一量，
         # 那是"只有一档"的量，拿它冒充五档合计会系统性低估/误判。
+        #
+        # ``l5_ok`` 是能力声明这道硬门（见方法 docstring）：源声明不提供
+        # depth_l5 时，即使 Quote 里**碰巧**带着五档数组，也一律不认 ——
+        # 声明与行为必须一致，否则账本记 blocked、规则却发告警。
         check_wall = wall_shares > 0.0 or wall_float_pct > 0.0
-        wall_ok = q.has_depth and check_wall
+        wall_ok = l5_ok and q.has_depth and check_wall
         bid_lots = self._depth_total(q, "bid") if wall_ok else 0.0
         bid_wall = self._wall_hits(bid_lots, float_shares, wall_shares, wall_float_pct) \
             if wall_ok else None
@@ -629,24 +1049,50 @@ class SpiritOrderRule:
         thr_amount: float,
         thr_float_pct: float,
         fallback_px: float = 0.0,
+        l1_lots: float = 0.0,
     ) -> tuple[float, float, str, float, float] | None:
         """在某一侧的挂单里找**满足「或」条件的最佳单档**。
 
         返回 ``(手, 价, 命中说明, 股, 金额)``；没有任何一档达标返回 None。
-        * 只遍历 ``vols``，价格缺失/为 0 时用 ``fallback_px``（调用方传买一/卖一价）
-          兜底，仍然没有就只能按 0 金额判 —— 那样只有绝对量口径能触发；
+
+        * **优先遍历 ``vols``（五档数量数组）**：有它就完全按原口径走，
+          ``vols`` 非空时 ``l1_lots`` **一律忽略**，保证既有行为一字不变。
+        * **``vols`` 为空时回退到 level-1**（IT-P1-CAPABILITY-004）：
+          用 ``l1_lots`` 这个**真实的买一/卖一挂单量（手）**当唯一一档。
+          这正是 Sina 的形态（``depth_l1=True`` / ``depth_l5=False``）—— 旧代码
+          只看 ``vols``，于是这批源上「机构买单/卖单」静默 0 告警。
+        * 价格缺失/为 0 时用 ``fallback_px``（调用方传买一/卖一价）兜底，
+          仍然没有就只能按 0 金额判 —— 那样只有绝对量口径能触发。
+        * **数量绝不从价格推导**：``l1_lots <= 0`` 时回退路径直接返回 None，
+          宁可漏报也不拿价格冒充手数。
         * 金额 = 手 × 100 × 价格（契约单位：量=手、价=元）；
         * ``float_shares <= 0`` 时比例项自动失效，只比绝对量/绝对额。
+        * ``l1_px`` 在回退路径下取 ``fallback_px``：调用方传的就是买一/卖一价，
+          与 L1 数量天然同源；数组路径下逐档取 ``prices[i]``。
+
+        新增的 ``l1_lots`` 带默认值 0.0，所以旧调用签名（7 个位置参数）
+        仍然可用且行为等同于"没有 L1 数据"。
         """
         best = None
         best_lots = 0.0
-        for i, raw in enumerate(vols):
-            lots = _num(raw, 0.0)
+
+        # --- 档位来源：五档数组优先，为空才用 level-1 的**数量** -----------
+        if vols:
+            rows = [(_num(raw, 0.0),
+                     _num(prices[i], 0.0) if i < len(prices) else 0.0)
+                    for i, raw in enumerate(vols)]
+        else:
+            # 没有五档数组：用真实的 L1 挂单量，价格用调用方给的买一/卖一价。
+            l1 = _num(l1_lots, 0.0)
+            if l1 <= 0.0:
+                return None             # 没有数量 -> 无从判定，绝不猜
+            rows = [(l1, _num(fallback_px, 0.0))]
+
+        for lots, px in rows:
             if lots <= 0.0:
                 continue
-            px = _num(prices[i], 0.0) if i < len(prices) else 0.0
             if px <= 0.0:
-                px = fallback_px
+                px = _num(fallback_px, 0.0)
             shares = lots * _LOT_SHARES
             amount = shares * px
             hits: list[str] = []
