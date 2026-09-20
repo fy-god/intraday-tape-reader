@@ -1,29 +1,80 @@
-# NEXT_STEPS — 2026-09-21 02:24 JST
+# NEXT_STEPS — 2026-09-21 03:38 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> **02:24 轮进展**：`IT-P1-CAPABILITY-004` 已完成（`1713f4f`）；
-> 新增修复 `IT-P1-NEWLIST-001` / `IT-P1-NEWLIST-002` /
-> `IT-P1-REPLAY-DETERMINISM-001`（`3decac9`）—— 三者均由**真实行情全市场扫描**暴露。
+> **03:38 轮进展**：`IT-P1-MARKET-RULE-20260706-001`（主板 ST 涨跌幅
+> 5%→10% 日期感知）与 `IT-P2-DAEMON-HEALTH-001`（`--detach` 归属缺陷，
+> 是我自己上一提交的问题）已完成（`22a51a2`）；
+> `serve --replay`（休市也能看到短线精灵）为 `a415965`；
+> `--detach` 真正脱离终端为 `9c4e08d`。全量 1570 passed / 8 gate。
 >
 > **02:24 轮新增 P0（最高优先，因为它是"用户真正要的东西"）**：
 > 见下方第 0 条 —— 用**事后收益**给告警打标签，量化"报得准不准"。
 > 在此之前，所有修复都只回答"会不会报错"。
+>
+> ⚠ **03:38 轮补充：P0-0 现在被 `IT-P1-EVAL-PUBLISH-001` 卡住了。**
+> `published` 字段在 Rule 返回时就写入，早于 `AlertBus.accept` 的
+> key 去重 / cooldown —— 机制反例 overcount **24×**
+> （24 轮连续命中，label 会记 24 条，Store 实际只 committed 1 条）。
+> 若拿它当标签分母，会把从未交付的候选算成"已发布事件"，
+> **P0-0 的代理指标会系统性偏乐观**。所以顺序必须是：
+> 先修 P0-A（下），再做 P0-0。
 
-## P0-0 — 从"会不会报错"转向"报得准不准"（**本轮新增，最高优先**）
+## P0-A — 告警交付阶段账本（**03:38 轮新增，P0-0 的前置阻塞**）
+
+### A. 把 `published` 拆成 `rule_selected / bus_accepted / committed`
+- **现状**：`volume_burst` / `spirit_order` 在规则内部 `max_per_round`
+  截断后立即 `mark_published(signal, code)`；而 Engine 拿到返回值后还要走
+  `AlertBus.accept`（key 去重 + cooldown）→ `store.add_alert` → notifier。
+  所以当前账本把 **`rule_selected` 错命名成 `published`**。
+- **云端 04:10 机制反例**：同一只票每 5 秒都满足 `volume_burst`，
+  cooldown=600 秒，共 24 轮 →
+  `rule-level published = 24`，`AlertBus 真正接受 = 1`，
+  `实际可 commit = 1`。**overcount 24×**。
+  （这是刻意机制反例，不是线上重复率，但足以证明字段语义不成立。）
+- **正确分层**：
+  ```text
+  hit_candidate -> rule_selected -> bus_accepted -> committed
+                -> notify_attempted -> notify_sent -> client_received
+  ```
+- **做法**：兼容期把 `published` 改名/语义定为 `rule_selected`；
+  真正的 `committed` 只在 Engine `bus.accept` + `store.add_alert` 之后记录。
+  `Alert` 应带稳定 `signal_id`，不要让 Engine 靠 title 文案猜所属 signal。
+- **验收**：构造"连续命中但 cooldown 只允许一次"，
+  断言 `rule_selected=24 / bus_accepted=1 / committed=1`；
+  回退验证须为真 AssertionError（只用既有 API）。
+- **证据文件**：`alert_stage_red.log / green.log / rollback.log`、
+  `alert_delivery_reconcile.json`。
+
+### A2. 把 ST 新规从"单元"推到"回放链路"（补本轮 R-07）
+- **现状**：日期感知板率只在单元测试层验证（7/7 真牙）。
+  `replay` 剧本股票名不含 ST，因此**回放端到端不触发该分支**。
+- **做法**：在 `default_universe` 或剧本里加入一只主板 ST，
+  用 `day=2026-07-03` 与 `day=2026-07-06` 各跑一次，
+  断言 `limit_up_price` 与 `limit_board` 告警的差异。
+- **为什么**：这是把本轮修复从"函数对了"推到"链路对了"的最短路径，
+  也是唯一能证明历史回放不被新规污染的证据。
+- **验收**：产出 `market_rule_replay_0705_vs_0706.json`，
+  两天的限价与告警数**不同**且各自符合当日制度。
+
+## P0-0 — 从"会不会报错"转向"报得准不准"（最高优先，依赖 P0-A）
 
 ### 0. 用事后收益自动标注告警，产出 Precision 代理指标
 - **现状**：本项目所有验证都只证明"链路通、不报错"。
   **真实 Precision / Recall / 漏报率 / 交易收益全部 `unavailable`** ——
   因为没有任何标注数据（"这只票当时到底该不该报"）。
-- **做法**：记录每条告警的 `(code, ts, price)`，T+5/T+30 分钟后取真实价格，
+- **做法**：记录每条**真正 committed** 告警的 `(code, ts, price)`
+  （依赖 P0-A 的阶段账本），T+5/T+30 分钟后取真实价格，
   统计"告警后是否继续同向移动"。**无需人工标注**，可自动产出代理指标。
 - **为什么现在做**：`spirit_*` 三条规则默认关闭，配置注释要求
   「先在真实行情里观察命中质量再打开」。**没有这个指标就永远无法决定**，
   只能一直抱着"默认关闭"或凭感觉打开。
 - **造假条件（falsify）**：若告警后 T+5 收益分布与**随机抽样时点**的收益分布
   **无显著差异**，则该信号无预测价值 → 应保持关闭或重调阈值。
+  更强条件：若真实事件在 ≥3 个独立交易日/时间块上，T+5/T+30 signed-return
+  相对 matched controls 无稳定正增量，或只来自单日/单票，
+  或控制市场方向后消失 —— 该 signal **不应**因"告警很多"而放开。
 - **验收**：对每条已启用规则给出"告警后 T+5 同向比例 vs 随机基线"，
   并明确标注这是**代理指标**，不是真实交易收益。
 - **注意**：这是**任务定义调整**，不是模型增量提升。别把它包装成"模型变强了"。
