@@ -135,6 +135,28 @@ def _child_argv(args: argparse.Namespace) -> list[str]:
     return argv
 
 
+def _detach_flags() -> int:
+    """让子进程**独立于启动它的终端**的 Windows 进程创建标志。
+
+    **为什么需要**（IT-P1-DAEMON-DETACH-001）：``run_daemon.py`` 的定位是
+    "让项目自己跑起来，不依赖任何对话/定时消息"。但原来的 Popen **没有任何
+    脱离标志** —— 守护是终端的前台子进程，用户关掉窗口（或会话结束）就有
+    被杀掉的风险，"常驻"名不副实。用户真正要的是"明天开盘它在盯着"，
+    而不是"只要那个黑窗口不关它就盯着"。
+
+    * ``CREATE_NEW_PROCESS_GROUP``：新进程组，不受父终端 Ctrl+C 影响；
+    * ``DETACHED_PROCESS``：**不继承**父控制台 —— 这是关窗口杀不掉它的关键。
+      子进程的 stdout/stderr 本来就重定向到日志文件，不需要控制台。
+
+    非 Windows 平台返回 0（POSIX 上真正的脱离需要 setsid/fork 双开，
+    本项目运行环境是 Windows，这里不假装跨平台支持）。
+    """
+    if os.name != "nt":
+        return 0
+    return getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | \
+        getattr(subprocess, "DETACHED_PROCESS", 0)
+
+
 def _child_env() -> dict:
     env = dict(os.environ)
     existing = env.get("PYTHONPATH", "")
@@ -144,10 +166,74 @@ def _child_env() -> dict:
     return env
 
 
+def _detach_and_return(args: argparse.Namespace) -> int:
+    """``--detach``：以脱离控制台的方式重新拉起自己，然后**立刻返回**。
+
+    做法就是最朴素可靠的那一种：把一个等价命令（去掉 ``--detach``，
+    否则会无限递归）用带 ``DETACHED_PROCESS`` 的 Popen 起一遍，
+    父进程马上退出，终端随即可以关闭。
+
+    为什么不直接给子进程加标志了事：守护自己必须是"脱离"的那个进程，
+    而当前进程已经附着在终端上了 —— 窗口一关它就没了。
+    只有**另起一个脱离进程**才能真正做到。
+    """
+    argv = [sys.executable, str(Path(__file__).resolve())]
+    if args.host:
+        argv += ["--host", args.host]
+    argv += ["--port", str(args.port)]
+    if args.config:
+        argv += ["--config", args.config]
+    if args.watch_only:
+        argv += ["--watch-only"]
+    if args.no_restart:
+        argv += ["--no-restart"]
+    if args.max_restarts:
+        argv += ["--max-restarts", str(args.max_restarts)]
+
+    RUN_DIR.mkdir(parents=True, exist_ok=True)
+    with LOG_FILE.open("ab") as log:
+        log.write(f"\n{'=' * 70}\n".encode())
+        log.write(f"[daemon] {datetime.now():%Y-%m-%d %H:%M:%S} "
+                  f"--detach 重新拉起（离开当前终端）\n".encode())
+        log.flush()
+        try:
+            child = subprocess.Popen(
+                argv, cwd=str(ROOT), env=_child_env(),
+                stdout=log, stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                creationflags=_detach_flags(),
+            )
+        except OSError as exc:
+            print(f"[✗] --detach 启动失败：{exc}")
+            return 2
+
+    # 脱离进程要一点时间才能写好状态文件 / 起来监听
+    ok = False
+    for _ in range(60):                     # 最多等 15 秒
+        time.sleep(0.25)
+        if _healthy(args.port):
+            ok = True
+            break
+        if not _pid_alive(child.pid):
+            break
+
+    print(f"[√] 已脱离终端启动守护 PID {child.pid}；看板 http://127.0.0.1:{args.port}/")
+    print(f"    日志：{LOG_FILE}")
+    print(f"    查状态：python tools/run_daemon.py --status")
+    if ok:
+        print("    [√] 健康检查通过 —— 现在可以关闭这个窗口了")
+        return 0
+    print("    [!] 15 秒内未通过健康检查，请查日志（守护进程本身仍在）")
+    return 0 if _pid_alive(child.pid) else 3
+
+
 def run(args: argparse.Namespace) -> int:
     if not SRC.is_dir():
         print(f"[✗] 找不到源码目录：{SRC}")
         return 2
+
+    if getattr(args, "detach", False):
+        return _detach_and_return(args)
 
     # --- 单实例：同端口已有活着的守护就别再起 ---
     st = _read_state()
@@ -169,6 +255,7 @@ def run(args: argparse.Namespace) -> int:
     print(f"[√] 守护启动 PID {os.getpid()}；看板 http://127.0.0.1:{args.port}/")
     print(f"    日志：{LOG_FILE}")
     print("    Ctrl+C 停止")
+    print("    提示：想让它不受此窗口影响，用 --detach 启动")
 
     stopping = {"flag": False}
 
@@ -192,8 +279,10 @@ def run(args: argparse.Namespace) -> int:
             log.flush()
             try:
                 # stdout/stderr 直接写文件：不用管道，避免句柄/权限坑
+                # creationflags：看板子进程也不该被父终端 Ctrl+C 带走
                 child = subprocess.Popen(argv, cwd=str(ROOT),
                                          stdout=log, stderr=subprocess.STDOUT,
+                                         creationflags=_detach_flags(),
                                          env=_child_env())
             except OSError as exc:
                 print(f"[✗] 子进程启动失败：{exc}")
@@ -257,6 +346,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-restarts", type=int, default=5,
                    help="连续重启上限（默认 5，超过则退出码 3）")
     p.add_argument("--status", action="store_true", help="打印守护状态后退出")
+    p.add_argument("--detach", action="store_true",
+                   help="脱离当前终端启动（关掉窗口也不会停；推荐）")
     return p
 
 
