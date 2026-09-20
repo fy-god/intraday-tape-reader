@@ -113,7 +113,12 @@ def test_store_observation_property():
 
 
 def test_observation_is_bounded_summary_not_per_stock():
-    """不持久化逐股明细 —— 只有汇总计数（内存有界）。"""
+    """不持久化**无界**逐股明细 —— 但有界的"哪只票缺什么"样本要带出来。
+
+    IT-P1-OBS-007：``as_dict()`` 原来只导出 ``unavailable_capability`` 一个计数，
+    看不到是哪只票、缺哪个字段。现在导出**有界**样本（最多 50 条）加按原因
+    聚合的计数 —— 既有可诊断性，又不让内存与 SSE 载荷无界。
+    """
     eng, rule, store = _engine([_Source("tencent")])
     eng._codes = [f"60000{i}" for i in range(5)]
     eng.poll_once(force=True)
@@ -121,10 +126,15 @@ def test_observation_is_bounded_summary_not_per_stock():
     obs = store.status()["observation"]
     # 有汇总字段
     for k in ("requested", "returned", "admitted", "capabilities",
-              "unknown_missing", "stale_rejected", "out_of_order_rejected"):
+              "unknown_missing", "future_rejected", "out_of_order_rejected"):
         assert k in obs, f"缺少 {k}"
-    # decisions 明细**不**进 store（那是无界逐股数据）
+    # 原始无界明细**不**进 store
     assert "decisions" not in obs
+    # 但有界样本可以进（<=50），且带截断标志
+    assert isinstance(obs.get("unavailable_sample"), list)
+    assert len(obs["unavailable_sample"]) <= 50
+    assert "decisions_truncated" in obs
+    assert isinstance(obs.get("unavailable_by_reason"), dict)
 
 
 # ---------------------------------------------------------------------------
@@ -239,7 +249,8 @@ def test_time_rejects_visible_in_status():
     eng.poll_once(force=True)
 
     obs = store.status()["observation"]
-    assert obs["stale_rejected"] == 1
+    # IT-P1-OBS-006：字段由 stale_rejected 改名为 future_rejected（旧名语义相反）
+    assert obs["future_rejected"] == 1
     assert obs["admitted"] == 0
 
 

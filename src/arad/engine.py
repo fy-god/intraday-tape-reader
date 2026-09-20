@@ -956,7 +956,7 @@ class Engine:
                 and c not in quality_bad
             ),
             rejected_quality=quality_bad,
-            stale_rejected=max(future_rej, 0),
+            future_rejected=max(future_rej, 0),
             out_of_order_rejected=max(ooo_rej, 0),
         )
 

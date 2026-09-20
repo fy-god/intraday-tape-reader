@@ -184,7 +184,17 @@ class RoundObservationSet:
     #: provider 返回了、但因数据质量不可用而被丢弃的代码
     #: （如 ``price<=0``）。与 unknown_missing / 时间拒绝三者互斥。
     rejected_quality: tuple[str, ...] = ()
-    stale_rejected: int = 0
+    #: 因**时间戳过于超前**（超过 FUTURE_TOLERANCE_SECONDS）而被拒的条数。
+    #:
+    #: ⚠ 改名（IT-P1-OBS-006）：本字段原名 ``stale_rejected``（陈旧），但唯一
+    #: 数据来源是 ``engine.py`` 的 ``t_reject:future`` 差分 —— **名实相反**。
+    #: 消费方 ``tools/live_session.py`` 早就把它输出成 ``future_rejected``，
+    #: 说明"未来"才是真实语义。现按实际语义改名。
+    #:
+    #: 注意：**当前不存在"陈旧拒绝"路径**。``_admit_time()`` 对任何早于 now
+    #: 的 ``ts`` 都无条件接受（首见码甚至接受数天前的 ``ts``，见
+    #: IT-P1-TIME-ROLE-003），所以不要指望这里能反映"数据太旧"。
+    future_rejected: int = 0
     out_of_order_rejected: int = 0
     # 因能力缺失而无法评估的**代码集合**（不是次数）。同一只票可能同时缺
     # turnover 与 volume_ratio，按次数记会把"1 只票不可评估"夸大成 2，
@@ -206,11 +216,32 @@ class RoundObservationSet:
         """个股部分请求数（``requested`` 去掉指数）。"""
         return max(self.requested - self.index_requested, 0)
 
+    @property
+    def stale_rejected(self) -> int:
+        """**已弃用别名** —— 请改用 :attr:`future_rejected`。
+
+        保留它只为不打断既有调用方（含 SSE 载荷与旧测试）。名字是错的
+        （详见 :attr:`future_rejected` 的说明），新代码不要使用。
+        """
+        return self.future_rejected
+
     def coverage(self) -> float:
         """本轮返回率（requested 为 0 时返回 0，不伪造 1.0）。"""
         return (self.returned / self.requested) if self.requested > 0 else 0.0
 
     def as_dict(self) -> dict[str, Any]:
+        """有界汇总。
+
+        ``decisions`` 是逐 (code, field, reason) 的明细，**不能**整份导出 ——
+        全市场一轮可达成千上万条，Store 只保留最近一轮，无界数据会把内存和
+        SSE 载荷都撑坏（IT-P1-OBS-007 的反面）。这里导出的是**有界样本**
+        加**按原因聚合的计数**，足以回答"是哪只票、缺哪个字段"，又不无界。
+        """
+        # 按 reason 聚合：{reason: 条数}
+        by_reason: dict[str, int] = {}
+        for d in self.decisions:
+            r = str(getattr(d, "reason", "") or "unknown")
+            by_reason[r] = by_reason.get(r, 0) + 1
         return {
             "source": self.source,
             "capabilities": self.capabilities.as_dict(),
@@ -222,7 +253,17 @@ class RoundObservationSet:
             "coverage": round(self.coverage(), 4),
             "unknown_missing": list(self.unknown_missing),
             "rejected_quality": list(self.rejected_quality),
-            "stale_rejected": self.stale_rejected,
+            "future_rejected": self.future_rejected,
             "out_of_order_rejected": self.out_of_order_rejected,
             "unavailable_capability": self.unavailable_capability,
+            # --- IT-P1-OBS-007：把"是哪只票、缺什么"带出 poll_once -------------
+            # 有界样本：最多 50 条明细，避免无界载荷
+            "unavailable_sample": [
+                {"code": str(getattr(d, "code", "")),
+                 "missing": list(getattr(d, "missing", ()) or ()),
+                 "reason": str(getattr(d, "reason", ""))}
+                for d in self.decisions[:50]
+            ],
+            "unavailable_by_reason": by_reason,
+            "decisions_truncated": len(self.decisions) > 50,
         }

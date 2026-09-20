@@ -92,6 +92,29 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b)
 
 
+def _shrinking_fetcher(total: int = CLIST_TOTAL, rows_per_page: int = 10,
+                       page_span: int = 100, clip: bool = True) -> FakeFetcher:
+    """``total`` 声明不变，但**每页只回 ``rows_per_page`` 行**（内容缩水）。
+
+    ``clip=True`` 时末页按 ``total`` 截齐（``len(out) <= total``）；
+    ``clip=False`` 时末页照发满 ``rows_per_page`` 行，制造
+    ``len(out) > expected_total`` 的**上界重叠**（翻页边界重复）。
+
+    页码步进仍按 ``page_span=100``（即 ``page_size``），所以 ``required_pages``
+    与足额时一致 —— 用来单独分离「页数够但行数不够」这一根因。
+    """
+
+    def responder(url: str):
+        pn = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["pn"][0])
+        start = (pn - 1) * page_span
+        n = rows_per_page
+        if clip:
+            n = max(0, min(rows_per_page, total - start))
+        return _payload(total, [_row(f"{600000 + start + i}") for i in range(n)])
+
+    return FakeFetcher(responder)
+
+
 # ==========================================================================
 # 1. 核心缺陷：截断 -> complete 必须为 False
 # ==========================================================================
@@ -228,7 +251,143 @@ class TestTruncationBoundary:
 
 
 # ==========================================================================
-# 4. 配置与既有契约不被破坏
+# 4. IT-P1-COMPLETE-001：页数够但**行数缩水** -> complete 必须为 False
+# ==========================================================================
+class TestShrunkenPagesAreIncomplete:
+    """``complete`` 必须与实际拿到的行数挂钩，不能只看页数。
+
+    修复前 ``complete = bool(total>0) and not failed and not truncated``：
+    每页只回 10 行时 ``returned=600 / expected_total=5913``（10.1%）仍标
+    ``complete=True``，``engine.py`` 的 ``if not meta.get("complete", True)``
+    门控放行，引擎把 600 只当成完整全市场采用。
+    """
+
+    def test_shrunken_pages_are_not_complete(self):
+        """审计实测场景：total=5913 需 60 页（<= max_pages=80），每页只回 10 行。
+
+        修复前这里是红的：返回 600 行仍报 complete=True。
+        """
+        f = _shrinking_fetcher(rows_per_page=10)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        # 页数轴完全正常 —— 缺陷只在行数轴上，故截断/失败页都必须为假
+        assert info["required_pages"] == 60 <= info["max_pages"] == 80
+        assert len(f.clist_pages) == 60, "60 页照常请求"
+        assert info["truncated"] is False, "页数够，不是截断"
+        assert info["pages_failed"] == 0, "没有失败页"
+        assert len(quotes) == 600, "缩水仍要拿回部分数据（不抛异常）"
+        assert info["returned"] == 600
+        assert info["expected_total"] == CLIST_TOTAL
+
+        assert info["complete"] is False, (
+            f"只拿到 {len(quotes)}/{CLIST_TOTAL} 行却报 complete=True，"
+            f"引擎会把 10.1% 当完整全市场；info={info}"
+        )
+
+    def test_shrunk_reason_names_the_count_shortfall(self):
+        """reason 必须能看出是**行数不足**（区别于截断/失败页）。"""
+        f = _shrinking_fetcher(rows_per_page=10)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        src.universe()
+        info = src.universe_info()
+
+        reason = info.get("reason") or ""
+        assert "行数" in reason and "缩水" in reason, f"reason 应说明行数缩水: {reason}"
+        assert "600" in reason and str(CLIST_TOTAL) in reason, (
+            f"reason 应给出实际行数与期望总数: {reason}")
+        assert "截断" not in reason, f"未截断就不该说截断: {reason}"
+
+    def test_shrunk_universe_does_not_raise(self):
+        """缩水不是异常路径：调用方依赖「部分数据继续跑」。"""
+        src = EastmoneySource(EM_CFG, fetcher=_shrinking_fetcher(rows_per_page=1))
+        quotes = src.universe()          # 不得抛 SourceError
+        info = src.universe_info()
+        assert len(quotes) == 60
+        assert info["complete"] is False
+
+    def test_truncated_and_shrunk_reason_mentions_both(self):
+        """截断 + 缩水叠加时，reason 两种不完整都要说明。"""
+        f = _shrinking_fetcher(rows_per_page=10)
+        src = EastmoneySource({**EM_CFG, "max_pages": 3}, fetcher=f)
+        src.universe()
+        info = src.universe_info()
+        assert info["truncated"] is True
+        assert info["complete"] is False
+        reason = info.get("reason") or ""
+        assert "截断" in reason, reason
+        assert "行数缩水" in reason, reason
+
+
+# ==========================================================================
+# 5. IT-P1-COMPLETE-001 边界：容差必须是「不少于」，不是「等于」
+# ==========================================================================
+class TestReturnedCountBoundary:
+    def test_upper_bound_overlap_stays_complete(self):
+        """``len(out) > expected_total``（翻页边界重复）是**正常**上界重叠。
+
+        审计明确：``returned=6000`` 略高于 ``expected_total=5913`` 不是缺陷。
+        修复**不得**因为它略多就判 incomplete（即不能写成 ``==``）。
+
+        这里每页回 120 行、页码步进仍是 100，相邻页有 20 行重叠（模拟翻页
+        边界重复），去重后 600000..606019 共 6020 行 > 5913。
+        """
+        f = _shrinking_fetcher(rows_per_page=120, clip=False)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        assert info["truncated"] is False
+        assert len(quotes) == 6020 > info["expected_total"] == CLIST_TOTAL
+        assert info["returned"] == 6020
+        assert info["complete"] is True, (
+            f"略高于总数是正常上界重叠，不得判 incomplete: {info}")
+        assert info["reason"] == "已按总数翻完", info
+
+    def test_exactly_expected_total_is_complete(self):
+        """恰好 ``len(out) == expected_total`` -> complete=True（回归保护）。"""
+        f = _paging_fetcher(total=CLIST_TOTAL)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        assert len(quotes) == info["returned"] == info["expected_total"] == CLIST_TOTAL
+        assert info["complete"] is True, info
+        # shortfall 是本次新加的诊断字段；用 get 以便回退验牙时本用例仍能通过
+        assert info.get("shortfall", 0) == 0, info
+
+    def test_one_row_below_expected_total_is_incomplete(self):
+        """只少 1 行（``len(out) == expected_total - 1``）-> complete=False。
+
+        页数轴完全正常（60 页、无失败、无截断），只把末页最后一行丢掉 ——
+        证明判据确实是「不少于」，而不是只看页数。
+        """
+        def responder(url: str):
+            pn = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["pn"][0])
+            start = (pn - 1) * 100
+            n = max(0, min(100, CLIST_TOTAL - start))
+            rows = [_row(f"{600000 + start + i}") for i in range(n)]
+            if pn == 60:
+                rows = rows[:-1]                     # 恰好少 1 行
+            return _payload(CLIST_TOTAL, rows)
+
+        f = FakeFetcher(responder)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        assert info["required_pages"] == 60 <= info["max_pages"]
+        assert info["truncated"] is False and info["pages_failed"] == 0
+        assert len(quotes) == CLIST_TOTAL - 1 == 5912
+        assert info["complete"] is False, (
+            f"少 1 行也是不完整（判据是「不少于」）: {info}")
+        assert info["shortfall"] == 1, info
+        assert "行数缩水" in (info["reason"] or ""), info
+
+
+# ==========================================================================
+# 6. 配置与既有契约不被破坏
 # ==========================================================================
 class TestConfigContractUnchanged:
     def test_max_pages_default_is_still_80(self):

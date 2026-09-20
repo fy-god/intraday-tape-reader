@@ -160,7 +160,12 @@ def make_round_sample(
         out["admitted"] = _safe_int(obs.get("admitted"))
         out["coverage"] = _safe_float(obs.get("coverage"))
         out["source"] = str(obs.get("source") or "")
-        out["future_rejected"] = _safe_int(obs.get("stale_rejected"))
+        # 优先读新名 future_rejected；旧名 stale_rejected 为兼容保留
+        # （IT-P1-OBS-006：旧名语义相反，曾把"未来拒绝"叫成"陈旧拒绝"）。
+        fr = obs.get("future_rejected")
+        if fr is None:
+            fr = obs.get("stale_rejected")
+        out["future_rejected"] = _safe_int(fr)
         out["out_of_order_rejected"] = _safe_int(obs.get("out_of_order_rejected"))
         missing = obs.get("unknown_missing")
         out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
@@ -169,6 +174,13 @@ def make_round_sample(
         out["unavailable_capability"] = _safe_int(obs.get("unavailable_capability"))
         caps = obs.get("capabilities")
         out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
+        # IT-P1-OBS-007：把"哪只票缺什么"带出 Store
+        sample = obs.get("unavailable_sample")
+        out["unavailable_sample"] = (
+            list(sample)[:5] if isinstance(sample, (list, tuple)) else [])
+        reasons = obs.get("unavailable_by_reason")
+        out["unavailable_by_reason"] = (
+            dict(reasons) if isinstance(reasons, dict) else {})
     return out
 
 

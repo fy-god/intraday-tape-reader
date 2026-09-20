@@ -324,6 +324,13 @@ class EastmoneySource:
         部分池会被当成全市场 5913 只。截断不抛异常（调用方依赖部分数据继续
         跑），但事实通过 ``truncated`` / ``required_pages`` / ``max_pages``
         显式暴露在 ``universe_info()`` 里。
+
+        行数缩水（IT-P1-COMPLETE-001）：仅看页数**不够** —— 页数够但每页内容
+        缩水（服务端限流/降级、边界重叠去重）时，拿到的 ``len(out)`` 会远低于
+        ``expected_total``。故 ``complete`` 还要求 ``len(out) >= expected_total``。
+        判据是「不少于」而非「等于」：翻页边界重叠会让 ``len(out)`` 略高于
+        ``expected_total``（实测 5913 只 -> 6000 行），这是**正常**的上界重叠，
+        不能因此判 incomplete。
         """
         seq = self._next_seq()
         failed: list[int] = []
@@ -365,11 +372,28 @@ class EastmoneySource:
             # 没有 total 就没有「应该有多少只」的基准，无法证明完整。
             reason = "接口未返回总数，只能顺序探测，无法确认是否翻完"
         out = _dedupe(quotes)
+        # IT-P1-COMPLETE-001：页数够 **不代表** 行数够。服务端限流/降级时每页
+        # 只回几行，或边界大量重叠被去重后，len(out) 会远低于 expected_total，
+        # 而此前 complete 只看「有总数 + 无失败页 + 未截断」，于是 600 行
+        # （全市场的 10.1%）被当成完整全市场采用（engine.py 的 complete 门控）。
+        #
+        # 判据用「不少于」而非「等于」：翻页边界重叠会让 len(out) 略高于
+        # expected_total（实测 total=5913、60 页 x 100 行 -> 6000 行），这是
+        # **正常的上界重叠**，绝不能因此判 incomplete。
+        shortfall = 0
+        if expected_total > 0 and len(out) < expected_total:
+            shortfall = expected_total - len(out)
+            cover = len(out) / expected_total
+            shrink = (f"行数缩水：实际只拿到 {len(out)} 行 < 总数 {expected_total} "
+                      f"（缺 {shortfall} 行，覆盖 {cover:.1%}）")
+            reason = f"{reason}；{shrink}" if reason else shrink
         err = f"clist {len(failed)} 页失败: {failed[:5]}" if failed else ""
         # IT-P1-006-R1：截断 (truncated) 与失败页一样，都不能算完整。
-        # 没有 total 时 required_pages=0/truncated=False，complete 仍由
-        # bool(total > 0) 决定为 False（无法证明完整），语义不变。
-        complete = bool(total > 0) and not failed and not truncated
+        # 没有 total 时 required_pages=0/truncated=False/expected_total=0，
+        # shortfall 恒为 0，complete 仍由 bool(total > 0) 决定为 False
+        # （没有基准即无法证明完整），既有语义不变。
+        complete = (bool(total > 0) and not failed and not truncated
+                    and shortfall == 0)
         with self._lock:
             self._last_universe = {
                 "complete": complete,
@@ -381,6 +405,8 @@ class EastmoneySource:
                 "max_pages": self.max_pages,
                 "expected_total": expected_total,
                 "returned": len(out),
+                # 少于 expected_total 的行数（0 = 未缩水）；> 0 时 complete 恒为 False
+                "shortfall": shortfall,
                 "reason": reason or "已按总数翻完",
             }
         self._finish(err, out)
