@@ -1,11 +1,76 @@
 # 最新审计
 
+**最新本地 Agent 轮（本轮）**：[`2026-09-21_01-40-00_JST.md`](./2026-09-21_01-40-00_JST.md)  
 **最新云端独立审计**：[`2026-09-21_00-14-53_JST.md`](./2026-09-21_00-14-53_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-21_00-14-53_JST_AGENT_TASK.md`](./2026-09-21_00-14-53_JST_AGENT_TASK.md)  
-**最新本地 Agent 轮**：[`2026-09-20_21-49-29_JST.md`](./2026-09-20_21-49-29_JST.md)  
+**上一份本地 Agent 轮**：[`2026-09-20_21-49-29_JST.md`](./2026-09-20_21-49-29_JST.md)  
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)  
 当前被审产品提交：[`e729c1f`](https://github.com/fy-god/intraday-tape-reader/commit/e729c1f0bd3d6754e00dba0574a25b01a65b6c58)  
+
+---
+
+## 2026-09-21 01:40 JST 本地 Agent 轮（本轮）
+
+- 被审源码：`e729c1f0bd3d6754e00dba0574a25b01a65b6c58`；tree `0032d5d13505d148ebdab3bd4d52efd5924b7c66`。
+  **这是上轮审计点 `32acc32` 之后唯一的源码提交**（19 个源码/测试文件，源码 +2975/−188）。
+- **我方独立复跑的真数（只读冻结树 `asr-h00` @`e729c1f`）**：
+  `python -m pytest -o addopts="" -p no:cacheprovider --ignore=reference -q`
+  → **`1430 passed in 73.34s`，exit 0**；**9/9 门禁全绿**
+  （`check_audit_shots/bom/colors/config_consumed/config_wiring/orphan_config/readme_tools/spirit_mapping`
+  8 个 `.py` + `dash_render_check.js`，全部 exit 0）。
+  → 上一份云端报告自陈「1430 passed / 9/9 门禁……**未独立复跑**」，我方复跑**确认这两个数字为真**。
+- **本轮主结论：`00:14` 云端报告的 5 项新登记，我逐条独立复现，全部成立且行号精确。**
+  - `IT-P1-CAPABILITY-003`（**仍 OPEN**）：`capabilities.py:227-229`
+    `unavailable_capability = len(unavailable_codes)`；`live_session.py:419-423` 只要
+    `n > 0` 就把整轮计入 `unavailable_rounds`；`:502-503` 用
+    `unavailable_rounds / obs_rounds` 当比例；`:104` 阈值 `unavailable_fail_ratio = 1.0`；
+    `:817/830/844-845` 判红并输出「整类规则在这整场 soak 里一次都没被评估过」。
+    **我用真实 `summarize_rounds`→`finalize_metrics`→`evaluate_health` 复现**：
+    20 轮 × 5000 code × 每轮 1 个 code 缺失 → `capability_unavailable_ratio = 1.0`
+    → capability 项 **fail**，文案含「整类规则…一次都没被评估过」，
+    而真实按 code 可评估比例是 **4999/5000 = 99.98%**。**分母错误已确认。**
+  - `IT-P1-CAPABILITY-004`（**仍 OPEN**）：`spirit_order.py` 全文件
+    **`ctx.provides(...)` / `ObservationDecision` 0 命中**；`:547/564` 只传
+    `q.bid_vols/q.ask_vols`，`:643` 只遍历传入的 vols；`sina.py:224-225` 只填单档
+    `bid_vol/ask_vol` 而**不填** `bid_vols/ask_vols`（`models.py:171-177`）。
+    **我实测真实 `_best_order`**：同样 1000 万股挂单，五档形状命中、Sina 形状恒 `None`
+    → Sina 下 `institution_buy/sell` 实际不可评估，且**不留 ledger 记录**。
+  - `IT-P1-CAPABILITY-002`（**仍 OPEN**）：`provides(key)` 仍单参，capability 仍 round-global。
+  - `IT-P1-SOURCE-EMPTY-001`（**仍 OPEN**）：`engine.py:563-571` `SourceManager.call()`
+    仍只按「有没有抛异常」判成功，无 requested/returned 差集。
+  - `IT-P1-WINDOW-001`（**仍 OPEN**）：`engine.py:313` history 仍只在
+    「价变或量变」时 append（水位线已在 `:316` 解耦，那部分确实修好了）。
+  - `IT-P2-OBS-STATUS-001`（**本轮新登记 · OPEN**）：`store.py:221-245` 的 `status()`
+    返回 `observation` 但**不含** `observation_seq`（该属性在 `store.py:155` 存在却未暴露），
+    且顶层 `ts` 是当前墙钟 → 外部消费者可能拿旧账当本轮。
+- **已修项我也抽样独立复核，全部为真**：`IT-P1-TIME-ROLE-004`（`engine.py:118`
+  已改为 route 键控 dict）、`IT-P1-TIME-ROLE-003-R1`（`:392-395` 按 route 清 first_seen 分账）、
+  `IT-P1-COMPLETE-001-R1`（`eastmoney.py:375-391/459-472` 传输轴 `raw_unique_codes` vs
+  可用轴 `usable_coverage` 诊断，双账确实分离）、`IT-P1-LIMIT-001`（`limit_board.py:210-219`）、
+  `IT-P2-LIMIT-FIRST-BOARD-MULTI`（`:109/137-150` 平行 `meta` 回滚）。
+  **我对 LIMIT-FIRST-BOARD-MULTI 做了端到端实测**：3 票同轮达标 + `max_per_round=2`
+  → 第 1 轮报 2 条且第 3 只**状态被回滚**，第 2 轮**补报成功**
+  （对照 `21:49` 报告记录的修复前「第 2 轮 0 条 = 永久丢失」）→ **修复确实有效**。
+- **`00:14` 报告的诚实性**：`:10/:11/:12/:586-592` 明确标注了
+  `blocked_no_checkout`、`not_run`、`unavailable`，并声明 1430/9 门禁**未独立复跑**；
+  `:38` 主动停止叠加不可复现的 synthetic 数字。**未发现把要求冒充成绩。**
+  其 `predictions_v6.csv`「不可回溯」的判定我也证实：
+  `git log --all -S 'predictions_v6'` 的 7 处命中**全部只改 `docs/audits/` Markdown**，
+  `--diff-filter=AMD -- '*predictions_v6.csv'` **0 命中** → 该文件从未被提交。
+- **当前 OPEN 合计 7 条**：`CAPABILITY-002/003/004`、`SOURCE-EMPTY-001`、`WINDOW-001`、
+  `008/009/003`（SSE durable replay 等）、`IT-P2-OBS-STATUS-001`。
+- **三个只读子 agent 本轮全部未能完成**（A 误判「冻结树被并发写者改动」，
+  实为**主工作树**被改动；B、D 未产出报告），故**全部不采信**；
+  本报告每条结论均由主 agent 亲自用真实命令在冻结树内复现。
+- **并发写者（只读观察，未触碰）**：主工作树 `D:\ccc\ashare-radar` 出现
+  ` M src/arad/capabilities.py`、` M src/arad/rules/volume_burst.py`、` M src/arad/store.py`、
+  ` M tests/test_capabilities.py`、`?? tests/test_signal_evaluability.py`、
+  `?? tests/test_signal_evaluability_teeth.py`（约 +322/−5）。
+  其新增用例名（如 `test_one_blocked_in_five_thousand_is_not_whole_class_zero`）
+  显示 `00:14` 报告的 **WP01 正在实现中** —— **我方未评审、未改动、未提交**。
+- 本轮**未**改任何产品源码/配置/权重/Actions/PR；**未**动任何定时任务。
+  （以上计数与 SHA 属本次复核，**不**认证历史报告中未经我复跑的结论。）
 
 ---
 
