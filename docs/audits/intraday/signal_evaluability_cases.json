@@ -1,0 +1,174 @@
+{
+  "_artifact": "signal_evaluability_cases.json",
+  "_finding": "IT-P1-CAPABILITY-003",
+  "_round": "2026-09-21_00-52_JST",
+  "_evidence_class": "SOFTWARE_SAMPLE",
+  "_note": "全部数字由真实产品函数产出（tools/live_session.py 的 summarize_rounds / finalize_metrics / evaluate_health，以及 src/arad/capabilities.py 的 RoundObservationSet），不是手写复刻。可复跑脚本见 _repro_script。",
+  "_repro_script": "%TEMP%\\repro_cap003.py",
+  "_reviewed_source_sha_before": "ffabc5723846479fa5ec3fc1a9503ad646b3b6b1",
+
+  "cases": [
+    {
+      "id": "CAP003-CASE-1",
+      "name": "5000 码 1 blocked × 20 轮 —— 审计原文反例",
+      "input": {
+        "rounds": 20,
+        "codes_per_round": 5000,
+        "blocked_per_round": 1,
+        "blocked_reason": "turnover_not_provided",
+        "signal": "volume_burst"
+      },
+      "true_code_level_evaluability": 0.9998,
+      "before_fix": {
+        "capability_unavailable_rounds": 20,
+        "capability_unavailable_total": 20,
+        "capability_unavailable_ratio": 1.0,
+        "capability_level": "fail",
+        "capability_ok": false,
+        "healthy": false,
+        "exit_code": 1,
+        "detail_claimed": "整类规则在这整场 soak 里一次都没被评估过",
+        "verdict": "WRONG —— 99.98% 可评估被判成 0%"
+      },
+      "after_fix": {
+        "signal_evaluability_rounds": 20,
+        "evaluability_considered_total": 100000,
+        "evaluability_evaluable_total": 99980,
+        "evaluability_blocked_total": 20,
+        "overall_evaluable_coverage": 0.9998,
+        "volume_burst_evaluable_coverage": 0.9998,
+        "capability_level": "ok",
+        "capability_ok": true,
+        "healthy": true,
+        "exit_code": 0,
+        "old_ratio_retained_as_diagnostic": 1.0
+      },
+      "acceptance": "PASS —— 不得被判 evaluable_coverage = 0；实测 0.9998 且 ok/exit 0",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_one_blocked_in_five_thousand_is_not_fail"
+    },
+    {
+      "id": "CAP003-CASE-2",
+      "name": "单 signal 全部 code 被 blocked —— 唯一允许 whole-class FAIL 的形状",
+      "input": {
+        "rounds": 4,
+        "signal": "volume_burst",
+        "considered_per_round": 100,
+        "evaluable_per_round": 0,
+        "blocked_per_round": 100
+      },
+      "after_fix": {
+        "capability_level": "fail",
+        "capability_ok": false,
+        "healthy": false,
+        "exit_code": 1,
+        "detail_contains": ["volume_burst", "一次都没被评估过"]
+      },
+      "acceptance": "PASS —— 全部 code 阻断时才允许 FAIL",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_all_blocked_signal_is_the_only_fail"
+    },
+    {
+      "id": "CAP003-CASE-3",
+      "name": "样本不足（considered < 200）时全阻断只到 warn，不判 fail",
+      "input": {
+        "rounds": 2,
+        "signal": "spirit_order.big_bid_wall",
+        "considered_total": 6,
+        "evaluable": 0
+      },
+      "after_fix": {
+        "capability_level": "warn",
+        "capability_ok": true,
+        "reason": "evaluability_min_samples = 200，样本不足不升级为 fail"
+      },
+      "acceptance": "PASS —— 不拿噪声定罪",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_small_sample_all_blocked_is_warn_not_fail"
+    },
+    {
+      "id": "CAP003-CASE-4",
+      "name": "considered == 0 的 signal 必须跳过（not_measured），不得当 0%",
+      "input": {"signal": "never_ran", "considered": 0, "evaluable": 0},
+      "after_fix": {"capability_level": "ok"},
+      "acceptance": "PASS —— 没有分母就没有结论",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_per_signal_not_measured_is_skipped_not_zero"
+    },
+    {
+      "id": "CAP003-CASE-5",
+      "name": "advisory（可跳过的缺失）不得参与判定",
+      "input": {
+        "signal": "volume_burst",
+        "considered": 5000,
+        "evaluable": 5000,
+        "blocked_capability": 0,
+        "advisory_missing": 5000
+      },
+      "after_fix": {"capability_level": "ok"},
+      "acceptance": "PASS —— 少判一项 ≠ 整类不可评估",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_advisory_missing_does_not_drive_capability_red"
+    },
+    {
+      "id": "CAP003-CASE-6",
+      "name": "旧报告（无逐 signal 数据）退回旧口径但只到 warn",
+      "input": {"rounds": 4, "unavailable_capability": 7, "signal_evaluability": "absent"},
+      "after_fix": {
+        "capability_level": "warn",
+        "capability_ok": true,
+        "healthy": true,
+        "exit_code": 0
+      },
+      "acceptance": "PASS —— 历史报告继续可见但不拿它定罪（分母是轮，不足以支撑整类结论）",
+      "test": "tests/test_live_session_observation.py::TestObservationHealth::test_capability_whole_class_unavailable_is_not_green"
+    }
+  ],
+
+  "blocking_vs_advisory_semantics": {
+    "_finding": "IT-P1-CAPABILITY-003 的语义混淆部分",
+    "volume_burst": {
+      "turnover": {
+        "state": "BLOCKING",
+        "trigger": "min_turnover > 0 且 ctx.provides('turnover') 为假",
+        "mechanism": "q.turnover 读到占位 0.0，必然 < min_turnover，该票在门槛处 continue，判据不完整",
+        "effect": "进 blocked_capability / unavailable_codes，进 considered 分母但不进 evaluable",
+        "test": "tests/test_signal_evaluability_teeth.py::test_turnover_missing_still_counted_unavailable"
+      },
+      "volume_ratio": {
+        "state": "ADVISORY",
+        "trigger": "vr_thr > 0 且 ctx.provides('volume_ratio') 为假",
+        "mechanism": "vr 读到占位 0.0，vr > vr_thr 为假 → 量比门槛被**跳过**，速度/金额条件仍生效，规则仍可命中",
+        "effect": "只加 advisory_missing，**不进** unavailable_codes；该票仍进 evaluable",
+        "test": "tests/test_signal_evaluability_teeth.py::test_advisory_missing_is_not_counted_as_capability_unavailable",
+        "_verified_by": "同一票在缺 volume_ratio 时实测产出 1 条 alert（不是 0）"
+      }
+    }
+  },
+
+  "new_ledger_fields": {
+    "_source": "src/arad/capabilities.py SignalEvalStats",
+    "fields": ["considered", "evaluable", "blocked_capability", "advisory_missing",
+               "evaluated_no_hit", "hit_candidates", "published",
+               "blocked_reasons", "blocked_sample"],
+    "derived": {
+      "evaluable_coverage": "evaluable / considered；considered <= 0 时返回 None（not_measured），**不是** 0.0"
+    },
+    "mechanical_invariants": [
+      "evaluable + blocked_capability == considered",
+      "evaluated_no_hit + hit_candidates == evaluable",
+      "published <= hit_candidates",
+      "advisory_missing <= evaluable"
+    ],
+    "enforced_by": "RoundObservationSet.check_signal_invariants() -> list[str]"
+  },
+
+  "deprecation": {
+    "field": "unavailable_capability",
+    "new_status": "诊断量，**不再**作为 whole-class health 真值",
+    "still_present_for_back_compat": true,
+    "marker": "as_dict()['_deprecated']['unavailable_capability']",
+    "reason": "一个标量同时承载 blocking 与 advisory 两种互斥语义，必然污染 health"
+  },
+
+  "not_verified": [
+    "真实盘中 provider 行为下的可评估率 —— 无 data/、无多日语料，全部数字为离线可复现反例（SOFTWARE_SAMPLE）",
+    "真实交易时段的 alert 触发率 / 漏报率 —— unavailable",
+    "spirit_order 的逐 pattern 可评估率 —— 见 spirit_order_provider_matrix.json（另一工作包）"
+  ]
+}

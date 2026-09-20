@@ -410,16 +410,141 @@ class TestObservationHealth:
         assert "coverage" in v["fail"]
 
     def test_capability_whole_class_unavailable_is_not_green(self):
-        """红测核心 3：所有轮 unavailable_capability > 0 -> 显式变黄/红。"""
+        """红测核心 3：轮级 unavailable 数据 -> 至少变黄，不得全绿。
+
+        **WP03 / IT-P1-CAPABILITY-003 语义修正**：本条以前断言
+        ``level == "fail"``。改为 ``warn`` 是**故意的**，理由是分母：
+        这些轮样本只有轮级的 ``unavailable_capability``，**没有逐 signal 的
+        ``considered``/``evaluable``**。用"这一轮里出现过缺失"去推
+        "整类规则一次都没被评估过"是不成立的推论 —— 5000 只票里坏 1 只也是
+        "出现过缺失"。旧口径分母是**轮**，而结论要的是**标的**级事实。
+
+        所以：没有逐 signal 数据时，旧口径仍**可见**（黄），但不拿它定罪。
+        真正的 fail 形状由下面
+        ``test_all_blocked_signal_is_the_only_fail`` 用逐 signal 数据钉住。
+        **这不是为了让测试变绿而放宽断言，而是修正断言所依据的分母。**
+        """
         rows = [_obs_round(i + 1, coverage=1.0, unavailable_capability=7)
                 for i in range(4)]
         v = ls.evaluate_health(_healthy_metrics(rows))
         cap = _check(v, "capability")
-        # 每一轮都不可评估 = 整类规则一次都没被验证过 -> fail
+        assert cap["level"] == "warn", "轮级缺失只到黄，不足以判死"
+        assert cap["ok"] is True
+        assert v["healthy"] is True and v["exit_code"] == 0
+        assert "能力缺失" in cap["detail"] or "旧口径" in cap["detail"]
+
+    def test_all_blocked_signal_is_the_only_fail(self):
+        """**新判据的核心**：某 signal 的 considered 全被判 blocked -> fail。
+
+        这才是"整类规则在这整场 soak 里一次都没被评估过"唯一站得住的证据。
+        """
+        rows = [_obs_round(i + 1, coverage=1.0,
+                           signal_evaluability={
+                               "volume_burst": {
+                                   "considered": 100, "evaluable": 0,
+                                   "blocked_capability": 100,
+                                   "advisory_missing": 0, "hit_candidates": 0,
+                                   "published": 0,
+                                   "blocked_reasons": {"turnover_not_provided": 100},
+                               }})
+                for i in range(4)]
+        v = ls.evaluate_health(_healthy_metrics(rows))
+        cap = _check(v, "capability")
         assert cap["level"] == "fail"
         assert cap["ok"] is False
         assert v["healthy"] is False and v["exit_code"] == 1
-        assert "能力缺失" in cap["detail"]
+        assert "volume_burst" in cap["detail"]
+        assert "一次都没被评估过" in cap["detail"]
+
+    def test_one_blocked_in_five_thousand_is_not_fail(self):
+        """**审计原文的核心反例**：5000 码里 1 个 blocked 绝不判死。
+
+        真实可评估率 4999/5000 = 99.98%。旧口径（轮级）会给出 ratio 1.0 并
+        判 whole-class FAIL —— 本场 soak 里每轮都"出现过缺失"。新口径按标的
+        算，99.98% 远在 warn 门槛 95% 之上 -> ok。
+
+        这条直接对应 IT-P1-CAPABILITY-003 的量化证据。
+        """
+        rows = [_obs_round(i + 1, coverage=1.0,
+                           signal_evaluability={
+                               "volume_burst": {
+                                   "considered": 5000, "evaluable": 4999,
+                                   "blocked_capability": 1,
+                                   "advisory_missing": 0, "hit_candidates": 3,
+                                   "published": 3,
+                                   "blocked_reasons": {"turnover_not_provided": 1},
+                               }})
+                for i in range(4)]
+        v = ls.evaluate_health(_healthy_metrics(rows))
+        cap = _check(v, "capability")
+        assert cap["level"] == "ok", (
+            f"5000 里坏 1 个不得判死，实际 {cap['level']}：{cap['detail']}")
+        assert cap["ok"] is True
+        assert v["healthy"] is True
+        assert "99.9" in cap["detail"], f"明细应显示 ~99.98%：{cap['detail']}"
+
+    def test_small_sample_all_blocked_is_warn_not_fail(self):
+        """样本不足时**最多到黄** —— 不拿噪声定罪。
+
+        3 只票的 signal 全被阻断，样本量 < ``evaluability_min_samples``(200)。
+        判红等于把"这次只测了 3 只"当成"整类规则废了"。
+        """
+        rows = [_obs_round(i + 1, coverage=1.0,
+                           signal_evaluability={
+                               "spirit_order.big_bid_wall": {
+                                   "considered": 3, "evaluable": 0,
+                                   "blocked_capability": 3,
+                                   "advisory_missing": 0, "hit_candidates": 0,
+                                   "published": 0,
+                                   "blocked_reasons": {"depth_l5_not_provided": 3},
+                               }})
+                for i in range(2)]
+        v = ls.evaluate_health(_healthy_metrics(rows))
+        cap = _check(v, "capability")
+        assert cap["level"] == "warn", (
+            f"3 个样本全阻断不足以判死，实际 {cap['level']}")
+        assert cap["ok"] is True
+
+    def test_per_signal_not_measured_is_skipped_not_zero(self):
+        """``considered == 0`` 的 signal 必须**跳过**，不能当 0% 判死。
+
+        没有分母就没有结论 —— 填 0 会把"这一项没测"误报成"整类失效"，
+        与旧缺陷同源的错误。
+        """
+        rows = [_obs_round(i + 1, coverage=1.0,
+                           signal_evaluability={
+                               "never_ran": {
+                                   "considered": 0, "evaluable": 0,
+                                   "blocked_capability": 0,
+                                   "advisory_missing": 0, "hit_candidates": 0,
+                                   "published": 0, "blocked_reasons": {},
+                               }})
+                for i in range(3)]
+        v = ls.evaluate_health(_healthy_metrics(rows))
+        cap = _check(v, "capability")
+        assert cap["level"] == "ok", f"无分母不得判死：{cap['detail']}"
+
+    def test_advisory_missing_does_not_drive_capability_red(self):
+        """advisory（可跳过的缺失）不得参与判定 —— 这正是语义混淆的修复点。
+
+        缺 ``volume_ratio`` 时规则仍能命中，该票是可评估的。若把 advisory
+        算进 blocked，就会重现"少判一项 = 整类不可评估"的老毛病。
+        """
+        rows = [_obs_round(i + 1, coverage=1.0,
+                           signal_evaluability={
+                               "volume_burst": {
+                                   "considered": 5000, "evaluable": 5000,
+                                   "blocked_capability": 0,
+                                   "advisory_missing": 5000,
+                                   "hit_candidates": 7, "published": 7,
+                                   "blocked_reasons": {
+                                       "advisory/vr_threshold_skipped:volume_ratio": 5000},
+                               }})
+                for i in range(3)]
+        v = ls.evaluate_health(_healthy_metrics(rows))
+        cap = _check(v, "capability")
+        assert cap["level"] == "ok", (
+            f"advisory 不是阻断，不得把它算成不可评估：{cap['detail']}")
 
     def test_capability_partial_is_warn_not_fail(self):
         """部分轮不可评估：变黄但不判死（退出码仍 0）。"""
@@ -486,10 +611,18 @@ class TestObservationHealth:
         assert v["healthy"] is True, "98.5% 是正常抖动，不能被 100% 门槛打死"
 
     def test_unavailable_thresholds_configurable(self):
+        """旧口径阈值仍可配置（作为诊断量），但**不再能判 fail**。
+
+        **WP03 语义修正**：本条以前断言默认档 -> ``fail``、松档 -> ``ok``。
+        现在轮级口径最高只到 ``warn``（分母不足以支撑"整类没评估"的强结论），
+        所以默认档给 ``warn``，松档给 ``ok``。判定是否 fail 改由逐 signal 的
+        ``evaluability_*`` 阈值决定 —— 见
+        ``test_all_blocked_signal_is_the_only_fail``。
+        """
         rows = [_obs_round(i + 1, coverage=1.0, unavailable_capability=1)
                 for i in range(4)]
         m = _healthy_metrics(rows)
-        assert _check(ls.evaluate_health(m), "capability")["level"] == "fail"
+        assert _check(ls.evaluate_health(m), "capability")["level"] == "warn"
         loose = ls.evaluate_health(m, tolerances={
             "unavailable_warn_ratio": 1.5, "unavailable_fail_ratio": 2.0})
         assert _check(loose, "capability")["level"] == "ok"

@@ -30,8 +30,24 @@ __all__ = [
     "CAPABILITY_TABLE",
     "capabilities_for",
     "ObservationDecision",
+    "SignalEvalStats",
     "RoundObservationSet",
+    # WP01 / IT-P1-CAPABILITY-003：缺失的三种语义
+    "BLOCKING",
+    "ADVISORY",
+    "NOT_REQUIRED",
 ]
+
+#: 缺失导致该 signal **不能评估**。必须进 blocked 分母。
+BLOCKING = "blocking"
+#: 当前规则语义**允许跳过**该条件，signal 仍可评估（只是判据少了一项）。
+#: 绝不能与 BLOCKING 混为一谈 —— 这正是 IT-P1-CAPABILITY-003 的核心。
+ADVISORY = "advisory"
+#: 本 signal 根本不需要该 capability。既不进 evaluable 也不进 blocked。
+NOT_REQUIRED = "not_required"
+
+#: ``as_dict()`` 里每个 signal 最多导出多少条 blocked 样本（防止全市场载荷无界）。
+_BLOCKED_SAMPLE_CAP = 20
 
 # 参与 capability 判定的字段名。顺序即展示顺序。
 CAPABILITY_KEYS: tuple[str, ...] = (
@@ -153,6 +169,109 @@ class ObservationDecision:
 
 
 @dataclass(slots=True)
+class SignalEvalStats:
+    """单条 signal 的**逐 code 可评估性**账本（WP01 / IT-P1-CAPABILITY-003）。
+
+    为什么必须有它 —— 旧口径 ``unavailable_capability = len(unavailable_codes)``
+    是**所有规则写入的 code 集合并集**，随后 ``live_session`` 用
+    "本轮是否有任意一个 unavailable code" 算 round ratio，并在 ratio=1 时
+    解释成"整类规则整场都没被评估"。这在语义上不成立：
+
+    * 5000 码里每轮只坏 1 个 → 真实可评估率 99.98%，旧口径却得 ratio=1.0
+      并报 **whole-class FAIL**。分母错了，不是阈值高低的问题。
+    * ``unavailable_capability`` 同时承载**硬阻断**（缺 turnover 且
+      ``min_turnover>0``，该票真的不能判）与**可跳过的缺失**（缺
+      ``volume_ratio`` 时 ``vr>0`` 为假即跳过门槛，规则**仍可能命中**）。
+      一个状态名两种语义，必然污染 health。
+
+    因此这里按 **signal**（不是 rule，也不是 round）建立账本，并把缺失拆成
+    三种：:data:`BLOCKING` / :data:`ADVISORY` / :data:`NOT_REQUIRED`。
+
+    **机械不变量**（由 ``check_invariants()`` 断言，测试逐条钉住）::
+
+        evaluable + blocked_capability == considered
+        evaluated_no_hit + hit_candidates == evaluable
+        published <= hit_candidates
+    """
+
+    signal: str = ""
+    #: 进入该 signal 判据的标的数（已排除停牌/无价这类前置不合格的）。
+    considered: int = 0
+    #: 判据完整、真的评估过的。
+    evaluable: int = 0
+    #: 因 capability 缺失而**无法**评估的。
+    blocked_capability: int = 0
+    #: 缺失了某项、但当前语义允许跳过，**仍在 evaluable 里**。
+    #: 这是 ``blocked_capability`` 的补集的一部分，不是它的子集。
+    advisory_missing: int = 0
+    #: 评估了、没到门槛。
+    evaluated_no_hit: int = 0
+    #: 评估了、到门槛了（候选命中）。
+    hit_candidates: int = 0
+    #: 其中真的发出去的告警数。``hit_candidates - published`` 就是被
+    #: ``max_per_round`` / AlertBus 冷却截掉的量 —— 必须与
+    #: ``evaluated_no_hit`` 区分，否则"被截断"会被读成"没命中"。
+    published: int = 0
+    #: {原因: 次数}，例如 ``{"turnover_not_provided": 3}``。
+    blocked_reasons: dict[str, int] = field(default_factory=dict)
+    #: 有界样本（最多 :data:`_BLOCKED_SAMPLE_CAP` 条）。
+    blocked_sample: list[dict] = field(default_factory=list)
+
+    @property
+    def evaluable_coverage(self) -> float | None:
+        """``evaluable / considered``；**没有分母时返回 None，不返回 0.0**。
+
+        这是刻意的：``not_measured`` 与 "0% 可评估" 是完全不同的结论，
+        填 0 会把"没测"误报成"整类失效"。
+        """
+        if self.considered <= 0:
+            return None
+        return self.evaluable / self.considered
+
+    def check_invariants(self) -> list[str]:
+        """返回违反的机械不变量列表（空 = 全部成立）。"""
+        bad: list[str] = []
+        if self.evaluable + self.blocked_capability != self.considered:
+            bad.append(
+                f"{self.signal}: evaluable({self.evaluable}) + "
+                f"blocked_capability({self.blocked_capability}) != "
+                f"considered({self.considered})")
+        if self.evaluated_no_hit + self.hit_candidates != self.evaluable:
+            bad.append(
+                f"{self.signal}: evaluated_no_hit({self.evaluated_no_hit}) + "
+                f"hit_candidates({self.hit_candidates}) != "
+                f"evaluable({self.evaluable})")
+        if self.published > self.hit_candidates:
+            bad.append(
+                f"{self.signal}: published({self.published}) > "
+                f"hit_candidates({self.hit_candidates})")
+        if self.advisory_missing > self.evaluable:
+            bad.append(
+                f"{self.signal}: advisory_missing({self.advisory_missing}) > "
+                f"evaluable({self.evaluable})")
+        return bad
+
+    def as_dict(self) -> dict[str, Any]:
+        cov = self.evaluable_coverage
+        return {
+            "signal": self.signal,
+            "considered": self.considered,
+            "evaluable": self.evaluable,
+            "blocked_capability": self.blocked_capability,
+            "advisory_missing": self.advisory_missing,
+            "evaluated_no_hit": self.evaluated_no_hit,
+            "hit_candidates": self.hit_candidates,
+            "published": self.published,
+            # None 表示 not_measured；不要用 0.0 冒充"整类失效"。
+            "evaluable_coverage": (round(cov, 4) if cov is not None else None),
+            "blocked_reasons": dict(self.blocked_reasons),
+            "blocked_sample": list(self.blocked_sample[:_BLOCKED_SAMPLE_CAP]),
+            "blocked_sample_truncated":
+                len(self.blocked_sample) > _BLOCKED_SAMPLE_CAP,
+        }
+
+
+@dataclass(slots=True)
 class RoundObservationSet:
     """一轮观测的完整账本（requested / returned / admitted / 各拒绝原因）。
 
@@ -222,6 +341,127 @@ class RoundObservationSet:
     # 覆盖率数字就失真了。decisions 里仍逐 (code, field) 留明细。
     unavailable_codes: set[str] = field(default_factory=set)
     decisions: list[ObservationDecision] = field(default_factory=list)
+    #: WP01 / IT-P1-CAPABILITY-003：逐 **signal** 的可评估性账本。
+    #:
+    #: 键的形状是 ``signal_key``（如 ``volume_burst``、
+    #: ``spirit_order:institution_buy``），不是 rule 名也不是轮号 ——
+    #: 只有到 signal 粒度才可能回答"这条规则到底有没有被验证过"。
+    signal_evals: dict[str, SignalEvalStats] = field(default_factory=dict)
+    #: 逐 signal 的"已考虑" code 集合，用于**去重** counting。
+    #:
+    #: 为什么需要：``evaluate()`` 可能对同一 code 在一轮里被调用多次（多份
+    #: snapshot/多次边沿检查），重复 mark 会把 ``considered`` 放大到超过真实
+    #: 标的数，机械不变量就假成立了。这里只保留**本轮内**的成员，随
+    #: RoundObservationSet 一起被替换，故不会无界增长。
+    _seen_codes: dict[str, set[str]] = field(default_factory=dict)
+    #: 逐 signal 的"已落桶" code 集合（blocked 或 evaluated，二者互斥）。
+    #:
+    #: 与 ``_seen_codes`` **必须分开**：先 ``mark_considered`` 再
+    #: ``mark_evaluated`` 是完全合法的调用序列（规则先登记、再判定），
+    #: 若让 ``mark_evaluated`` 依赖 ``mark_considered`` 的返回值提前返回，
+    #: 该票就永远进不了 evaluable —— ``considered`` 与
+    #: ``evaluable+blocked`` 的不变量随即破裂。
+    _final_codes: dict[str, set[str]] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------
+    # WP01 记账 API（有界：只存计数 + 少量样本）
+    # ------------------------------------------------------------------
+    def eval_stats(self, signal: str) -> SignalEvalStats:
+        """取（必要时新建）某 signal 的账本。"""
+        key = str(signal or "")
+        st = self.signal_evals.get(key)
+        if st is None:
+            st = SignalEvalStats(signal=key)
+            self.signal_evals[key] = st
+            self._seen_codes[key] = set()
+            self._final_codes[key] = set()
+        return st
+
+    def mark_considered(self, signal: str, code: str) -> bool:
+        """登记一只标的进入某 signal 的判据。**同一轮同一 code 只记一次**。
+
+        返回是否为首次登记。
+        """
+        self.eval_stats(signal)
+        seen = self._seen_codes.setdefault(str(signal or ""), set())
+        key = str(code or "")
+        if key in seen:
+            return False
+        seen.add(key)
+        self.signal_evals[str(signal or "")].considered += 1
+        return True
+
+    def _claim_final(self, signal: str, code: str) -> bool:
+        """该 code 在本轮是否**首次**落进终态桶（blocked/evaluated）。
+
+        返回 False 表示它已经被记过（blocked 或 evaluated），调用方必须
+        直接返回，不得重复计数。blocked 与 evaluated 互斥且先到先得。
+        """
+        self.eval_stats(signal)
+        fin = self._final_codes.setdefault(str(signal or ""), set())
+        key = str(code or "")
+        if key in fin:
+            return False
+        fin.add(key)
+        self.mark_considered(signal, code)      # 保证 considered 已计入
+        return True
+
+    def mark_blocked(self, signal: str, code: str, reason: str,
+                     capability: str = "") -> None:
+        """该 code 因 capability 缺失**不能评估**（进 blocked 分母）。"""
+        if not self._claim_final(signal, code):
+            return
+        st = self.eval_stats(signal)
+        st.blocked_capability += 1
+        r = str(reason or "capability_missing")
+        st.blocked_reasons[r] = st.blocked_reasons.get(r, 0) + 1
+        if len(st.blocked_sample) <= _BLOCKED_SAMPLE_CAP:
+            st.blocked_sample.append({
+                "code": str(code or ""), "reason": r,
+                "capability": str(capability or ""),
+            })
+
+    def mark_advisory_missing(self, signal: str, code: str, reason: str,
+                              capability: str = "") -> None:
+        """该 code 缺了某项，但当前语义**允许跳过**，仍可评估。
+
+        注意它**不**把 code 记成 blocked，也**不**落终态桶 —— 调用方随后
+        仍应 ``mark_evaluated``，该票才进 evaluable。
+        """
+        st = self.eval_stats(signal)
+        st.advisory_missing += 1
+        if not capability:
+            return
+        r = f"advisory/{reason or 'advisory'}:{capability}"
+        # advisory 的明细与 blocked 分开记，避免污染 blocked_reasons。
+        st.blocked_reasons[r] = st.blocked_reasons.get(r, 0) + 1
+
+    def mark_evaluated(self, signal: str, code: str, hit: bool) -> None:
+        """该 code 判据完整、真的评估过了。``hit`` 表示是否到门槛。"""
+        if not self._claim_final(signal, code):
+            return
+        st = self.eval_stats(signal)
+        st.evaluable += 1
+        if hit:
+            st.hit_candidates += 1
+        else:
+            st.evaluated_no_hit += 1
+
+    def mark_published(self, signal: str, code: str) -> None:
+        """该 code 的命中**真的发出去了**（未被截断/冷却吞掉）。
+
+        注意它**不**落终态桶：published 是 hit_candidate 的后续状态，
+        不是与 blocked/evaluated 并列的第三种终态。
+        """
+        st = self.eval_stats(signal)
+        st.published += 1
+
+    def check_signal_invariants(self) -> list[str]:
+        """全部 signal 的机械不变量自检，返回违规列表（空 = 全成立）。"""
+        out: list[str] = []
+        for st in self.signal_evals.values():
+            out.extend(st.check_invariants())
+        return out
 
     @property
     def unavailable_capability(self) -> int:
@@ -294,6 +534,19 @@ class RoundObservationSet:
                 "stale_rejected": "已弃用的别名，指向 provider_stale_diagnosed",
             },
             "unavailable_capability": self.unavailable_capability,
+            # --- WP01 / IT-P1-CAPABILITY-003：逐 signal 可评估性 ---------------
+            # 旧口径（unavailable_capability + round ratio）**不能**回答
+            # "这条 signal 到底被验证过没有"。这里给出真正的分母与分子。
+            "signal_evaluability": {
+                k: v.as_dict() for k, v in sorted(self.signal_evals.items())
+            },
+            "_deprecated": {
+                "unavailable_capability":
+                    "IT-P1-CAPABILITY-003：这是所有规则写入的 code 并集大小，"
+                    "**不是**任何 signal 的可评估性。仍然导出以兼容旧消费方，"
+                    "但**不得**再作为 whole-class health 的真值 —— "
+                    "请读 signal_evaluability[*].evaluable_coverage。",
+            },
             # --- IT-P1-OBS-007：把"是哪只票、缺什么"带出 poll_once -------------
             # 有界样本：最多 50 条明细，避免无界载荷
             "unavailable_sample": [

@@ -282,9 +282,21 @@ def test_unavailable_counted_per_code_not_per_field():
 
 
 def test_two_missing_fields_recorded_when_both_reachable():
-    """能力是**源级**的：换手率可用、量比不可用时，只应记录量比缺失。
+    """能力是**源级**的：换手率可用、量比不可用时，两者**分账**记录。
 
-    用只提供 turnover 的自定义源，验证两个门槛各自独立判定、互不牵连。
+    WP01 / IT-P1-CAPABILITY-003 **语义修正**：本条以前断言
+    ``unavailable_capability == 1``，理由是"量比缺失也算能力缺失"。
+    但量比缺失在本规则里的真实语义是**可跳过的**：``vr`` 取占位 0.0 时
+    ``vr > 0.0`` 为假 -> 量比门槛被跳过，规则靠速度/金额**仍能命中**。
+    把它记成"不可评估"正是审计指出的语义混淆（一个状态名同时承载
+    "硬阻断"与"可跳过"），会让 5000 码里只坏 1 个的场景被误判成
+    整类规则 0% 可评估。
+
+    所以现在：``turnover`` 缺失（且 min_turnover>0）= **blocking**，
+    进 ``unavailable_codes``；``volume_ratio`` 缺失 = **advisory**，
+    只留明细、不进缺失计数。**这不是为了让测试变绿而放宽断言，而是修正
+    断言本身所依据的语义**；blocking 侧的可见性由
+    ``test_sina_marks_unavailable_instead_of_silent_zero`` 继续钉住。
     """
     st = FakeState()
     feed_burst(st)
@@ -294,11 +306,16 @@ def test_two_missing_fields_recorded_when_both_reachable():
         state=st, cfg=dict(DEFAULTS), now=NOW, session=SessionPhase.MORNING,
         elapsed_trading_seconds=1800.0, minutes_to_close=120.0,
         capabilities=caps, observation=obs)
-    RULE.evaluate(
+    alerts = RULE.evaluate(
         make_snapshot([burst_quote(turnover=3.0, volume_ratio=0.0)], ts=NOW), ctx)
 
-    assert obs.unavailable_capability == 1                 # 仍是同一只票
+    # 缺量比是 advisory：该票仍可评估，且靠速度/金额真的命中了
+    assert obs.unavailable_capability == 0, (
+        "缺 volume_ratio 允许跳过 -> 不得记进能力缺失计数")
+    assert len(alerts) == 1, "跳过量比门槛后速度条件成立，应当命中"
+    # 明细仍在，但状态区分成 advisory_missing（不是 unavailable_capability）
     assert [d.reason for d in obs.decisions] == ["volume_ratio_not_provided"]
+    assert [d.status for d in obs.decisions] == ["advisory_missing"]
 
 
 def test_capability_is_source_level_not_value_level():

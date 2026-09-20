@@ -102,6 +102,20 @@ DEFAULT_OBSERVATION_TOLERANCES: dict[str, Any] = {
     "coverage_fail_min": 0.75,
     "unavailable_warn_ratio": 0.0,
     "unavailable_fail_ratio": 1.0,
+    # --- WP03 / IT-P1-CAPABILITY-003：逐 signal 可评估率 -------------------
+    # 为什么用**逐 signal** 而不是"轮里有没有缺失"：后者分母不是同一件事。
+    # 5000 只票里每轮只坏 1 只，真实可评估率 99.98%，旧口径却给出
+    # "轮比例 = 1.0" 并报 whole-class FAIL。新口径直接算
+    # ``evaluable / considered``，把分母修正回标的级。
+    #
+    # 语义：某个 signal 的 ``considered`` 全被判 blocked（coverage == 0）
+    # 才是"整类规则一次都没被评估过"的**唯一**站得住的证据。
+    "evaluability_warn_coverage": 0.95,
+    "evaluability_fail_coverage": 0.0,
+    # 样本不足时**最多只到 warn**，不判 fail。理由：coverage 是小样本比率，
+    # 一只票坏掉就能让 3 只票的 signal 从 1.0 掉到 0.67；在没有真实 soak
+    # 样本的情况下把它判红，等于用噪声定罪。宁可黄着让人去看明细。
+    "evaluability_min_samples": 200,
 }
 
 #: 允许的抓取失败比例。为什么不是 0：README §5.5 写得很清楚 —— 东财限流是常态，
@@ -120,6 +134,7 @@ _OBSERVATION_MARKER_KEYS: tuple[str, ...] = (
     "future_rejected", "stale_rejected", "out_of_order_rejected",
     "unknown_missing", "rejected_quality", "unavailable_capability",
     "observation_fields", "capabilities", "unavailable_by_reason",
+    "signal_evaluability",
 )
 
 #: 可观测性字段在轮样本里的"采集标记"：只有真的可测的字段才写进去。
@@ -129,7 +144,7 @@ _OBSERVATION_VALUE_FIELDS: tuple[str, ...] = (
     "requested", "returned", "admitted", "coverage", "source",
     "future_rejected", "stale_rejected", "out_of_order_rejected",
     "unknown_missing", "rejected_quality", "unavailable_capability",
-    "capabilities", "unavailable_by_reason",
+    "capabilities", "unavailable_by_reason", "signal_evaluability",
 )
 #: 股票池规模允许的膨胀倍数（首末对比）。留足余量：新股上市、股票池 TTL 到期后
 #: 从"自选股降级"恢复到全市场，都会让这个数字变大，那不是内存泄漏。
@@ -244,6 +259,27 @@ def make_round_sample(
         quality = obs.get("rejected_quality")
         out["rejected_quality"] = len(quality) if isinstance(quality, (list, tuple)) else 0
         out["unavailable_capability"] = _safe_int(obs.get("unavailable_capability"))
+        # WP03 / IT-P1-CAPABILITY-003：逐 signal 可评估率。
+        # 只保留判定需要的**有界**计数，丢掉 blocked_sample 明细（逐股，
+        # 可能几千条）—— soak 报告是长时间跑的，不能让明细撑爆内存/文件。
+        sig_ev = obs.get("signal_evaluability")
+        if isinstance(sig_ev, dict) and sig_ev:
+            slim: dict[str, dict] = {}
+            for sig, cell in sig_ev.items():
+                if not isinstance(cell, dict):
+                    continue
+                slim[str(sig)] = {
+                    "considered": _safe_int(cell.get("considered")),
+                    "evaluable": _safe_int(cell.get("evaluable")),
+                    "blocked_capability": _safe_int(cell.get("blocked_capability")),
+                    "advisory_missing": _safe_int(cell.get("advisory_missing")),
+                    "hit_candidates": _safe_int(cell.get("hit_candidates")),
+                    "published": _safe_int(cell.get("published")),
+                    "blocked_reasons": (
+                        dict(cell.get("blocked_reasons"))
+                        if isinstance(cell.get("blocked_reasons"), dict) else {}),
+                }
+            out["signal_evaluability"] = slim
         caps = obs.get("capabilities")
         out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
         # IT-P1-OBS-007：把"哪只票缺什么"带出 Store
@@ -363,6 +399,19 @@ def summarize_rounds(rounds: Sequence[dict], *,
     unavailable_rounds = 0
     unavailable_by_reason: dict[str, int] = {}
     capability_missing: dict[str, int] = {}      # {能力名: 有多少轮该源不提供}
+    # --- WP03：逐 signal 可评估率（新口径，替代整类轮比例当判据） --------
+    # 形状：{signal: {"considered": int, "evaluable": int, ...}}
+    # 为什么按 signal 而不是按轮：不同 signal 需要不同 capability
+    # （volume_burst 要 turnover，spirit_order.big_bid_wall 要 depth_l5），
+    # 把它们并成一个轮级布尔就是把"少判一项"夸大成"整类全废"。
+    ev_total: dict[str, int] = {}                # signal -> considered
+    ev_evaluable: dict[str, int] = {}            # signal -> evaluable
+    ev_blocked: dict[str, int] = {}              # signal -> blocked_capability
+    ev_advisory: dict[str, int] = {}             # signal -> advisory_missing
+    ev_hits: dict[str, int] = {}                 # signal -> hit_candidates
+    ev_published: dict[str, int] = {}            # signal -> published
+    ev_blocked_by_reason: dict[str, int] = {}    # reason -> 次数（跨 signal 汇总）
+    ev_rounds = 0                                # 真的带了 signal_evaluability 的轮数
 
     for pos, r in enumerate(rows):
         present = _round_observation_fields(r)
@@ -435,6 +484,43 @@ def summarize_rounds(rounds: Sequence[dict], *,
                 if val is False:
                     capability_missing[str(key)] = capability_missing.get(str(key), 0) + 1
 
+        # ---- WP03：逐 signal 可评估率 ----------------------------------
+        # 轮样本里的 ``signal_evaluability`` 是每轮 ``as_dict()`` 的结果，
+        # 逐轮**相加**得到整场 soak 的 considered/evaluable 总量。
+        # 注意相加前先做类型校验：脏值只能被跳过，不能被当 0 累加
+        # （当 0 会把一条"读不出"的轮稀释成"这轮没标的需要评估"）。
+        ev = r.get("signal_evaluability")
+        if isinstance(ev, dict) and ev:
+            ev_rounds += 1
+            for sig, cell in ev.items():
+                if not isinstance(cell, dict):
+                    continue
+                s_key = str(sig)
+                c = _safe_int(cell.get("considered"))
+                e = _safe_int(cell.get("evaluable"))
+                b = _safe_int(cell.get("blocked_capability"))
+                # 只接受自洽的单元：evaluable + blocked == considered。
+                # 不自洽说明写入方有问题 —— 宁可丢弃也不要把坏数带进判定。
+                if c < 0 or e < 0 or b < 0 or e + b != c:
+                    continue
+                ev_total[s_key] = ev_total.get(s_key, 0) + c
+                ev_evaluable[s_key] = ev_evaluable.get(s_key, 0) + e
+                ev_blocked[s_key] = ev_blocked.get(s_key, 0) + b
+                ev_advisory[s_key] = ev_advisory.get(s_key, 0) + _safe_int(
+                    cell.get("advisory_missing"))
+                ev_hits[s_key] = ev_hits.get(s_key, 0) + _safe_int(
+                    cell.get("hit_candidates"))
+                ev_published[s_key] = ev_published.get(s_key, 0) + _safe_int(
+                    cell.get("published"))
+                reasons = cell.get("blocked_reasons")
+                if isinstance(reasons, dict):
+                    for rk, rv in reasons.items():
+                        k = str(rk)
+                        # advisory 明细也在这张表里（带 advisory/ 前缀），
+                        # 分开统计，避免把它误当"阻断原因"。
+                        ev_blocked_by_reason[k] = (
+                            ev_blocked_by_reason.get(k, 0) + _safe_int(rv))
+
     # ---- 最差 N 轮：按 coverage 升序（同分保持轮号稳定），只收有效 coverage --
     ranked.sort(key=lambda t: (t[0], t[1]))
     worst: list[dict] = []
@@ -499,10 +585,40 @@ def summarize_rounds(rounds: Sequence[dict], *,
         "capability_unavailable_rounds": unavailable_rounds,
         # 分母用"带账本的轮数"而不是全部轮：旧样本/失败轮没账本，
         # 不该把它们算成"能力正常"而稀释掉真实缺口。
+        #
+        # **WP03 起这个比例只是诊断量，不再是 health 判据** ——
+        # 它的分母是"轮"，而"整类规则能否评估"的分母必须是"标的"。
+        # 5000 码里每轮只坏 1 个，这里给 1.0，但真实可评估率 99.98%。
+        # 判定改看下面的 ``signal_evaluability``。
         "capability_unavailable_ratio": (
             round(unavailable_rounds / obs_rounds, 4) if obs_rounds else None),
         "capability_missing_rounds": capability_missing,
         "unavailable_by_reason": unavailable_by_reason,
+        # --- WP03：逐 signal 可评估率（新判据的真值来源） ----------------
+        "signal_evaluability": {
+            sig: {
+                "considered": ev_total.get(sig, 0),
+                "evaluable": ev_evaluable.get(sig, 0),
+                "blocked_capability": ev_blocked.get(sig, 0),
+                "advisory_missing": ev_advisory.get(sig, 0),
+                "hit_candidates": ev_hits.get(sig, 0),
+                "published": ev_published.get(sig, 0),
+                # 没有分母时是 None（not_measured），**不是 0.0** ——
+                # 填 0 会把"这一项没测"误报成"整类失效"。
+                "evaluable_coverage": (
+                    round(ev_evaluable.get(sig, 0) / ev_total[sig], 6)
+                    if ev_total.get(sig, 0) > 0 else None),
+            }
+            for sig in sorted(ev_total)
+        },
+        "signal_evaluability_rounds": ev_rounds,
+        "evaluability_considered_total": sum(ev_total.values()),
+        "evaluability_evaluable_total": sum(ev_evaluable.values()),
+        "evaluability_blocked_total": sum(ev_blocked.values()),
+        "evaluability_advisory_total": sum(ev_advisory.values()),
+        "evaluability_hit_candidates_total": sum(ev_hits.values()),
+        "evaluability_published_total": sum(ev_published.values()),
+        "evaluability_blocked_by_reason": ev_blocked_by_reason,
         "worst_rounds": worst,
     }
 
@@ -601,6 +717,17 @@ def empty_metrics() -> dict:
         "capability_unavailable_ratio": None,
         "capability_missing_rounds": {},
         "unavailable_by_reason": {},
+        # WP03：逐 signal 可评估率。空 dict 表示"没有逐 signal 数据"
+        # （旧报告），判定方据此退回旧口径且只到 warn（见 evaluate_health）。
+        "signal_evaluability": {},
+        "signal_evaluability_rounds": 0,
+        "evaluability_considered_total": 0,
+        "evaluability_evaluable_total": 0,
+        "evaluability_blocked_total": 0,
+        "evaluability_advisory_total": 0,
+        "evaluability_hit_candidates_total": 0,
+        "evaluability_published_total": 0,
+        "evaluability_blocked_by_reason": {},
         "worst_rounds": [],
         "memory": {"bounded": True, "reason": "（未采样）"},
         "api": {"requests": 0, "non_200": 0, "malformed": 0, "unreachable": 0, "by_route": {}},
@@ -822,27 +949,106 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         unavail_ratio = unavail_rounds / obs_rounds
     u_warn = _num("unavailable_warn_ratio")
     u_fail = _num("unavailable_fail_ratio")
-    if obs_rounds <= 0:
+
+    # ---- WP03 / IT-P1-CAPABILITY-003：逐 signal 可评估率（**新判据**） ----
+    #
+    # 为什么替换旧判据：旧判据的分母是"轮"，问的是"这一轮里有没有出现过
+    # 任何能力缺失"；而我们要回答的是"**这类规则到底评没评估过**"，
+    # 分母必须是**标的**。5000 码里每轮坏 1 个 -> 旧口径 1.0 -> whole-class
+    # FAIL，真实可评估率却是 99.98%。分母错了，阈值再怎么调都没用。
+    #
+    # 新判据只认一种 fail 形状：某个 signal 的 considered 全部被判 blocked
+    # （coverage == 0），即"这一类规则在这整场 soak 里一次都没评过"。
+    sig_ev = m.get("signal_evaluability")
+    sig_cells = {str(k): v for k, v in sig_ev.items()
+                 if isinstance(v, dict)} if isinstance(sig_ev, dict) else {}
+    ev_warn_cov = _num("evaluability_warn_coverage")
+    ev_fail_cov = _num("evaluability_fail_coverage")
+    ev_min_samples = _num("evaluability_min_samples")
+    min_samples = int(ev_min_samples) if ev_min_samples is not None else 200
+
+    worst_sig: list[tuple[float, str, int, int]] = []   # (cov, signal, ev, tot)
+    all_blocked: list[str] = []
+    for sig, cell in sig_cells.items():
+        tot = _safe_int(cell.get("considered"))
+        ev = _safe_int(cell.get("evaluable"))
+        if tot <= 0:
+            continue                                    # not_measured：跳过
+        cov = ev / tot
+        worst_sig.append((cov, sig, ev, tot))
+        if ev == 0:
+            all_blocked.append(sig)
+    worst_sig.sort(key=lambda t: (t[0], t[1]))
+
+    considered_total = _safe_int(m.get("evaluability_considered_total"))
+    evaluable_total = _safe_int(m.get("evaluability_evaluable_total"))
+    blocked_total = _safe_int(m.get("evaluability_blocked_total"))
+    overall_cov = (evaluable_total / considered_total
+                   if considered_total > 0 else None)
+
+    if sig_cells:
+        # 有逐 signal 数据 -> 用它判，旧比例只作为诊断写进 detail。
+        cap_level = "ok"
+        if all_blocked:
+            cap_level = "fail"          # 唯一站得住的"整类没评估"证据
+        elif (ev_warn_cov is not None and worst_sig
+              and worst_sig[0][0] < ev_warn_cov):
+            # 有 signal 掉到 warn 线以下：黄，但**不判死**。
+            cap_level = "warn"
+        # 样本不足时不升级为 fail：coverage 是小样本比率，一只票坏掉就能让
+        # 3 只票的 signal 从 1.0 掉到 0.67；没有足够样本时判红等于用噪声定罪。
+        # 这里看的是**总可评估样本量**，与"哪个 signal 全阻断"无关 ——
+        # 全阻断本身已经是明确信号，但样本量太小仍不足以支撑全场判死。
+        if cap_level == "fail" and considered_total < min_samples:
+            cap_level = "warn"
+
+        cov_txt = ("—" if overall_cov is None else f"{overall_cov:.2%}")
+        detail = (
+            f"逐 signal 可评估率 {cov_txt}"
+            f"（可评估 {evaluable_total}/{considered_total}，"
+            f"因能力缺失被阻断 {blocked_total}）；"
+            f"共 {len(sig_cells)} 个 signal，最差 "
+            + (", ".join(f"{s}={c:.2%}({e}/{t})"
+                         for c, s, e, t in worst_sig[:3]) or "—")
+            + f"；阈值 warn <{ev_warn_cov:.0%}，fail=全部阻断")
+        if all_blocked:
+            detail += (f" —— 这些 signal 在整场 soak 里**一次都没被评估过**："
+                       f"{sorted(all_blocked)[:5]}")
+        reasons = dict(m.get("evaluability_blocked_by_reason") or {})
+        if reasons:
+            top = sorted(reasons.items(),
+                         key=lambda kv: (-int(kv[1]), str(kv[0])))[:5]
+            detail += f"；主要阻断原因 {dict(top)}"
+        # 诊断量（不再是判据）：保留旧比例，方便与历史报告对比。
+        detail += (f"（诊断：旧口径轮比例 "
+                   f"{'—' if unavail_ratio is None else f'{unavail_ratio:.0%}'}"
+                   f"、累计缺失标的 {unavail_total}，仅供参考）")
+        add("capability", cap_level != "fail", detail, level=cap_level)
+    elif obs_rounds <= 0:
         add("capability", True,
             f"无观测账本，无法判定能力缺失（unavailable 合计 {unavail_total}）"
             "（跳过不算失败）")
     else:
-        if u_fail is not None and unavail_ratio is not None and unavail_ratio >= u_fail:
-            cap_level = "fail"
-        elif u_warn is not None and unavail_ratio is not None and unavail_ratio > u_warn:
+        # 旧版本报告：没有逐 signal 数据 -> 退回旧口径，**但只到 warn 为止**。
+        # 为什么不继续判 fail：旧口径的分母（轮）不足以支撑"整类没评估"这种
+        # 强结论。历史报告继续可见，但不拿它定罪。
+        if (u_fail is not None and unavail_ratio is not None
+                and unavail_ratio >= u_fail):
+            cap_level = "warn"
+        elif (u_warn is not None and unavail_ratio is not None
+              and unavail_ratio > u_warn):
             cap_level = "warn"
         else:
             cap_level = "ok"
         reasons = dict(m.get("unavailable_by_reason") or {})
         detail = (
-            f"{unavail_rounds}/{obs_rounds} 轮出现'能力缺失导致规则无法评估'"
-            f"（比例 {unavail_ratio:.0%}），累计不可评估标的 {unavail_total} 个；"
-            f"阈值 warn >{u_warn:.0%}，fail >={u_fail:.0%}")
+            f"旧口径（轮级）：{unavail_rounds}/{obs_rounds} 轮出现'能力缺失'"
+            f"（比例 {unavail_ratio:.0%}），累计缺失标的 {unavail_total} 个；"
+            "无逐 signal 可评估率数据，故只做提示不判死"
+            f"（阈值 warn >{u_warn:.0%}，fail >={u_fail:.0%}）")
         if reasons:
             top = sorted(reasons.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:5]
             detail += f"；主要原因 {dict(top)}"
-        if cap_level == "fail":
-            detail += " —— 整类规则在这整场 soak 里一次都没被评估过"
         add("capability", cap_level != "fail", detail, level=cap_level)
 
     req = int(api.get("requests") or 0)
@@ -1278,6 +1484,43 @@ def _fmt_table(checks: Sequence[dict]) -> str:
     return "\n".join(lines)
 
 
+def _overall_evaluability(metrics: dict) -> float | None:
+    """整场 soak 的整体可评估率 = 可评估标的 / 已考虑标的。
+
+    与旧 ``capability_unavailable_ratio`` 的**根本区别**是分母：这里是**标的**，
+    那里是**轮**。5000 码里每轮坏 1 个，这里给出 99.98%，那里给出 100%
+    "出现过缺失"。没有分母（considered == 0）时返回 ``None``（not_measured），
+    **不是** 0.0 —— 填 0 会把"没测"误报成"整类失效"。
+    """
+    tot = _safe_int(metrics.get("evaluability_considered_total"))
+    if tot <= 0:
+        return None
+    return _safe_int(metrics.get("evaluability_evaluable_total")) / tot
+
+
+def _fmt_signal_evaluability(sig_ev: Any) -> str:
+    """逐 signal 可评估率里**最差**的几个，供一行人读。
+
+    只打最差的（升序前 3）—— 全量打出来会让报告退化成转储。
+    """
+    if not isinstance(sig_ev, dict) or not sig_ev:
+        return ""
+    rows: list[tuple[float, str, int, int]] = []
+    for sig, cell in sig_ev.items():
+        if not isinstance(cell, dict):
+            continue
+        tot = _safe_int(cell.get("considered"))
+        if tot <= 0:
+            continue
+        ev = _safe_int(cell.get("evaluable"))
+        rows.append((ev / tot, str(sig), ev, tot))
+    if not rows:
+        return ""
+    rows.sort(key=lambda t: (t[0], t[1]))
+    parts = [f"{s}={c:.1%}({e}/{t})" for c, s, e, t in rows[:3]]
+    return "；最差 signal " + ", ".join(parts)
+
+
 def _fmt_observation_summary(metrics: dict) -> str:
     """把 WP05 的观测聚合打印成一行（人读的结论表用）。"""
     def _pct(v: Any) -> str:
@@ -1302,8 +1545,18 @@ def _fmt_observation_summary(metrics: dict) -> str:
         f"乱序 {metrics.get('ooo_total')}\n"
         f"  来源混合：{metrics.get('source_mix') or '{}'}"
         f"（未知来源 {metrics.get('source_mix_unknown_rounds')} 轮）\n"
-        f"  能力缺失：{metrics.get('capability_unavailable_rounds')} 轮出现，"
-        f"累计 {metrics.get('capability_unavailable_total')} 个标的不可评估"
+        f"  可评估率（逐 signal）：可评估 "
+        f"{metrics.get('evaluability_evaluable_total')}/"
+        f"{metrics.get('evaluability_considered_total')}"
+        f"（{_pct(_overall_evaluability(metrics))}），"
+        f"被能力阻断 {metrics.get('evaluability_blocked_total')}，"
+        f"advisory {metrics.get('evaluability_advisory_total')}；"
+        f"命中候选 {metrics.get('evaluability_hit_candidates_total')}/"
+        f"已发出 {metrics.get('evaluability_published_total')}"
+        f"{_fmt_signal_evaluability(metrics.get('signal_evaluability'))}\n"
+        f"  （诊断）旧口径轮比例："
+        f"{metrics.get('capability_unavailable_rounds')} 轮出现过能力缺失，"
+        f"累计 {metrics.get('capability_unavailable_total')} 个标的"
         f"（比例 {_pct(metrics.get('capability_unavailable_ratio'))}）"
         f"{metrics.get('unavailable_by_reason') or ''}\n"
         f"  最差轮次（按 coverage 升序）：{_fmt_worst(metrics.get('worst_rounds') or [])}"

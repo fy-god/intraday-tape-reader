@@ -73,6 +73,18 @@ class AlertStore:
         #: 观测账本的轮次序号，每写入一次 +1。消费方据此判断"这份账本
         #: 是不是本轮的"——防止失败轮沿用上一成功轮的数字（IT-P2-OBS-004）。
         self._observation_seq: int = 0
+        #: 账本**自身**的写入时刻，与 ``_last_poll_ts`` **同源**
+        #: （``set_poll_stats(now=...)``）。无账本时为 ``None``。
+        #:
+        #: 为什么单独存而不是复用 ``_last_poll_ts``：后者每次 poll 都刷新，
+        #: **包括**没有账本的失败轮；用它当账本时刻就等于把旧账标成新鲜
+        #: （IT-P2-OBS-STATUS-001）。格式取完整日期时间（与 status 的
+        #: ``ts`` 同格式），因为只有时分秒无法跨零点算 age。
+        self._observation_observed_at: str | None = None
+        #: 账本写入时引擎的 poll 计数（``set_poll_stats(count=...)``）。
+        #: 无账本时为 ``0``（与 ``_observation_seq`` 的 0 哨兵一致）。
+        #: 注意它是**账本当时**的计数，不是"最近一次 poll"的计数。
+        self._observation_poll_count: int = 0
 
     # ------------------------------------------------------------------
     # 引擎接入
@@ -133,7 +145,8 @@ class AlertStore:
         with self._lock:
             self._last_poll_ms = int(poll_ms)
             self._poll_count = int(count)
-            self._last_poll_ts = (now or datetime.now()).strftime("%H:%M:%S")
+            ts = now or datetime.now()
+            self._last_poll_ts = ts.strftime("%H:%M:%S")
             if health is not None:
                 self._source_health = list(health)
             if observation is not None:
@@ -142,6 +155,10 @@ class AlertStore:
                     try:
                         self._observation = as_dict()
                         self._observation_seq += 1
+                        # 账本身份与其内容**同一时刻**落账：只有真的写入
+                        # 才推进 seq/时刻/计数，三者永远同步（IT-P2-OBS-STATUS-001）。
+                        self._observation_observed_at = ts.strftime("%Y-%m-%d %H:%M:%S")
+                        self._observation_poll_count = int(count)
                     except Exception:  # noqa: BLE001  可观测性不得影响主流程
                         pass
 
@@ -161,6 +178,23 @@ class AlertStore:
         """
         with self._lock:
             return int(self._observation_seq)
+
+    @property
+    def observation_observed_at(self) -> str | None:
+        """账本自身的记录时刻（``YYYY-MM-DD HH:MM:SS``）。
+
+        从未写入过账本时返回 ``None`` —— 消费方必须据此判定"无账本"，
+        而不是拿 API 顶层 ``ts``（那是**请求**时刻）冒充账本时刻。
+        """
+        with self._lock:
+            return None if self._observation_observed_at is None \
+                else str(self._observation_observed_at)
+
+    @property
+    def observation_poll_count(self) -> int:
+        """账本写入时引擎的 poll 计数；从未写入过账本时为 ``0``。"""
+        with self._lock:
+            return int(self._observation_poll_count)
 
     def add_note(self, msg: str) -> None:
         with self._lock:
@@ -218,6 +252,12 @@ class AlertStore:
         watch = list(getattr(self._engine, "watchlist", []) or []) if self._engine else []
         with self._lock:
             observation = dict(self._observation)
+            # 账本**自身**的身份（IT-P2-OBS-STATUS-001）。必须与
+            # ``observation`` 在同一临界区读出，否则可能读到"新 seq 配旧账本"。
+            obs_seq = int(self._observation_seq)
+            obs_observed_at = (None if self._observation_observed_at is None
+                               else str(self._observation_observed_at))
+            obs_poll_count = int(self._observation_poll_count)
         return {
             "phase": phase.value,
             "session": PHASE_CN.get(phase, phase.value),
@@ -241,6 +281,14 @@ class AlertStore:
             # capability 集合。让"Sina 期间放量规则不可评估"能被查到，
             # 而不是只看到 alerts=0（IT-P0-002-R1 / WP02）。
             "observation": observation,
+            # 账本**自己的**身份，而不是"这次请求"的。外部 API 消费者据此
+            # 判断读到的是本轮账本还是上一成功轮的旧账：``observation_seq``
+            # 没变 = 本轮没产生新账本，``observation_observed_at`` 让你能算
+            # age（顶层 ``ts`` 是请求时刻，**不能**代替它）。
+            # 无账本：seq=0 / observed_at=None / poll_count=0。
+            "observation_seq": obs_seq,
+            "observation_observed_at": obs_observed_at,
+            "observation_poll_count": obs_poll_count,
             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
 

@@ -90,10 +90,14 @@ class VolumeBurstRule:
 
     # ------------------------------------------------------------------
     def _mark_unavailable(self, ctx: RuleContext, code: str, field: str) -> None:
-        """记一次「能力缺失导致该项无法评估」。
+        """记一次「能力缺失导致该项**无法评估**」（**硬阻断**）。
 
         只做记账，供 live_session / 看板显示"放量规则在 Sina 期间不可评估"，
         而不是让用户以为"这段时间没放量"。没有挂 observation 时静默跳过。
+
+        **WP01 / IT-P1-CAPABILITY-003：这里只记真正阻断的缺失。**
+        可以跳过的缺失走 :meth:`_mark_advisory` —— 以前两者共用这一个方法，
+        于是"少判一项但仍能命中"被记成"整类不可评估"，污染 health。
         """
         obs = getattr(ctx, "observation", None)
         if obs is None:
@@ -110,6 +114,46 @@ class VolumeBurstRule:
                     missing=(field,),
                 ))
         except Exception:  # noqa: BLE001  可观测性绝不能影响主流程
+            pass
+
+    def _mark_advisory(self, ctx: RuleContext, code: str, field: str) -> None:
+        """记一次「缺了这一项，但当前语义**允许跳过**」。
+
+        **绝不能**写进 ``unavailable_codes`` —— 那会让
+        ``unavailable_capability`` 同时表达两种互斥语义。该票仍可评估，
+        只是判据少了一项；明细以 ``advisory_missing`` 状态单独留存。
+        """
+        obs = getattr(ctx, "observation", None)
+        if obs is None:
+            return
+        try:
+            decisions = getattr(obs, "decisions", None)
+            if isinstance(decisions, list):
+                decisions.append(ObservationDecision(
+                    code=code, status="advisory_missing",
+                    rule=self.name, reason=f"{field}_not_provided",
+                    missing=(field,),
+                ))
+        except Exception:  # noqa: BLE001
+            pass
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _obs_mark(obs: object, method: str, *args: object) -> None:
+        """防御式调用 ``RoundObservationSet`` 的 WP01 记账方法。
+
+        **可观测性绝不能影响主流程** —— 这是本仓既有纪律（见
+        ``test_broken_observation_does_not_break_rule``）。账本对象可能是
+        旧版本、被替换成坏桩、或永远没挂上，任何一种都只能静默降级，
+        不允许把异常抛进信号主链路。
+        """
+        if obs is None:
+            return
+        try:
+            fn = getattr(obs, method, None)
+            if callable(fn):
+                fn(*args)
+        except Exception:  # noqa: BLE001
             pass
 
     # ------------------------------------------------------------------
@@ -141,6 +185,31 @@ class VolumeBurstRule:
         bucket = bucket_of(now_epoch, cooldown)
 
         picked: list[tuple[float, Alert]] = []
+        # WP01 / IT-P1-CAPABILITY-003：逐 signal 的可评估性账本。
+        #
+        # 旧口径只有一个全局 `unavailable_capability`（所有规则写入的 code
+        # 并集），消费方拿"本轮有没有任意一个缺失"算轮比例，于是
+        # **5000 码里每轮只坏 1 个**也会得到 ratio=1.0 并被解释成
+        # "整类规则整场没被评估过"（真实可评估率 99.98%）。分母错了。
+        #
+        # 更重要的是：本规则对两种缺失的语义**本来就不一样** ——
+        #   * 缺 `turnover`：下面 `q.turnover < min_turnover` 会把该票拦掉，
+        #     是**硬阻断**（blocking）；
+        #   * 缺 `volume_ratio`：`vr > 0.0` 为假 -> 跳过量比门槛，规则
+        #     **仍可能命中**，是**可跳过的缺失**（advisory）。
+        # 两者共用一个状态名必然污染 health，故在此拆开记账。
+        obs = getattr(ctx, "observation", None)
+        signal = self.name          # "volume_burst"：到 signal 粒度才有意义
+        _mark = self._obs_mark      # 防御式调用：账本坏了绝不能影响规则
+
+        def _no_hit(c: str) -> None:
+            """该票判据完整、真的评估过但没到门槛。
+
+            幂等：若同一 (signal, code) 已被记成 blocked，这里不会重复计数
+            （``mark_evaluated`` 内部先 ``mark_considered``）。
+            """
+            _mark(obs, "mark_evaluated", signal, c, False)
+
         for code, q in snap.quotes.items():
             if q is None:
                 continue
@@ -152,7 +221,8 @@ class VolumeBurstRule:
 
             pct = float(q.pct)
             if min_abs_pct > 0.0 and abs(pct) < min_abs_pct:
-                continue                                    # 纯放量不波动 -> 不报
+                _no_hit(code)                               # 纯放量不波动 -> 不报
+                continue
 
             # --- 换手率门槛 -------------------------------------------------
             # IT-P1-CAPABILITY-001：Sina 解析器用 turnover=0.0 表示"本源不提供
@@ -162,27 +232,41 @@ class VolumeBurstRule:
             #
             # 第一阶段只**记账**，不擅自改成"缺字段就跳过门槛"——那会改变误报率
             # （见本轮审计报告 §3.4）。所以下面仍保留原门槛判定，行为与改动前
-            # 逐字一致；新增的只是把这种情况记成 unavailable_capability，使
+            # 逐字一致；新增的只是把这种情况记成 **blocking** 缺失，使
             # "Sina 期间放量规则不可评估"从静默变为可见。降级口径等真实数据。
             if min_turnover > 0.0 and not ctx.provides("turnover"):
                 self._mark_unavailable(ctx, code, "turnover")
+                # 缺 turnover 且 min_turnover>0 -> 该票**真的不能判**
+                _mark(obs, "mark_blocked", signal, code,
+                      "turnover_not_provided", "turnover")
             if min_turnover > 0.0 and float(q.turnover) < min_turnover:
-                continue
+                continue                    # 已记 blocked，或被真实换手率拦下
             if min_amount > 0.0 and float(q.amount) < min_amount:
+                _no_hit(code)
                 continue
 
             # --- 条件 1：量比（数据源缺失时跳过该项） --------------------
-            # 同样只加记账：源不提供量比时标记 unavailable，门槛判定保持原样
-            # （vr 为占位 0.0 时 `vr > 0.0` 本来就不成立，即既有的"缺失即跳过"）。
+            # 同样只加记账：源不提供量比时标记 **advisory**（不是 blocking）——
+            # `vr > 0.0` 为假即跳过门槛，规则**仍可能靠速度/金额命中**，
+            # 所以该票依旧是可评估的。把这种情况算成"不可评估"正是
+            # IT-P1-CAPABILITY-003 指出的语义混淆。
             vr = _num(q.volume_ratio, 0.0)
             if vr_thr > 0.0 and not ctx.provides("volume_ratio"):
-                self._mark_unavailable(ctx, code, "volume_ratio")
+                # 注意这里用 _mark_advisory 而不是 _mark_unavailable：
+                # 缺量比只是**跳过一个判据**，规则仍可能靠速度/金额命中，
+                # 该票依然可评估。记进 unavailable_codes 会把它误报成
+                # "整类不可评估"（IT-P1-CAPABILITY-003）。
+                self._mark_advisory(ctx, code, "volume_ratio")
+                _mark(obs, "mark_advisory_missing", signal, code,
+                      "vr_threshold_skipped", "volume_ratio")
             if vr_thr > 0.0 and vr > 0.0 and vr < vr_thr:
+                _no_hit(code)
                 continue
 
             # --- 条件 2：速度倍数 ---------------------------------------
             avg_per_min = float(q.volume_lots) / denom_seconds * 60.0
             if avg_per_min <= 0.0:
+                _no_hit(code)
                 continue                                    # 无均量基准可算 -> 跳过
             delta = 0.0
             if win > 0.0:
@@ -190,6 +274,7 @@ class VolumeBurstRule:
             recent_per_min = (delta / win * 60.0) if win > 0.0 else 0.0
             ratio = recent_per_min / avg_per_min
             if speed_mult > 0.0 and ratio < speed_mult:
+                _no_hit(code)
                 continue
 
             # --- severity 升档 ------------------------------------------
@@ -244,11 +329,19 @@ class VolumeBurstRule:
                 cooldown_seconds=cooldown,
             )
             picked.append((ratio, alert))
+            # 到门槛了 = 候选命中。注意这时还**没有**发出去 ——
+            # 下面 max_per_round 会截断，被截掉的绝不能算 published
+            # （否则"被限流吞掉"会被读成"已经告警过"）。
+            _mark(obs, "mark_evaluated", signal, code, True)
 
         # 按速度倍数降序（同倍数用代码保证确定性）；max_per_round<=0 视为不限量
         picked.sort(key=lambda t: (-t[0], t[1].code))
         if max_per_round > 0:
             picked = picked[:max_per_round]
+        # 只有**真的进了返回列表**的才算 published；被截掉的那些保持
+        # hit_candidate 身份，机械不变量 published <= hit_candidates 成立。
+        for _ratio, a in picked:
+            _mark(obs, "mark_published", signal, a.code)
         return [a for _, a in picked]
 
 
