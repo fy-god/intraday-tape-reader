@@ -52,6 +52,32 @@
   **我对 LIMIT-FIRST-BOARD-MULTI 做了端到端实测**：3 票同轮达标 + `max_per_round=2`
   → 第 1 轮报 2 条且第 3 只**状态被回滚**，第 2 轮**补报成功**
   （对照 `21:49` 报告记录的修复前「第 2 轮 0 条 = 永久丢失」）→ **修复确实有效**。
+- **r2 追加（未经完成的子 agent D 的对抗性证伪工作，由主 agent 本人补做）**：
+  - **4 个攻击点全部失败，原声称全部存活**：
+    ① `IT-P1-CAPABILITY-003` 的「硬阻断 vs 可跳过」——我用**真实 `VolumeBurstRule`** 构造
+    三组对照，实测 **缺 `turnover` → 0 条 Alert（硬阻断）**、
+    **缺 `volume_ratio` → 1 条 Alert（仍命中）**，而两者记录的 status **同为
+    `unavailable_capability`** → 同名承载相反语义**已确证**。
+    ② 攻击「回滚是否让已发出的告警重复报」：真实 `LimitBoardRule(max_per_round=2)` +
+    3 票连跑 5 轮 → **每只票恰好报 1 次，无重复、无丢失** → 修复**双向正确**。
+    ③ 攻击「`qualified` 先判后写是否活锁」：封单 1000→1000→1500→3000 手
+    → 不足期间停在 `at_limit_unqualified`，**首次达标恰好报 1 次**，之后幂等 → **无活锁**。
+    ④ 攻击「up/down 同轮截断还原是否互相覆盖」：确认跌停封单看 `ask_vol`
+    （`limit_board.py:271`），我的观察是**自己的构造错误**，非产品缺陷。
+  - **补验证正文 §9 标为「未复核」的两项，均成立**：
+    `IT-P0-001` 用真实 `TradingCalendar().phase()` 实跑 → `14:58` = `close_auction`、
+    **不在** `CONTINUOUS`、**在** `CALL_AUCTIONS`（`session.py:67-72` 自陈故意单列）→ **已修**；
+    `IT-P1-TIME-POLICY-001` 用真实 `time_policy_for()` 实跑 → 三家源**全部**
+    `freshness_allowed=False`、**未注册源也取 False** → **不 hard reject，成立**。
+  - **新登记 `IT-P1-CAPABILITY-004-PRECEDENT-AVAILABLE`（P1 · 加强项）**：
+    对**同一个** Sina 形状 quote（单档 `bid_vol=30000` 有值、五档为空），
+    `limit_board._seal_amount_wan` = **3,000 万元**且 `qualified=True`，
+    而 `spirit_order._best_order` = **`None`** —— **`limit_board` 早就在消费单档量**
+    （`limit_board.py:266-272`、`models.py:171`）。故 `spirit_order` 的修复
+    **不需要等 `WP03`（per-code provenance）**，**修复代价比原报告估计更低，建议上调优先级**。
+  - **我自己的 3 处探针 bug 已全部在正文披露**（`volume_delta` 过小致 (B) 误得 0 条；
+    封单 5,000 手×10 元实已超门槛；跌停侧误用 `bid_vol`）——
+    三处**都不改变结论**，保留在案以免误读为"一次成功"。
 - **`00:14` 报告的诚实性**：`:10/:11/:12/:586-592` 明确标注了
   `blocked_no_checkout`、`not_run`、`unavailable`，并声明 1430/9 门禁**未独立复跑**；
   `:38` 主动停止叠加不可复现的 synthetic 数字。**未发现把要求冒充成绩。**
