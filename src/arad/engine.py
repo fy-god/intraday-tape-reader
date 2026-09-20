@@ -53,6 +53,11 @@ class EngineState:
     history: dict[str, deque] = field(default_factory=dict)
     first_seen: dict[str, Quote] = field(default_factory=dict)
     last_price: dict[str, float] = field(default_factory=dict)
+    #: code -> 已准入观测量的事件时间上界（秒）。乱序判定的**显式**水位线。
+    #: 必须与 ``history`` 解耦：``history`` 只在价格/量变化时追加（服务窗口
+    #: 采样），若借用它的尾部时间当水位线，平价新鲜观测就不推进水位线，
+    #: 迟到的旧点会被误准入（IT-P0-002-R2）。
+    accepted_watermark: dict[str, float] = field(default_factory=dict)
     day_open: dict[str, float] = field(default_factory=dict)
     last_alert: dict[str, float] = field(default_factory=dict)
     #: cooldown_key -> 上次放行时刻。用于"同类告警至少间隔 N 秒"的时间距离判断，
@@ -137,6 +142,13 @@ class EngineState:
         内部，但 ``poll_once()`` 随后又从原始 ``quotes`` 重建 Snapshot ——
         被这里拒绝的 far-future 照样进了规则，迟到旧价照样覆盖了缓存。
         现在调用方必须消费本函数的返回值，而不是自己重算。
+
+        IT-P0-002-R2：乱序水位线必须是**独立显式**的 ``accepted_watermark``。
+        以前借用 ``history[-1][0]``，而 ``history`` 只在价格/累计量**变化**时
+        追加（它是窗口采样，语义不该改）。于是"平价新鲜观测"（同价同量）虽
+        推进了 ``quotes``/``last_price``，却**不推进水位线**；下一个真正迟到
+        的点因 ``q_ep >= h[-1][0]`` 被放行，覆盖缓存并让时间序列尾部倒挂。
+        现在水位线在**准入成功时无条件推进**，与 history 的追加策略解耦。
         """
         ep = now.timestamp()
         self.seq += 1
@@ -151,11 +163,11 @@ class EngineState:
                 self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
                 continue
 
-            # --- 乱序准入：必须在任何写入之前判定 ------------------------
-            # 旧代码先写 state.quotes，之后才判乱序，于是"不顺延 history"
-            # 只保护了 history，latest cache 与 last_price 仍被迟到旧价倒退。
-            h = self.history.get(q.code)
-            if h and q_ep < h[-1][0]:
+            # --- 乱序准入：用显式水位线，必须在任何写入之前判定 ----------
+            # 水位线在每次准入成功时无条件推进（见函数末尾），因此"平价新鲜
+            # 观测"也会推高它，迟到的旧点就再也钻不过去（IT-P0-002-R2）。
+            wm = self.accepted_watermark.get(q.code)
+            if wm is not None and q_ep < wm:
                 self.stats["t_reject:out_of_order"] = \
                     self.stats.get("t_reject:out_of_order", 0) + 1
                 continue
@@ -167,12 +179,15 @@ class EngineState:
                 self.day_open[q.code] = q.open
             # 只在价格/成交量真正变化时追加，避免重复点污染窗口
             prev = self.last_price.get(q.code)
+            h = self.history.get(q.code)
             if h is None:
                 h = deque(maxlen=max(int(self.history_len), 30))
                 self.history[q.code] = h
             if prev is None or prev != q.price or not h or h[-1][2] != q.volume_lots:
                 h.append((q_ep, q.price, q.volume_lots))
             self.last_price[q.code] = q.price
+            # 无条件推进水位线（与 history 是否追加无关）
+            self.accepted_watermark[q.code] = q_ep if wm is None else max(wm, q_ep)
             admitted[q.code] = q
         return admitted
 
@@ -203,6 +218,9 @@ class EngineState:
         for c in drop:
             self.history.pop(c, None)
             self.last_price.pop(c, None)
+            # 水位线必须与 history 一起回收，否则 prune 后残留的水位线
+            # 会让重新关注的代码被旧水位线误判为"迟到"。
+            self.accepted_watermark.pop(c, None)
             self.first_seen.pop(c, None)
         # 冷却表按时间过期
         cutoff = time.time() - 3600
@@ -886,25 +904,49 @@ class Engine:
         else:
             serving_src = self.sources.sources[serving_idx]
         caps = capabilities_for(serving_src)
-        # 账本口径（IT-P0-002-R1 / WP02）：
-        #   requested = 本轮请求的代码数（个股 + 指数）
-        #   returned  = provider 原始返回且 price>0 的（未经时间准入）
-        #   admitted  = 通过时间准入后真正进入规则的
-        # returned 与 admitted 的差额就是被时间准入拒掉的（future / out_of_order），
-        # 这两个 rejection 计数直接取自 state.stats 的差分，不另起一套口径。
+        # 账本口径（IT-P0-002-R1 / IT-P2-OBS-003 / IT-P2-OBS-005）：
+        #
+        #   requested    = 本轮请求的代码数（个股 + 指数）
+        #   returned     = provider **原始返回**的条数（含 price<=0）
+        #   admitted     = 通过**时间准入**的条数（个股与指数同口径，纯时间）
+        #   unknown_missing    = 请求了但**完全没返回**的（provider 侧缺失）
+        #   rejected_quality   = 返回了但质量不可用（price<=0）
+        #   stale/ooo_rejected = 返回了但时间不合格
+        #
+        # 以前 `returned = dict(admitted)`，于是"返回了但被内部丢弃"的票会被
+        # 记成"没返回"（unknown_missing 同时表达三种互斥语义）；`admitted`
+        # 又把"个股业务粗筛后"与"指数纯时间准入"相加，使 returned-admitted
+        # 无法解释为"被时间拒绝"（IT-P2-OBS-003）。现在三者互斥且可对账。
         req_stocks = len(self._codes)
-        raw_returned = sum(1 for q in quotes if q.price > 0)
+        raw_stock = list(quotes)
+        raw_idx = list(idx_quotes)
         future_rej = int(self.state.stats.get("t_reject:future", 0)) - _t0_future
         ooo_rej = int(self.state.stats.get("t_reject:out_of_order", 0)) - _t0_ooo
+
+        # 质量不可用：provider 返回了但 price<=0（update 内部第 145 行丢弃）
+        quality_bad = tuple(
+            q.code for q in (raw_stock + raw_idx) if q.price <= 0
+        )
+        # 完全没返回：既不在原始返回里，也不是质量/时间问题
+        raw_codes = {q.code for q in raw_stock if q.price > 0}
+        time_rejected_codes = {
+            q.code for q in raw_stock
+            if q.price > 0 and q.code not in admitted
+        }
         observation = RoundObservationSet(
             source=str(getattr(serving_src, "name", "")),
             capabilities=caps,
             requested=req_stocks + len(self.index_codes),
-            returned=raw_returned + sum(1 for q in idx_quotes if q.price > 0),
-            admitted=len(eligible) + len(idx_admitted),
+            index_requested=len(self.index_codes),
+            returned=len(raw_stock) + len(raw_idx),
+            admitted=len(admitted) + len(idx_admitted),
+            index_admitted=len(idx_admitted),
             unknown_missing=tuple(
-                c for c in self._codes if c not in returned
+                c for c in self._codes
+                if c not in raw_codes and c not in time_rejected_codes
+                and c not in quality_bad
             ),
+            rejected_quality=quality_bad,
             stale_rejected=max(future_rej, 0),
             out_of_order_rejected=max(ooo_rej, 0),
         )

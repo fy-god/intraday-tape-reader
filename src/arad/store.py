@@ -70,6 +70,9 @@ class AlertStore:
         self._notes: list[str] = []
         #: 最近一轮的观测账本（有界汇总，见 set_poll_stats）。WP02。
         self._observation: dict = {}
+        #: 观测账本的轮次序号，每写入一次 +1。消费方据此判断"这份账本
+        #: 是不是本轮的"——防止失败轮沿用上一成功轮的数字（IT-P2-OBS-004）。
+        self._observation_seq: int = 0
 
     # ------------------------------------------------------------------
     # 引擎接入
@@ -138,6 +141,7 @@ class AlertStore:
                 if callable(as_dict):
                     try:
                         self._observation = as_dict()
+                        self._observation_seq += 1
                     except Exception:  # noqa: BLE001  可观测性不得影响主流程
                         pass
 
@@ -146,6 +150,17 @@ class AlertStore:
         """最近一轮的观测账本（没有则为空 dict）。"""
         with self._lock:
             return dict(self._observation)
+
+    @property
+    def observation_seq(self) -> int:
+        """观测账本被写入的次数。
+
+        消费方（如 ``live_session``）用它在采样前后比对：序号没变就说明
+        本轮**没有**产生新账本，此时 ``observation`` 仍是上一轮的，不能
+        冒充本轮数字（IT-P2-OBS-004）。
+        """
+        with self._lock:
+            return int(self._observation_seq)
 
     def add_note(self, msg: str) -> None:
         with self._lock:

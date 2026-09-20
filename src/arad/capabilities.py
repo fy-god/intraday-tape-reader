@@ -164,10 +164,26 @@ class RoundObservationSet:
     # 注意 default_factory 必须是**可调用**，不能直接给实例。
     capabilities: SourceCapabilities = field(
         default_factory=lambda: UNKNOWN_CAPABILITIES)
+    #: 本轮**请求**的代码数（个股 + 指数）。
     requested: int = 0
+    #: 其中**指数**部分。单独分账是必需的：``requested`` 含指数，而
+    #: ``unknown_missing``/``rejected_quality`` 只覆盖个股，不拆开就永远
+    #: 对不上账（机械恒等式差 5，正好是 ``poll.index_codes`` 的长度）。
+    index_requested: int = 0
+    #: provider **原始返回**的条数（含 price<=0 这类质量不可用的）。
+    #: 必须与 ``admitted`` 分开：以前 returned 被定义成"准入后"集合，
+    #: 于是明明返回了却被内部丢弃的票被记成"没返回"（IT-P2-OBS-005）。
     returned: int = 0
+    #: 通过**时间准入**的条数（个股 + 指数，均为纯时间口径）。个股与指数
+    #: 同为纯时间准入，不得把"个股业务粗筛"的结果混进来（IT-P2-OBS-003）。
     admitted: int = 0
+    #: 其中**指数**部分（``admitted`` 的子集）。
+    index_admitted: int = 0
+    #: 请求了但 provider 本轮**完全没返回**的代码。
     unknown_missing: tuple[str, ...] = ()
+    #: provider 返回了、但因数据质量不可用而被丢弃的代码
+    #: （如 ``price<=0``）。与 unknown_missing / 时间拒绝三者互斥。
+    rejected_quality: tuple[str, ...] = ()
     stale_rejected: int = 0
     out_of_order_rejected: int = 0
     # 因能力缺失而无法评估的**代码集合**（不是次数）。同一只票可能同时缺
@@ -185,6 +201,11 @@ class RoundObservationSet:
     def missing_count(self) -> int:
         return len(self.unknown_missing)
 
+    @property
+    def stock_requested(self) -> int:
+        """个股部分请求数（``requested`` 去掉指数）。"""
+        return max(self.requested - self.index_requested, 0)
+
     def coverage(self) -> float:
         """本轮返回率（requested 为 0 时返回 0，不伪造 1.0）。"""
         return (self.returned / self.requested) if self.requested > 0 else 0.0
@@ -194,10 +215,13 @@ class RoundObservationSet:
             "source": self.source,
             "capabilities": self.capabilities.as_dict(),
             "requested": self.requested,
+            "index_requested": self.index_requested,
             "returned": self.returned,
             "admitted": self.admitted,
+            "index_admitted": self.index_admitted,
             "coverage": round(self.coverage(), 4),
             "unknown_missing": list(self.unknown_missing),
+            "rejected_quality": list(self.rejected_quality),
             "stale_rejected": self.stale_rejected,
             "out_of_order_rejected": self.out_of_order_rejected,
             "unavailable_capability": self.unavailable_capability,

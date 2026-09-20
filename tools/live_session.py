@@ -164,6 +164,8 @@ def make_round_sample(
         out["out_of_order_rejected"] = _safe_int(obs.get("out_of_order_rejected"))
         missing = obs.get("unknown_missing")
         out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
+        quality = obs.get("rejected_quality")
+        out["rejected_quality"] = len(quality) if isinstance(quality, (list, tuple)) else 0
         out["unavailable_capability"] = _safe_int(obs.get("unavailable_capability"))
         caps = obs.get("capabilities")
         out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
@@ -848,6 +850,8 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
         # _errors 是引擎内部计数器，也是"这一轮抓取失败了"的唯一真实来源
         # （poll_once 失败时直接 return []，外部看不出与"没告警"的区别）。
         errs_before = int(getattr(engine, "_errors", 0) or 0)
+        store = getattr(engine, "store", None)
+        obs_seq_before = int(getattr(store, "observation_seq", 0) or 0)
         t0 = time.perf_counter()
         fresh: list[Any] = []
         exc_note: str | None = None
@@ -865,13 +869,19 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
         history = getattr(state, "history", {}) or {}
         maxlen = max([getattr(h, "maxlen", 0) or 0 for h in history.values()]
                      + [int(getattr(state, "history_len", 0) or 0), 30])
-        # 本轮真实观测账本（WP02 / IT-P2-OBS-001）。Store 里存的是**最近一轮**
-        # 的有界汇总；拿不到就退化为不含 observation 的旧形状。
+        # 本轮真实观测账本（WP02 / IT-P2-OBS-001）。
+        #
+        # IT-P2-OBS-004：Store 里存的是**最近一轮**的汇总。若本轮 poll 抛异常
+        # 或没有推进（observation_seq 未增加），那份汇总属于**上一成功轮**，
+        # 原样写进本轮 sample 会把上一轮的覆盖率/拒绝数标在本轮名下，而
+        # sample 只有 index，事后无法识别。所以按轮次序号做归属判定：
+        # 序号未变 -> **不并入**，并记 observation_stale_from 指出实际轮次。
         obs_snapshot: dict = {}
         try:
-            store = getattr(engine, "store", None)
             get_obs = getattr(store, "observation", None)
-            if isinstance(get_obs, dict) and get_obs:
+            obs_seq_after = int(getattr(store, "observation_seq", 0) or 0)
+            if isinstance(get_obs, dict) and get_obs and not error \
+                    and obs_seq_after > obs_seq_before:
                 obs_snapshot = get_obs
         except Exception:                            # noqa: BLE001
             obs_snapshot = {}
