@@ -18,7 +18,7 @@ from typing import Any
 
 from .config import Settings, load_settings
 from .models import Alert, AlertKind, Quote
-from .session import PHASE_CN, SessionPhase, TradingCalendar
+from .session import CALL_AUCTIONS, CONTINUOUS, PHASE_CN, SessionPhase, TradingCalendar
 
 __all__ = ["AlertStore"]
 
@@ -238,9 +238,46 @@ class AlertStore:
     # ------------------------------------------------------------------
     # 读取侧（Web 调用）
     # ------------------------------------------------------------------
+    def _describe_phase(self, phase: SessionPhase) -> str:
+        """按时段给人类可读描述（**只用 phase，不碰墙钟**）。
+
+        ``TradingCalendar.describe()`` 会自己重新算 ``phase(now)``，
+        所以它**不能**用来描述一个"引擎算出来的" phase —— 回放模式下墙钟是
+        凌晨、引擎时钟是 09:40，两者会打架。这里按同一张 ``PHASE_CN`` 表
+        和同样的措辞自己拼，保证与 ``phase`` 字段自洽。
+        """
+        label = PHASE_CN.get(phase, phase.value)
+        if phase in CONTINUOUS:
+            return f"{label} 交易中"
+        if phase in CALL_AUCTIONS:
+            return f"{label}（无连续成交）"
+        if phase in (SessionPhase.CLOSED, SessionPhase.POST):
+            try:
+                nxt = self.calendar.next_open()
+            except Exception:                      # noqa: BLE001
+                return label
+            return f"{label} · 下次开盘 {nxt.strftime('%m-%d %H:%M')}"
+        return label
+
     def status(self) -> dict:
         state = self._state()
-        phase = self.calendar.phase()
+        # ⚠ 时段判定优先用**引擎实际评估过的** phase（`state.session`），
+        # 而不是拿墙钟重算（IT-P1-SERVE-REPLAY-001）。
+        #
+        # 为什么：`serve --replay` 用合成行情 + 假时钟推进，墙钟仍是凌晨，
+        # 于是 `calendar.phase()` 返回 closed。前端就会显示"休市"，
+        # 而左栏同时滚动着 63 条 09:40 的告警 —— 自相矛盾，
+        # 用户会以为数据是假的或坏了。
+        #
+        # `state.session` 由 `poll_once` 在**同一轮**用引擎自己的时钟写入
+        # （engine.py:1049 `self.state.session = phase`），所以它才是
+        # "这批数据属于哪个时段"的正确答案。
+        # 回退到墙钟只为覆盖"引擎一轮都还没跑"的启动瞬间。
+        session_phase = getattr(state, "session", None) if state is not None else None
+        if session_phase is not None:
+            phase = session_phase
+        else:
+            phase = self.calendar.phase()
         with self._lock:
             total = self._total
             by_kind = dict(self._by_kind)
@@ -261,7 +298,7 @@ class AlertStore:
         return {
             "phase": phase.value,
             "session": PHASE_CN.get(phase, phase.value),
-            "session_desc": self.calendar.describe(),
+            "session_desc": self._describe_phase(phase),
             "is_open": phase in (SessionPhase.MORNING, SessionPhase.AFTERNOON),
             "uptime_s": round(time.time() - self._started, 1),
             "universe": len(quotes),

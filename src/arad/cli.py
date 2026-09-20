@@ -148,7 +148,14 @@ def cmd_once(args: argparse.Namespace) -> int:
 
 
 def cmd_serve(args: argparse.Namespace) -> int:
-    """启动 Web 看板 + 实时引擎。"""
+    """启动 Web 看板 + 实时引擎。
+
+    ``--replay``：用合成行情驱动**同一个看板**，让用户在休市时也能看到
+    短线精灵滚动、告警弹出、分组计数这些**真实前端效果**。
+    为什么需要它：看板的实时数据只在连续竞价时段产生，而用户想"先看看
+    长什么样"的时候往往正是休市。原来只提示"去跑 replay"，
+    但 ``replay`` 是纯命令行的，**看不到看板** —— 那句话等于没解决问题。
+    """
     from .config import load_settings
     from .engine import Engine, build_notifiers, build_rules
     from .server import web as webmod
@@ -157,6 +164,9 @@ def cmd_serve(args: argparse.Namespace) -> int:
     st = load_settings(args.config)
     host = args.host or st.get("web.host", "127.0.0.1")
     port = int(args.port or st.get("web.port", 8899))
+
+    if getattr(args, "replay", False):
+        return _serve_replay(args, st, host, port, webmod)
 
     engine = Engine(source=None, settings=st, rules=build_rules(st),
                     notifiers=build_notifiers(st), calendar=TradingCalendar.load())
@@ -169,7 +179,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
     _say(f"时段：{engine.calendar.describe()}")
     if not engine.calendar.is_open():
         _say("[!] 当前非连续竞价时段，看板可打开但没有实时告警。")
-        _say("    想先看效果：python -m arad.cli replay")
+        _say("    想现在就看到短线精灵滚动：python -m arad.cli serve --replay")
     _say("按 Ctrl+C 停止")
 
     import threading
@@ -180,6 +190,85 @@ def cmd_serve(args: argparse.Namespace) -> int:
         _say("\n正在停止…")
     finally:
         engine.stop()
+        try:
+            srv.shutdown()
+            srv.server_close()
+        except Exception:  # noqa: BLE001
+            pass
+    _say("已停止")
+    return 0
+
+
+def _serve_replay(args, st, host: str, port: int, webmod) -> int:
+    """``serve --replay``：合成行情 + 真看板，把回放"喂"给前端。
+
+    关键点是**共用同一个 store**：``Replay.build_engine`` 接受 ``store=``，
+    所以可以让回放引擎把告警写进看板正在读的那个 store 里，
+    前端 SSE 就能照常收到 alert / spirit 事件 —— 不需要前端知道数据是假的。
+    """
+    import threading
+    import time as _time
+
+    from .engine import build_rules
+    from .replay import Replay, default_universe
+    from .store import AlertStore
+    from .session import TradingCalendar
+
+    stocks = default_universe(max(1, int(getattr(args, "stocks", 30))))
+    minutes = getattr(args, "minutes", None)
+    seed = int(getattr(args, "seed", 42))
+    speed = float(getattr(args, "speed", 0.0) or 0.0)
+
+    # 看板读这个 store；回放引擎往同一个 store 写
+    store = AlertStore(st, calendar=TradingCalendar.load())
+    rp = Replay(stocks, seed=seed, minutes=minutes, settings=st,
+                rules=build_rules(st), notifiers=[], store=store)
+    engine = rp.build_engine()
+    engine._codes = [s.code for s in stocks]
+
+    cfg = dict(st.web)
+    srv = webmod.create_server(store, cfg, host=host, port=port)
+    real_host, real_port = srv.server_address[0], srv.server_address[1]
+
+    _rule("启动 Web 看板（回放模式）")
+    _say(f"地址：http://{real_host}:{real_port}/")
+    _say(f"回放：{len(stocks)} 只 / seed={seed} / "
+         f"{'全时段' if not minutes else f'{minutes} 分钟'} / "
+         f"速度={'尽快' if speed <= 0 else f'{speed}x'}")
+    _say("[i] 这是**合成行情**，用于预览看板与短线精灵效果，非真实盘口。")
+    _say("按 Ctrl+C 停止")
+
+    threading.Thread(target=srv.serve_forever, name="arad-web", daemon=True).start()
+
+    stop = {"flag": False}
+
+    def _pump() -> None:
+        """逐 tick 推进回放；每 tick 之间按 speed 控速，并响应 Ctrl+C。"""
+        total = len(rp.timeline)
+        for i, ts in enumerate(rp.timeline):
+            if stop["flag"]:
+                return
+            rp.clock.set(ts)
+            try:
+                engine.poll_once(force=True)
+            except Exception as exc:  # noqa: BLE001
+                _say(f"[!] 回放第 {i + 1} 轮异常：{exc!r}")
+            if speed > 0:
+                _time.sleep(max(0.0, rp.tick_seconds / speed))
+        _say("[√] 回放已跑完 —— 看板仍可访问，按 Ctrl+C 退出")
+        _say(f"    共 {total} 轮")
+
+    pump = threading.Thread(target=_pump, name="arad-replay", daemon=True)
+    pump.start()
+    try:
+        while pump.is_alive():
+            pump.join(timeout=0.5)
+        while True:
+            _time.sleep(0.5)
+    except KeyboardInterrupt:
+        _say("\n正在停止…")
+    finally:
+        stop["flag"] = True
         try:
             srv.shutdown()
             srv.server_close()
@@ -288,6 +377,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--config", default=None)
     s.add_argument("--watch-only", action="store_true",
                    help="只盯自选股，不拉全市场股票池（启动即用，不必等 20s 刷新）")
+    s.add_argument("--replay", action="store_true",
+                   help="回放模式：用合成行情填满看板，休市时也能看到短线精灵滚动")
+    s.add_argument("--stocks", type=int, default=30,
+                   help="（--replay）合成股票数，默认 30")
+    s.add_argument("--seed", type=int, default=42, help="（--replay）随机种子")
+    s.add_argument("--minutes", type=float, default=None,
+                   help="（--replay）只跑前 N 分钟，默认整个交易日")
+    s.add_argument("--speed", type=float, default=0.0,
+                   help="（--replay）倍速；0=尽快跑完（默认），1=真实速度")
     s.set_defaults(func=cmd_serve)
 
     def _add_replay_flags(sp: argparse.ArgumentParser) -> None:
