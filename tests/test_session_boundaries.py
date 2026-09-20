@@ -30,9 +30,11 @@ CASES = [
     ("11:30:00", SessionPhase.LUNCH, False),        # 整点即午休
     ("12:59:59", SessionPhase.LUNCH, False),
     ("13:00:00", SessionPhase.AFTERNOON, True),
-    ("14:59:59", SessionPhase.AFTERNOON, True),
-    ("15:00:00", SessionPhase.POST, False),         # 整点即收盘
-    ("20:00:00", SessionPhase.POST, False),         # 注意：已收盘 ≠ 休市(CLOSED)
+    ("14:56:59", SessionPhase.AFTERNOON, True),      # 连续竞价末秒
+    ("14:57:00", SessionPhase.CLOSE_AUCTION, True),  # 收盘集合竞价（IT-P0-001）
+    ("14:59:59", SessionPhase.CLOSE_AUCTION, True),  # 仍在动，仍要抓
+    ("15:00:00", SessionPhase.POST, False),          # 整点即收盘
+    ("20:00:00", SessionPhase.POST, False),          # 注意：已收盘 ≠ 休市(CLOSED)
 ]
 
 

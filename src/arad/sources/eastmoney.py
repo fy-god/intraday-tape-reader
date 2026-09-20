@@ -315,25 +315,42 @@ class EastmoneySource:
         """全市场股票池快照（翻页 + 并发）。
 
         完整性（IT-P1-006）：``total`` 可用时，期望页数由总数算出，
-        ``pages_failed`` 为空才算完整；``total`` 不可用（``data/diff`` 为 null）
-        时只能顺序探测，遇空页即停，此时**无法证明**拿全了，故标为不完整。
+        ``pages_failed`` 为空**且未被 ``max_pages`` 截断**才算完整；
+        ``total`` 不可用（``data/diff`` 为 null）时只能顺序探测，遇空页即停，
+        此时**无法证明**拿全了，故标为不完整。
+
+        截断（IT-P1-006-R1）：``required_pages > max_pages`` 时只取前
+        ``max_pages`` 页，此时**必须**报 ``complete=False`` —— 否则 300 只的
+        部分池会被当成全市场 5913 只。截断不抛异常（调用方依赖部分数据继续
+        跑），但事实通过 ``truncated`` / ``required_pages`` / ``max_pages``
+        显式暴露在 ``universe_info()`` 里。
         """
         seq = self._next_seq()
         failed: list[int] = []
         pages_requested = 0
         expected_total = 0
+        required_pages = 0    # 按总数算出的**需要**页数（截断前）
+        truncated = False     # required_pages > max_pages
         reason = ""
         first = self._request_json(self._clist_url(1))
         quotes = parse_clist(first, seq)
         total = self._total_of(first)
         if total > 0:
             expected_total = total
-            pages = min(self.max_pages, -(-total // self.page_size))
+            required_pages = -(-total // self.page_size)
+            truncated = required_pages > self.max_pages
+            pages = min(self.max_pages, required_pages)
             pages_requested = pages
             if pages > 1:
                 more, failed = self._fetch_pages(range(2, pages + 1), seq)
                 quotes.extend(more)
-            if failed:
+            if truncated:
+                reason = (f"翻页被 max_pages={self.max_pages} 截断："
+                          f"总数 {expected_total} 只需 {required_pages} 页，"
+                          f"仅请求了前 {pages} 页")
+                if failed:
+                    reason += f"；另有 {len(failed)} 页失败 {failed[:5]}"
+            elif failed:
                 reason = f"第 {failed[0]} 页起失败，共 {len(failed)} 页"
         else:
             # total 不可用（data/diff 为 null）：顺序探测，遇空页即停，避免空转 80 页
@@ -349,13 +366,19 @@ class EastmoneySource:
             reason = "接口未返回总数，只能顺序探测，无法确认是否翻完"
         out = _dedupe(quotes)
         err = f"clist {len(failed)} 页失败: {failed[:5]}" if failed else ""
-        complete = bool(total > 0) and not failed
+        # IT-P1-006-R1：截断 (truncated) 与失败页一样，都不能算完整。
+        # 没有 total 时 required_pages=0/truncated=False，complete 仍由
+        # bool(total > 0) 决定为 False（无法证明完整），语义不变。
+        complete = bool(total > 0) and not failed and not truncated
         with self._lock:
             self._last_universe = {
                 "complete": complete,
+                "truncated": truncated,
                 "pages_failed": len(failed),
                 "pages_ok": max(pages_requested - len(failed), 0),
                 "pages_requested": pages_requested,
+                "required_pages": required_pages,
+                "max_pages": self.max_pages,
                 "expected_total": expected_total,
                 "returned": len(out),
                 "reason": reason or "已按总数翻完",

@@ -1,8 +1,13 @@
 """交易时段判定：SessionPhase / TradingCalendar。
 
-A股连续竞价：09:30-11:30、13:00-15:00
-集合竞价：09:15-09:25（开盘）、14:57-15:00（收盘，深市）
+A股连续竞价：09:30-11:30、13:00-14:57
+集合竞价：09:15-09:25（开盘）、14:57-15:00（收盘）
 静默期：09:25-09:30
+
+⚠ 修正（IT-P0-001）：旧注释把 13:00-15:00 整体当连续竞价、并把收盘集合竞价
+标成"深市"专属。实际**上交所与深交所股票一致**：下午连续竞价到 14:57，
+14:57-15:00 为收盘集合竞价。深圳 14:57-15:00 不接受撤单，上海同样按收盘
+集合竞价撮合。旧注释与旧代码在这里是同一个错误的两面。
 """
 from __future__ import annotations
 
@@ -12,7 +17,8 @@ from enum import Enum
 
 from .config import load_holidays
 
-__all__ = ["SessionPhase", "TradingCalendar", "PHASE_CN"]
+__all__ = ["SessionPhase", "TradingCalendar", "PHASE_CN",
+           "CONTINUOUS", "CALL_AUCTIONS", "OBSERVABLE"]
 
 
 class SessionPhase(str, Enum):
@@ -36,7 +42,8 @@ class SessionPhase(str, Enum):
     AUCTION = "auction"        # 09:25-09:30 静默（历史名）
     MORNING = "morning"        # 09:30-11:30
     LUNCH = "lunch"            # 11:30-13:00
-    AFTERNOON = "afternoon"    # 13:00-15:00
+    AFTERNOON = "afternoon"    # 13:00-14:57（**连续竞价**，不含收盘集合竞价）
+    CLOSE_AUCTION = "close_auction"   # 14:57-15:00 收盘集合竞价（深沪两市）
     POST = "post"              # 15:00 之后
 
     # --- 语义正确的别名（推荐使用） -------------------------------------
@@ -51,17 +58,33 @@ PHASE_CN: dict[SessionPhase, str] = {
     SessionPhase.MORNING: "早盘",
     SessionPhase.LUNCH: "午间休市",
     SessionPhase.AFTERNOON: "午盘",
+    SessionPhase.CLOSE_AUCTION: "收盘集合竞价",
     SessionPhase.POST: "已收盘",
 }
 
-# 连续竞价时段（规则默认只在此时段告警）
+# 连续竞价时段（规则默认只在此时段告警）。
+#
+# ⚠ 这里**故意不含** CLOSE_AUCTION：14:57-15:00 是收盘集合竞价，
+# 期间没有连续成交，价格由 15:00 一次性撮合决定。历史实现把它并进
+# AFTERNOON，于是 ``is_open(14:58)`` 返回 True、告警按连续竞价语义触发
+# （IT-P0-001）。本模块自己的 docstring 从第一天起就写着这个时段，
+# 但代码从未实现 —— 属于「文档声明了、代码没做」。
 CONTINUOUS = (SessionPhase.MORNING, SessionPhase.AFTERNOON)
+
+#: 集合竞价时段（开盘 + 收盘）。价格在这些窗口里**会动**，与静默期不同。
+CALL_AUCTIONS = (SessionPhase.PRE_OPEN, SessionPhase.CLOSE_AUCTION)
+
+#: 可观测/可抓取窗口：连续竞价 + 两个集合竞价。
+#: 静默期（AUCTION）不在其中 —— 它可撤单不可成交，价格冻结。
+OBSERVABLE = (SessionPhase.MORNING, SessionPhase.AFTERNOON,
+              SessionPhase.PRE_OPEN, SessionPhase.CLOSE_AUCTION)
 
 _T_AUCTION_START = time(9, 15)
 _T_SILENCE_START = time(9, 25)
 _T_OPEN = time(9, 30)
 _T_MORNING_END = time(11, 30)
 _T_AFTERNOON_START = time(13, 0)
+_T_CLOSE_AUCTION_START = time(14, 57)
 _T_CLOSE = time(15, 0)
 
 # 兼容旧名
@@ -112,7 +135,8 @@ class TradingCalendar:
             09:25:00-09:29:59  静默     AUCTION
             09:30:00-11:29:59  早盘     MORNING
             11:30:00-12:59:59  午休     LUNCH
-            13:00:00-14:59:59  午盘     AFTERNOON
+            13:00:00-14:56:59  午盘     AFTERNOON（连续竞价）
+            14:57:00-14:59:59  收盘集合竞价 CLOSE_AUCTION
             15:00:00 起         已收盘   POST
         """
         now = now or datetime.now()
@@ -129,26 +153,51 @@ class TradingCalendar:
             return SessionPhase.MORNING
         if t < _T_AFTERNOON_START:    # 11:30-13:00 午休
             return SessionPhase.LUNCH
-        if t < _T_CLOSE:              # 13:00-15:00 午盘（15:00 整已收盘）
+        if t < _T_CLOSE_AUCTION_START:   # 13:00-14:57 午盘（连续竞价）
             return SessionPhase.AFTERNOON
+        if t < _T_CLOSE:              # 14:57-15:00 收盘集合竞价（IT-P0-001）
+            return SessionPhase.CLOSE_AUCTION
         return SessionPhase.POST
 
     def is_open(self, now: datetime | None = None) -> bool:
-        """是否处于连续竞价（可交易）时段。"""
+        """是否处于**连续竞价**（可连续成交）时段。
+
+        14:57-15:00 的收盘集合竞价**不算**连续竞价（IT-P0-001）。
+        """
         return self.phase(now) in CONTINUOUS
 
+    def is_call_auction(self, now: datetime | None = None) -> bool:
+        """是否处于集合竞价（开盘 09:15-09:25 或收盘 14:57-15:00）。"""
+        return self.phase(now) in CALL_AUCTIONS
+
     def is_tradable_window(self, now: datetime | None = None) -> bool:
-        """含集合竞价的可观测窗口。"""
-        return self.phase(now) in (
-            SessionPhase.PRE_OPEN, SessionPhase.AUCTION,
-            SessionPhase.MORNING, SessionPhase.AFTERNOON,
-        )
+        """含集合竞价的可观测窗口。
+
+        ⚠ 语义澄清（IT-P0-001）：这个方法的两个历史调用点都把它当
+        "要不要抓行情"用，而它返回的是"含集合竞价"。既然收盘集合竞价现在
+        是独立时段，这里必须把 CLOSE_AUCTION 也算进去 —— 否则 14:57-15:00
+        会从"抓取"变成"不抓取"，那是**过度修正**：该时段价格确实在动。
+        真正的"不可观测"只有静默期与休市。
+        """
+        return self.phase(now) in OBSERVABLE
 
     # ------------------------------------------------------------------
     def elapsed_trading_seconds(self, now: datetime | None = None) -> float:
-        """当日已交易的连续竞价秒数（用于量能节奏对比）。
+        """当日已交易的**连续竞价**秒数（用于量能节奏对比）。
 
-        严格按左闭右开：11:30 整不再计入上午，15:00 整当天计满 14400 秒（4 小时）。
+        严格按左闭右开，且**止于 14:57**（IT-P0-001）::
+
+            09:30-11:30  7200 秒
+            13:00-14:57  7020 秒
+            全天         14220 秒
+
+        14:57-15:00 是收盘集合竞价：期间**没有连续成交**，累计成交量要到
+        15:00 一次性撮合才落地。若仍把这段计入分母（旧行为，全天 14400 秒），
+        ``volume_burst`` 的 ``avg_per_min = volume_lots / elapsed * 60``
+        就会出现"分子不动、分母继续涨"，把放量速率人为稀释掉。
+        这正是 12:07 报告所说"只增加枚举但量能时钟仍算到 15:00 不算完成"。
+
+        注意：15:00 之后返回的是**全天连续竞价**时长（14220），不是 4 小时整。
         """
         now = now or datetime.now()
         if not self.is_trading_day(now):
@@ -160,7 +209,8 @@ class TradingCalendar:
             total += max(0.0, (datetime.combine(now.date(), morning_end)
                                - datetime.combine(now.date(), _T_OPEN)).total_seconds())
         if t > _T_AFTERNOON_START:
-            after_end = min(t, _T_CLOSE)
+            # 收口在 14:57：收盘集合竞价不计入连续竞价时长
+            after_end = min(t, _T_CLOSE_AUCTION_START)
             total += max(0.0, (datetime.combine(now.date(), after_end)
                                - datetime.combine(now.date(), _T_AFTERNOON_START)).total_seconds())
         return total
@@ -192,6 +242,10 @@ class TradingCalendar:
         label = PHASE_CN.get(ph, ph.value)
         if ph in CONTINUOUS:
             return f"{label} 交易中"
+        if ph in CALL_AUCTIONS:
+            # 集合竞价有撮合、价格会动，但无连续成交 —— 说清楚，别让用户
+            # 以为"没在交易"或"在连续交易"（IT-P0-001）。
+            return f"{label}（无连续成交）"
         if ph == SessionPhase.CLOSED:
             nxt = self.next_open(now)
             return f"{label} · 下次开盘 {nxt.strftime('%m-%d %H:%M')}"

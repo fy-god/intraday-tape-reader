@@ -38,7 +38,9 @@ def cal() -> TradingCalendar:
     (at(11, 30), SessionPhase.LUNCH, "午休开始（左闭右开）"),
     (at(12, 59, 59), SessionPhase.LUNCH, "午休末秒"),
     (at(13, 0), SessionPhase.AFTERNOON, "下午开盘"),
-    (at(14, 59, 59), SessionPhase.AFTERNOON, "下午末秒"),
+    (at(14, 56, 59), SessionPhase.AFTERNOON, "连续竞价末秒"),
+    (at(14, 57), SessionPhase.CLOSE_AUCTION, "收盘集合竞价开始（IT-P0-001）"),
+    (at(14, 59, 59), SessionPhase.CLOSE_AUCTION, "收盘集合竞价末秒"),
     (at(15, 0), SessionPhase.POST, "收盘瞬间即 POST"),
     (at(23, 59, 59), SessionPhase.POST, "深夜"),
 ])
@@ -58,6 +60,8 @@ def test_continuous_contains_only_two_sessions():
     assert set(CONTINUOUS) == {SessionPhase.MORNING, SessionPhase.AFTERNOON}
     assert SessionPhase.LUNCH not in CONTINUOUS
     assert SessionPhase.PRE_OPEN not in CONTINUOUS
+    # IT-P0-001：收盘集合竞价不是连续竞价
+    assert SessionPhase.CLOSE_AUCTION not in CONTINUOUS
 
 
 def test_is_open_matches_phase(cal):
@@ -67,15 +71,55 @@ def test_is_open_matches_phase(cal):
     assert cal.is_open(at(15, 0)) is False
     assert cal.is_open(at(9, 20)) is False      # 集合竞价不可连续竞价成交
 
+    # --- IT-P0-001：14:57-15:00 是收盘集合竞价，不是连续竞价 ---
+    assert cal.is_open(at(14, 56, 59)) is True
+    assert cal.is_open(at(14, 57)) is False, "收盘集合竞价不是连续竞价"
+    assert cal.is_open(at(14, 58)) is False
+    assert cal.is_open(at(14, 59, 59)) is False
 
-def test_elapsed_trading_seconds_full_day_is_14400(cal):
-    """A股每天连续竞价 4 小时 = 14400 秒。"""
+
+def test_close_auction_is_still_observable(cal):
+    """收盘集合竞价不算连续竞价，但**必须**仍然抓行情（价格确实在动）。
+
+    这是"不过度修正"的守卫：把 14:57-15:00 从抓取窗口里一并排除，
+    同样会丢数据 —— 只是错误方向相反。
+    """
+    assert cal.is_call_auction(at(9, 20)) is True
+    assert cal.is_call_auction(at(14, 58)) is True
+    assert cal.is_call_auction(at(10, 0)) is False
+
+    assert cal.is_tradable_window(at(14, 58)) is True, "收盘集合竞价应可观测"
+    assert cal.is_tradable_window(at(9, 20)) is True
+    assert cal.is_tradable_window(at(9, 27)) is False, "静默期不可观测"
+    assert cal.is_tradable_window(at(15, 0)) is False
+
+
+def test_elapsed_trading_seconds_full_day_is_14220(cal):
+    """连续竞价时长止于 **14:57**（IT-P0-001），全天 14220 秒而非 14400。"""
     assert cal.elapsed_trading_seconds(at(9, 30)) == 0.0
     assert cal.elapsed_trading_seconds(at(10, 0)) == 1800.0
     assert cal.elapsed_trading_seconds(at(11, 30)) == 7200.0
     assert cal.elapsed_trading_seconds(at(13, 0)) == 7200.0
-    assert cal.elapsed_trading_seconds(at(15, 0)) == 14400.0
-    assert cal.elapsed_trading_seconds(at(20, 0)) == 14400.0
+    # 13:00-14:57 = 7020 秒；14:57-15:00 是收盘集合竞价，不计入连续竞价
+    assert cal.elapsed_trading_seconds(at(14, 57)) == 7200.0 + 7020.0
+    assert cal.elapsed_trading_seconds(at(14, 57)) == 14220.0
+    # 收盘集合竞价期间与收盘后，连续竞价时长都**不再增长**
+    assert cal.elapsed_trading_seconds(at(14, 58)) == 14220.0
+    assert cal.elapsed_trading_seconds(at(15, 0)) == 14220.0
+    assert cal.elapsed_trading_seconds(at(20, 0)) == 14220.0
+
+
+def test_elapsed_freezes_across_close_auction(cal):
+    """收盘集合竞价窗口内分母必须冻结。
+
+    这是 IT-P0-001 的**实质**后果（12:07 报告要求）：若量能时钟仍走到 15:00，
+    ``volume_burst`` 的 ``avg_per_min = volume_lots / elapsed * 60`` 会出现
+    "分子不动、分母继续涨"，把放量速率人为稀释 —— 只加枚举不改时钟不算修完。
+    """
+    a = cal.elapsed_trading_seconds(at(14, 57))
+    b = cal.elapsed_trading_seconds(at(14, 58))
+    c = cal.elapsed_trading_seconds(at(14, 59, 59))
+    assert a == b == c, f"收盘集合竞价期间分母应冻结：{a} / {b} / {c}"
 
 
 def test_elapsed_never_decreases(cal):

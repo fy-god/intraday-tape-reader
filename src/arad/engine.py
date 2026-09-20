@@ -21,7 +21,7 @@ from .config import PROJECT_ROOT, Settings, load_settings, load_watchlist
 from .filters import Filters
 from .models import Alert, Quote, Snapshot
 from .rules.base import Rule, RuleContext
-from .session import CONTINUOUS, SessionPhase, TradingCalendar
+from .session import OBSERVABLE, SessionPhase, TradingCalendar
 from .store import AlertStore
 
 __all__ = ["EngineState", "AlertBus", "SourceManager", "Engine", "run_forever", "build_rules", "build_notifiers"]
@@ -821,7 +821,16 @@ class Engine:
         self.store.broadcast("phase", {"phase": phase.value})
 
         if self.settings.get("poll.idle_when_closed", True) and not force:
-            if phase not in CONTINUOUS and phase is not SessionPhase.PRE_OPEN:
+            # 可抓取窗口 = 连续竞价 + 两个集合竞价（OBSERVABLE）。
+            # 静默期（09:25-09:30）与休市不抓：前者可撤单不可成交、价格冻结，
+            # 抓了只是重复数据并稀释"急拉"速度。
+            #
+            # IT-P0-001：收盘集合竞价（14:57-15:00）**必须**留在这里 ——
+            # 它虽是集合竞价、不再是连续竞价（故不在 CONTINUOUS），但价格
+            # 确实在动，把它一并排除就是过度修正。以前这里写的是
+            # `phase not in CONTINUOUS and phase is not PRE_OPEN`，语义相同
+            # 只是没把新时段列进来。
+            if phase not in OBSERVABLE:
                 if not self._codes:
                     self._maybe_refresh_universe(force=True)
                 return []
