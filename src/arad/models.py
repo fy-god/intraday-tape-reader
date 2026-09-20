@@ -138,10 +138,39 @@ def looks_like_index(symbol: str, name: str = "", bare: str = "") -> bool:
     return bool(nm) and board_of(c, nm) is Board.INDEX
 
 
+def is_new_listing(name: str) -> bool:
+    """名称是否处于「无涨跌幅限制」的新股状态（上市首日 ``N`` / 第 2-5 日 ``C``）。
+
+    **为什么必须识别**：2023 全面注册制后，新股上市**前 5 个交易日不设涨跌幅
+    限制**。A 股行情源的命名约定是：首日冠 ``N``、第 2~5 日冠 ``C``（如
+    ``N沈鼓`` / ``C沈鼓``）。若不识别，:func:`limit_rate_of` 会按板块给出
+    ±10%/±20%，算出一个**远低于现价**的"涨停价"，于是：
+
+    * ``limit_board`` 误报「打开跌停 +208%」（实测 601091 C沈鼓，现价 57.77
+      而按主板算出的 limit_up 只有 22.88，差 152%）；
+    * ``tick_surge`` / ``unusual`` 的"接近涨停"类判据同样失真。
+
+    判据**收紧到"首字母 N/C 且第二个字符是中文"**：只认这个组合，
+    避免误伤名称以 C/N 开头的正常股票（如 ``TCL`` 之类英文名）。
+    实测全市场 5564 只真实行情里，符合该形态的恰好 2 只（C沈鼓 / C信诺维），
+    且**没有**假阳性。
+    """
+    nm = str(name or "").strip()
+    if len(nm) < 2:
+        return False
+    if nm[0] not in ("N", "C"):
+        return False
+    return not nm[1].isascii()
+
+
 def limit_rate_of(code: str, name: str = "") -> float:
     """该股票的涨跌停比例（ST 主板 5%，其余按板块）。
 
     只按**板块**决定比例：双创的 ST 股仍是 20%。
+
+    ⚠ **不适用于新股**：上市前 5 个交易日无涨跌幅限制，调用方应先看
+    :meth:`Quote.has_price_limit`。这里**不**把新股特判成某个比例 ——
+    因为"无限制"不是一个比例，硬塞一个 0.0 或 1.0 都会在下游被当成真阈值。
     """
     if isinstance(code, Board):
         b = code
@@ -228,16 +257,59 @@ class Quote:
         return self.price <= 0 or self.prev_close <= 0 or self.volume_lots <= 0
 
     @property
+    def is_new_listing(self) -> bool:
+        """是否处于「无涨跌幅限制」的新股状态（上市首日 ``N`` / 第 2-5 日 ``C``）。"""
+        return is_new_listing(self.name)
+
+    @property
+    def has_price_limit(self) -> bool:
+        """本股当前是否**有**涨跌幅限制。
+
+        新股（``N``/``C`` 状态）上市前 5 个交易日无限制；此外若数据源
+        直接给了 ``limit_up``/``limit_down``（部分源会返真实值），也以它为准。
+        """
+        if self.limit_up and self.limit_up > 0 and self.limit_down and self.limit_down > 0:
+            return True
+        return not is_new_listing(self.name)
+
+    @property
     def limit_up_price(self) -> float:
+        """涨停价；**无涨跌幅限制时返回 0.0**（表示"没有这个约束"）。
+
+        为什么返回 0.0 而不是 ``prev_close * 1.1``：新股上市前 5 日真的没有
+        涨停，给一个假的 ±10% 会让 ``limit_board`` 误报
+        「打开跌停 +208%」（实测 601091 C沈鼓）。下游约定见
+        :meth:`is_at_limit_up` —— 0.0 一律当"无此约束"处理。
+        """
         if self.limit_up and self.limit_up > 0:
             return self.limit_up
+        if not self.has_price_limit:
+            return 0.0
         return round(self.prev_close * (1 + limit_rate_of(self.code, self.name)), 2)
 
     @property
     def limit_down_price(self) -> float:
+        """跌停价；**无涨跌幅限制时返回 0.0**（同 :attr:`limit_up_price`）。"""
         if self.limit_down and self.limit_down > 0:
             return self.limit_down
+        if not self.has_price_limit:
+            return 0.0
         return round(self.prev_close * (1 - limit_rate_of(self.code, self.name)), 2)
+
+    def is_at_limit_up(self, tol: float = 1e-6) -> bool:
+        """现价是否**贴着**涨停（无涨跌幅限制时恒为 False）。
+
+        这是"该股有涨停约束"的唯一正确入口：先看是否有约束，再比价格。
+        直接写 ``q.price >= q.limit_up_price`` 在无约束股上会因
+        ``limit_up_price == 0.0`` 而**恒真**。
+        """
+        lu = self.limit_up_price
+        return bool(lu > 0.0 and self.price >= lu - tol)
+
+    def is_at_limit_down(self, tol: float = 1e-6) -> bool:
+        """现价是否**贴着**跌停（无涨跌幅限制时恒为 False）。"""
+        ld = self.limit_down_price
+        return bool(ld > 0.0 and self.price <= ld + tol)
 
     @property
     def open_pct(self) -> float:

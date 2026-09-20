@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import random
 from dataclasses import dataclass, field
 from datetime import datetime, time as dtime, timedelta
@@ -364,14 +365,38 @@ def build_script(stock: ScriptedStock, timeline: Sequence[datetime],
     return quotes
 
 
+def _stable_code_seed(code: str) -> int:
+    """把股票代码映射成**跨进程稳定**的整数种子。
+
+    **为什么不能用内置 ``hash()``**（IT-P1-REPLAY-DETERMINISM-001）：
+    CPython 对 ``str`` 的 ``hash()`` 默认按 ``PYTHONHASHSEED`` **每进程随机化**
+    （抵御哈希碰撞 DoS）。于是 ``hash(s.code)`` 会让同 seed 在不同进程生成
+    **不同**行情 —— 本模块文档承诺的"同 seed + 同参数字节级可复现"是假的。
+
+    实测（三个独立子进程，seed=42）：数据指纹
+    ``8ba5542d…`` / ``4d73762d…`` / ``95a79558…`` 三者互不相同；
+    固定 ``PYTHONHASHSEED=0`` 后三者全部相同 —— 根因确认。
+    后果：``selftest``/``replay`` 的告警数在 68~71 之间漂移，
+    **不能作为回归判据**，历次报告里"selftest N 条告警"也都不是稳定不变量。
+
+    这里改用 SHA-256 前 8 字节，它对同一字符串**永远**给出同一个值。
+    """
+    h = hashlib.sha256(str(code).encode("utf-8")).digest()
+    return int.from_bytes(h[:8], "big") % 2**31
+
+
 def generate_script(stocks: Sequence[ScriptedStock], day: datetime,
                     *, seed: int = 42, tick_seconds: float = TICK_SECONDS,
                     minutes: float | None = None) -> dict[str, list[Quote]]:
-    """生成 ``{code: [Quote, ...]}`` 的整段回放数据（确定性）。"""
+    """生成 ``{code: [Quote, ...]}`` 的整段回放数据（确定性）。
+
+    确定性由 :func:`_stable_code_seed` 保证：同 ``seed`` + 同股票列表，
+    **在任何进程、任何时刻**都产出逐字相同的数据。请勿改回 ``hash()``。
+    """
     timeline = trading_timeline(day, tick_seconds=tick_seconds, minutes=minutes)
     out: dict[str, list[Quote]] = {}
     for i, s in enumerate(stocks):
-        rng = random.Random((seed * 1_000_003) ^ (i * 7919) ^ hash(s.code) % 2**31)
+        rng = random.Random((seed * 1_000_003) ^ (i * 7919) ^ _stable_code_seed(s.code))
         out[s.code] = build_script(s, timeline, rng)
     return out
 
