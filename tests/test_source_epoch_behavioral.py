@@ -16,10 +16,22 @@
 |---|---|---|
 | 001 跨源水位线误杀 | **能** | ``test_engine_end_to_end_switch_keeps_data``：走真实 ``poll_once`` 切源路径，旧代码 ``admitted=0`` |
 | 002 原始 ts 丢失 | **不能** | 夹到 now 是**既有且被测试固定**的契约（``test_engine_time_admission.py`` 断言 ``h[-1][0] == EP``）。本次修复**不改变**该契约，只是**额外留痕** ``provider_ts_raw`` —— "多了一个属性"只能靠新符号验证。故 002 的牙在合同文件里（结构性），此处**不假装**有行为牙 |
-| 003 首见陈旧 | **能** | ``test_stale_first_seen_does_not_pollute_state``：只看旧 API 的 ``quotes``/``history`` 有没有被污染 |
+| 003 首见陈旧 | **本轮下调为"不能"** | 见下 |
+
+> **003 的下调（如实交代）**：上一轮 `100e06a` 在此处有行为级牙 ——
+> ``test_stale_first_seen_does_not_pollute_state`` 断言 3 天前的首见包不得污染
+> ``quotes``/``history``。但那一轮同时把三源写成 ``freshness_allowed=false``，
+> 于是"硬拒绝"与自己的合同**互相矛盾**（WP03 指出）。本轮改为合同驱动：
+> 未受信任来源**不硬拒绝**，只记 age 诊断。因此本文件里 003 的行为级断言
+> **从"必须被拒"翻转为"必须被接纳且留下诊断"** —— 旧代码（条件更少）在这条
+> 上仍然是"接纳"，所以它**不再是验牙**，而是回归保护。
+> 003 的验牙能力现在落在 ``test_source_epoch_route.py`` 的
+> ``test_stale_rejected_per_route_epoch_when_freshness_trusted``（结构性：
+> 需要 ``TIME_POLICY`` / ``source_name`` 新 API）。
 
 > 直说：002 我没有拿到行为级验牙。谁若要求"002 也有行为牙"，正确做法是先推翻
 > "夹到 now"这个既有契约 —— 但那会改变已被测试固定的语义，本轮**不擅自**做。
+> 003 的行为级牙则是在本轮**被我自己下调掉的**（因为原断言与合同矛盾）。
 
 ## 关于"直接调 update()"的边界
 
@@ -140,19 +152,24 @@ def test_engine_switch_updates_price_cache():
 
 
 # ===========================================================================
-# 003 —— 首见陈旧（**行为级**：只看旧 API 的 quotes/history）
+# 003 —— 首见陈旧（**本轮下调**：合同驱动，不再无条件硬拒绝）
 # ===========================================================================
-def test_stale_first_seen_does_not_pollute_state():
-    st = EngineState(history_len=360)
-    st.update([_q("999999", NOW - timedelta(days=3))], NOW)
-    assert "999999" not in st.quotes, "3 天前的首见报价污染了缓存"
-    assert "999999" not in st.history, "3 天前的首见报价污染了 history"
+def test_stale_first_seen_is_admitted_under_unknown_contract():
+    """WP03：合同三源 freshness_allowed=false -> provider ts 不得硬拒绝。
 
+    这是对上一轮 `100e06a` 的**明确下调**。上一轮此处的断言是
+    "3 天前的首见报价污染了缓存"，但硬拒绝与自己的 `source_time_contract.json`
+    矛盾（三源 role=unknown，无从判定该 ts 的语义）。
 
-def test_stale_first_seen_is_counted():
+    行为级 —— 只看 ``quotes``。
+    """
     st = EngineState(history_len=360)
-    st.update([_q("999999", NOW - timedelta(days=3))], NOW)
-    assert st.stats.get("t_reject:stale", 0) >= 1, "陈旧拒绝应计入 stats"
+    st.begin_source_epoch("stocks", "tencent#0", source_name="tencent")
+    st.update([_q("999999", NOW - timedelta(days=3))], NOW, route="stocks")
+    assert "999999" in st.quotes, (
+        "合同禁止用 provider ts 硬判新鲜度，但代码仍拒绝了 —— 与合同矛盾")
+    assert st.time_age_seconds.get("999999", 0) > 4 * 3600, \
+        "接纳的同时必须留下 age 诊断"
 
 
 # ===========================================================================

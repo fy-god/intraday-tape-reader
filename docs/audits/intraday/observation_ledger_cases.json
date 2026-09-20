@@ -1,0 +1,41 @@
+{
+  "_doc": "WP04 / IT-P1-OBS-010：观测账本互斥桶。终态桶为 admitted / explicit_unavailable / future / stale(诊断) / out_of_order / quality。",
+  "file": "tests/test_observation_ledger_buckets.py",
+  "total_cases": 17,
+  "cases": [
+    "test_zero_price_goes_to_rejected_quality_not_missing",
+    "test_truly_missing_code_still_reported",
+    "test_time_rejected_code_is_not_double_counted_as_missing",
+    "test_three_buckets_are_mutually_exclusive",
+    "test_ledger_identity_holds",
+    "test_stock_and_index_are_separately_accounted",
+    "test_index_not_requested_is_not_counted_as_requested",
+    "test_admitted_does_not_include_business_filtered",
+    "test_returned_minus_admitted_is_time_rejection",
+    "test_as_dict_exposes_rejected_quality",
+    "test_observation_status_json_safe_with_new_bucket",
+    "test_stale_diagnosed_is_recorded_and_separate_from_future",
+    "test_fresh_quote_is_not_stale_diagnosed",
+    "test_stale_diagnosis_is_per_round_not_cumulative",
+    "test_stale_bucket_is_json_safe",
+    "test_requested_index_that_never_returns_lands_in_missing",
+    "test_index_requested_and_missing_stay_reconciled"
+  ],
+  "buckets": {
+    "admitted": "通过时间准入（含指数，index_admitted 为子集）",
+    "explicit_unavailable": "provider 明确不可用（unknown_missing / rejected_quality）",
+    "future": "ts 超前 > FUTURE_TOLERANCE_SECONDS -> future_rejected（拒绝）",
+    "stale": "age > STALE_TOLERANCE_SECONDS -> provider_stale_diagnosed（**诊断，不拒绝**）",
+    "out_of_order": "同 (route, epoch) 内 ts 倒退 -> out_of_order_rejected（拒绝）",
+    "quality": "price<=0 -> rejected_quality"
+  },
+  "fixed_defect": {
+    "id": "IT-P1-OBS-010",
+    "was": "RoundObservationSet.stale_rejected 被 alias 成 future_rejected，两个互斥的桶永远同值（唯一数据源 t_reject:future，名实相反）",
+    "now": "stale_rejected 指向 provider_stale_diagnosed（陈旧诊断）；future_rejected 保持超前拒绝。两者可不等，且有测试钉住。"
+  },
+  "run": {
+    "exit_code": 0,
+    "summary": "29 passed in 0.64s"
+  }
+}

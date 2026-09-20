@@ -27,14 +27,16 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, NamedTuple
 
 from ..models import Quote, board_of, guess_prefix
 from .base import SourceError
 
 __all__ = [
     "EastmoneySource",
+    "ClistPage",
     "parse_clist",
+    "parse_clist_page",
     "parse_ulist",
     "secid_of",
     "CLIST_URL",
@@ -236,16 +238,70 @@ def parse_clist(payload: str | dict, seq: int = 0) -> list[Quote]:
 
     ``data`` 为 null 或 ``data.diff`` 为 null -> 返回 ``[]``（该页无数据，不算失败）。
     字段映射见契约 2.2；f2/f18 为 ``"-"`` 的行被丢弃。
+
+    只要可用 Quote，不要传输账本时用它；需要**双账**（IT-P1-COMPLETE-001-R1）
+    请用 ``parse_clist_page()`` —— 本函数是它的 ``.quotes`` 投影。
+    """
+    return list(parse_clist_page(payload, seq).quotes)
+
+
+class ClistPage(NamedTuple):
+    """单页 clist 的**双账**（IT-P1-COMPLETE-001-R1）—— 传输层与解析层分账。
+
+    为什么必须分开：``data.total`` 是 **transport/universe 口径**（含停牌、
+    含字段缺失的原始行），而 ``_quote_of`` 会按契约丢弃 ``f2/f18`` 为 ``"-"``
+    或 ``<= 0`` 的行。把两者塞进一个布尔，就会把「市场里有停牌股」误判成
+    「服务端少给了数据」。
+
+    字段::
+
+        quotes          通过 parser 质量校验的 Quote（本页、未去重）
+        raw_rows        ``data.diff`` 的原始行数（传输层收到多少行）
+        raw_code_rows   其中能规范化出 6 位代码的行数
+        codes           能规范化出的代码（保序，含重复；供 unique 统计）
+        total           API 声称的总数（``data.total``；无则 0）
+    """
+
+    quotes: list[Quote]
+    raw_rows: int
+    raw_code_rows: int
+    codes: tuple[str, ...]
+    total: int
+
+    @property
+    def dropped_invalid(self) -> int:
+        """被 parser 丢弃的行数（含无代码行与价格无效行）。"""
+        return self.raw_rows - len(self.quotes)
+
+
+def parse_clist_page(payload: str | dict, seq: int = 0) -> ClistPage:
+    """解析 clist 单页并**同时**产出传输账本与可用 Quote（纯函数，无 I/O）。
+
+    与 ``parse_clist`` 的差别只在返回值：这里额外报告 ``raw_rows`` /
+    ``raw_code_rows`` / ``codes`` / ``total``，让 ``universe()`` 能把
+    「传输完整性」与「解析可用率」分别记账。
     """
     obj = _as_dict(payload)
     if not obj:
-        return []
-    out: list[Quote] = []
+        return ClistPage(quotes=[], raw_rows=0, raw_code_rows=0, codes=(), total=0)
+    quotes: list[Quote] = []
+    codes: list[str] = []
+    raw_rows = 0
     for row in _rows_of(obj):
+        raw_rows += 1
+        code = _norm_code(row.get("f12")) if isinstance(row, Mapping) else None
+        if code is not None:
+            codes.append(code)
         q = _quote_of(row, seq)
         if q is not None:
-            out.append(q)
-    return out
+            quotes.append(q)
+    data = obj.get("data")
+    total = 0
+    if isinstance(data, Mapping):
+        num = _num(data.get("total"), 0.0)
+        total = int(num) if num and num > 0 else 0
+    return ClistPage(quotes=quotes, raw_rows=raw_rows,
+                     raw_code_rows=len(codes), codes=tuple(codes), total=total)
 
 
 def parse_ulist(payload: str | dict, seq: int = 0) -> list[Quote]:
@@ -314,23 +370,34 @@ class EastmoneySource:
     def universe(self) -> list[Quote]:
         """全市场股票池快照（翻页 + 并发）。
 
-        完整性（IT-P1-006）：``total`` 可用时，期望页数由总数算出，
-        ``pages_failed`` 为空**且未被 ``max_pages`` 截断**才算完整；
-        ``total`` 不可用（``data/diff`` 为 null）时只能顺序探测，遇空页即停，
-        此时**无法证明**拿全了，故标为不完整。
+        完整性在这里是**两把独立的尺子**（IT-P1-COMPLETE-001-R1）：
 
-        截断（IT-P1-006-R1）：``required_pages > max_pages`` 时只取前
-        ``max_pages`` 页，此时**必须**报 ``complete=False`` —— 否则 300 只的
-        部分池会被当成全市场 5913 只。截断不抛异常（调用方依赖部分数据继续
-        跑），但事实通过 ``truncated`` / ``required_pages`` / ``max_pages``
-        显式暴露在 ``universe_info()`` 里。
+        * **传输轴** ``transport_complete``：服务端有没有把池子给全。
+          判据 = 有总数 + 无失败页 + 未被 ``max_pages`` 截断 +
+          ``raw_unique_codes >= transport_expected_total``。
+          只数**传输层收到的原始行/代码**，与 parser 丢不丢停牌行无关。
+        * **可用轴** ``usable_coverage``：解析后真正能用的比例，
+          纯诊断，**不参与** ``transport_complete``。
 
-        行数缩水（IT-P1-COMPLETE-001）：仅看页数**不够** —— 页数够但每页内容
-        缩水（服务端限流/降级、边界重叠去重）时，拿到的 ``len(out)`` 会远低于
-        ``expected_total``。故 ``complete`` 还要求 ``len(out) >= expected_total``。
-        判据是「不少于」而非「等于」：翻页边界重叠会让 ``len(out)`` 略高于
-        ``expected_total``（实测 5913 只 -> 6000 行），这是**正常**的上界重叠，
-        不能因此判 incomplete。
+        为什么必须分开：``data.total`` 是 transport/universe 口径（含停牌股），
+        而契约 2.2 明文要求 parser 丢弃 ``f2/f18`` 为 ``"-"`` 或 ``<= 0`` 的行。
+        拿 ``len(usable_quotes)`` 去比 ``total``，等于把「市场里有停牌股」判成
+        「服务端少给了数据」—— 实测 A 股停牌率约 6.06%（docs/NOTES_tencent.md：
+        5908 只里 358 只停牌），于是每次刷新都假报 incomplete，``engine.py`` 的
+        ``complete`` 门控拒绝覆盖现有池，**新上市代码永远进不来**
+        （IT-P1-COMPLETE-001-R1，18:22 冻结树实测 0/10）。
+
+        兼容：``meta["complete"] = meta["transport_complete"]``，既有
+        ``engine.py`` 的 ``meta.get("complete", True)`` 语义继续成立。
+
+        截断（IT-P1-006-R1）与失败页（IT-P1-006）语义不变，仍令 False。
+        ``total`` 不可用（``data/diff`` 为 null）时只能顺序探测，没有基准就
+        **无法证明**拿全了，也报 False。
+
+        注意 ``usable_coverage`` 可能极低（极端时全市场停牌 -> 0.0）而
+        ``transport_complete`` 仍为 True：传输确实完整，只是没有可用行情。
+        ``engine.refresh_universe`` 对空 ``quotes`` 另有 ``if not quotes``
+        保护，不会把空池写进股票池。
         """
         seq = self._next_seq()
         failed: list[int] = []
@@ -339,64 +406,77 @@ class EastmoneySource:
         required_pages = 0    # 按总数算出的**需要**页数（截断前）
         truncated = False     # required_pages > max_pages
         reason = ""
-        first = self._request_json(self._clist_url(1))
-        quotes = parse_clist(first, seq)
-        total = self._total_of(first)
+        pages: list[ClistPage] = []
+        first = parse_clist_page(self._request_json(self._clist_url(1)), seq)
+        pages.append(first)
+        total = first.total
         if total > 0:
             expected_total = total
             required_pages = -(-total // self.page_size)
             truncated = required_pages > self.max_pages
-            pages = min(self.max_pages, required_pages)
-            pages_requested = pages
-            if pages > 1:
-                more, failed = self._fetch_pages(range(2, pages + 1), seq)
-                quotes.extend(more)
+            pages_requested = min(self.max_pages, required_pages)
+            if pages_requested > 1:
+                more, failed = self._scan_pages(range(2, pages_requested + 1), seq)
+                pages.extend(more)
             if truncated:
                 reason = (f"翻页被 max_pages={self.max_pages} 截断："
                           f"总数 {expected_total} 只需 {required_pages} 页，"
-                          f"仅请求了前 {pages} 页")
+                          f"仅请求了前 {pages_requested} 页")
                 if failed:
                     reason += f"；另有 {len(failed)} 页失败 {failed[:5]}"
             elif failed:
                 reason = f"第 {failed[0]} 页起失败，共 {len(failed)} 页"
         else:
-            # total 不可用（data/diff 为 null）：顺序探测，遇空页即停，避免空转 80 页
+            # total 不可用（data/diff 为 null）：顺序探测，遇空页即停，避免空转 80 页。
+            # 「空页」判据沿用**可用行情为空**（而不是 raw 行为空），与修复前一致。
             for pn in range(2, self.max_pages + 1):
-                rows = parse_clist(self._request_json(self._clist_url(pn)), seq)
-                if not rows:
+                page = parse_clist_page(self._request_json(self._clist_url(pn)), seq)
+                if not page.quotes:
                     break
-                quotes.extend(rows)
+                pages.append(page)
                 pages_requested = pn
             else:
                 pages_requested = self.max_pages
             # 没有 total 就没有「应该有多少只」的基准，无法证明完整。
             reason = "接口未返回总数，只能顺序探测，无法确认是否翻完"
-        out = _dedupe(quotes)
-        # IT-P1-COMPLETE-001：页数够 **不代表** 行数够。服务端限流/降级时每页
-        # 只回几行，或边界大量重叠被去重后，len(out) 会远低于 expected_total，
-        # 而此前 complete 只看「有总数 + 无失败页 + 未截断」，于是 600 行
-        # （全市场的 10.1%）被当成完整全市场采用（engine.py 的 complete 门控）。
-        #
-        # 判据用「不少于」而非「等于」：翻页边界重叠会让 len(out) 略高于
-        # expected_total（实测 total=5913、60 页 x 100 行 -> 6000 行），这是
-        # **正常的上界重叠**，绝不能因此判 incomplete。
+
+        # ---- 双账：传输层原始行 与 解析后可用行情 分开数 ------------------
+        raw_rows = sum(p.raw_rows for p in pages)
+        raw_code_rows = sum(p.raw_code_rows for p in pages)
+        raw_unique_codes = len({c for p in pages for c in p.codes})
+        duplicate_codes = raw_code_rows - raw_unique_codes
+        parsed: list[Quote] = [q for p in pages for q in p.quotes]
+        out = _dedupe(parsed)
+        usable_quotes = len(out)
+        dropped_invalid = raw_rows - len(parsed)
+
+        # shortfall 是**传输轴**缺口：原始唯一代码没覆盖住服务端声明的总数。
+        # 停牌行有代码、只是价格无效 —— 它计入 raw_unique_codes，**不产生**
+        # shortfall（这正是本缺陷的修复点）。判据仍是「不少于」而非「等于」：
+        # 翻页边界重叠会让 raw_unique_codes 略高于 expected_total（实测
+        # total=5913 -> 6020），那是**正常的上界重叠**，不能判 incomplete。
         shortfall = 0
-        if expected_total > 0 and len(out) < expected_total:
-            shortfall = expected_total - len(out)
-            cover = len(out) / expected_total
-            shrink = (f"行数缩水：实际只拿到 {len(out)} 行 < 总数 {expected_total} "
-                      f"（缺 {shortfall} 行，覆盖 {cover:.1%}）")
+        if expected_total > 0 and raw_unique_codes < expected_total:
+            shortfall = expected_total - raw_unique_codes
+            cover = raw_unique_codes / expected_total
+            shrink = (f"行数缩水：传输层只有 {raw_unique_codes} 个唯一代码"
+                      f"（{raw_rows} 行，去重后 {usable_quotes} 条可用）"
+                      f" < 总数 {expected_total}（缺 {shortfall}，覆盖 {cover:.1%}）")
             reason = f"{reason}；{shrink}" if reason else shrink
         err = f"clist {len(failed)} 页失败: {failed[:5]}" if failed else ""
         # IT-P1-006-R1：截断 (truncated) 与失败页一样，都不能算完整。
         # 没有 total 时 required_pages=0/truncated=False/expected_total=0，
-        # shortfall 恒为 0，complete 仍由 bool(total > 0) 决定为 False
-        # （没有基准即无法证明完整），既有语义不变。
-        complete = (bool(total > 0) and not failed and not truncated
-                    and shortfall == 0)
+        # shortfall 恒为 0，transport_complete 仍由 bool(total > 0) 决定为
+        # False（没有基准即无法证明完整），既有语义不变。
+        transport_complete = (bool(total > 0) and not failed and not truncated
+                              and shortfall == 0)
+        # 可用率只是**诊断**：不参与 transport_complete，否则又回到旧缺陷。
+        usable_coverage = (usable_quotes / expected_total) if expected_total > 0 else 0.0
         with self._lock:
             self._last_universe = {
-                "complete": complete,
+                # 兼容字段：既有调用方（engine.py 的 complete 门控）继续可用
+                "complete": transport_complete,
+                "transport_complete": transport_complete,
                 "truncated": truncated,
                 "pages_failed": len(failed),
                 "pages_ok": max(pages_requested - len(failed), 0),
@@ -404,10 +484,22 @@ class EastmoneySource:
                 "required_pages": required_pages,
                 "max_pages": self.max_pages,
                 "expected_total": expected_total,
-                "returned": len(out),
-                # 少于 expected_total 的行数（0 = 未缩水）；> 0 时 complete 恒为 False
+                "transport_expected_total": expected_total,
+                "returned": usable_quotes,
+                # 传输轴缺口（0 = 原始代码已覆盖总数）；> 0 时 transport_complete 恒 False
                 "shortfall": shortfall,
                 "reason": reason or "已按总数翻完",
+                # ---- 双账明细 ----
+                "raw_rows": raw_rows,                    # 收到的原始行数（去重前）
+                "raw_code_rows": raw_code_rows,          # 其中能规范化出代码的行数
+                "raw_unique_codes": raw_unique_codes,    # 唯一代码数（传输轴覆盖）
+                # 重复出现的代码个数（== raw_code_rows - raw_unique_codes）；
+                # 无代码的行不计入这里，它们在 raw_rows - raw_code_rows 里
+                "duplicate_codes": duplicate_codes,
+                "usable_rows": len(parsed),              # 能解析成 Quote 的行数
+                "usable_quotes": usable_quotes,          # 去重后的 Quote 数（= returned）
+                "dropped_invalid": dropped_invalid,      # 被 parser 丢弃的行数
+                "usable_coverage": usable_coverage,      # 可用率（诊断，不参与判定）
             }
         self._finish(err, out)
         return out
@@ -565,34 +657,32 @@ class EastmoneySource:
             raise SourceError("eastmoney 响应结构异常（非对象）")
         return dict(obj)
 
-    def _total_of(self, payload: Mapping[str, Any]) -> int:
-        data = payload.get("data")
-        if not isinstance(data, Mapping):
-            return 0
-        total = _num(data.get("total"), 0.0)
-        return int(total) if total and total > 0 else 0
-
     # --- 分页 / 分批 -----------------------------------------------------
-    def _fetch_one_page(self, pn: int, seq: int) -> list[Quote]:
-        return parse_clist(self._request_json(self._clist_url(pn)), seq)
+    # 注意：不要恢复「只返回 list[Quote] 的单页抓取」辅助函数（旧 ``_fetch_one_page``
+    # / ``_fetch_pages`` 已删除）。``universe()`` 必须拿得到**传输账本**
+    # （raw_rows / codes），否则又会退化成拿 post-parse 条数去比 API total ——
+    # 那正是 IT-P1-COMPLETE-001-R1 的根因。
+    def _scan_one_page(self, pn: int, seq: int) -> ClistPage:
+        """抓一页并保留**传输账本**（``universe()`` 要用 raw 行/代码数）。"""
+        return parse_clist_page(self._request_json(self._clist_url(pn)), seq)
 
-    def _fetch_pages(self, pns: Iterable[int], seq: int) -> tuple[list[Quote], list[int]]:
-        """并发抓多页；返回 (行情, 失败页号列表)。
+    def _scan_pages(self, pns: Iterable[int], seq: int) -> tuple[list[ClistPage], list[int]]:
+        """并发抓多页；返回 (每页双账, 失败页号列表)。语义同旧 ``_fetch_pages``。
 
-        单页失败不抛异常 —— 全市场 5913 只里丢一页（100 只）仍可用，
-        整体崩掉反而会让引擎无谓地故障转移。失败页号由调用方记入 health。
+        返回的页按 ``pn`` 升序（并发完成顺序不确定，排序后才能让去重「先到先得」
+        有确定的语义：靠前的页赢得重码）。
         """
-        pages = list(pns)
-        if not pages:
+        wanted = list(pns)
+        if not wanted:
             return [], []
-        out: list[Quote] = []
+        got: dict[int, ClistPage] = {}
         failed: list[int] = []
-        with ThreadPoolExecutor(max_workers=min(self.workers, len(pages))) as ex:
-            futs = {ex.submit(self._fetch_one_page, pn, seq): pn for pn in pages}
+        with ThreadPoolExecutor(max_workers=min(self.workers, len(wanted))) as ex:
+            futs = {ex.submit(self._scan_one_page, pn, seq): pn for pn in wanted}
             for fut in as_completed(futs):
                 pn = futs[fut]
                 try:
-                    out.extend(fut.result())
+                    got[pn] = fut.result()
                 except SourceError as exc:
                     failed.append(pn)
                     with self._lock:
@@ -601,9 +691,9 @@ class EastmoneySource:
             failed.sort()
             with self._lock:
                 self._stats["pages_failed"] += len(failed)
-            if len(failed) == len(pages):
-                raise SourceError(f"eastmoney clist 全部 {len(pages)} 页失败")
-        return out, failed
+            if len(failed) == len(wanted):
+                raise SourceError(f"eastmoney clist 全部 {len(wanted)} 页失败")
+        return [got[pn] for pn in sorted(got)], failed
 
     def _fetch_ulist(self, codes: list[str], seq: int) -> list[Quote]:
         return parse_ulist(self._request_json(self._ulist_url(codes)), seq)

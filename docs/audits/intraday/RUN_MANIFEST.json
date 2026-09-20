@@ -1,0 +1,277 @@
+{
+  "_doc": "本轮（2026-09-20 21:00 JST）执行清单。未执行项写 not_run + 原因，不填 0，不把历史数字冒充本轮执行。",
+  "generated_at_jst": "2026-09-20T21:50:44+09:00",
+  "repo": "fy-god/intraday-tape-reader",
+  "branch": "main",
+  "head_local": "32acc32462b94411bdaa83b1c13a02290486f4a0",
+  "head_origin_main": "32acc32462b94411bdaa83b1c13a02290486f4a0",
+  "pushed": true,
+  "worktree_dirty": true,
+  "worktree_status": [
+    "M docs/ARCHITECTURE.md",
+    " M docs/audits/intraday/source_time_contract.json",
+    " M src/arad/capabilities.py",
+    " M src/arad/engine.py",
+    " M src/arad/rules/base.py",
+    " M src/arad/rules/limit_board.py",
+    " M src/arad/rules/spirit_index.py",
+    " M src/arad/sources/eastmoney.py",
+    " M tests/test_eastmoney_truncation.py",
+    " M tests/test_engine_admission_snapshot.py",
+    " M tests/test_live_session_observation.py",
+    " M tests/test_observation_ledger_buckets.py",
+    " M tests/test_observation_naming_and_detail.py",
+    " M tests/test_rule_limit_board.py",
+    " M tests/test_source_epoch_behavioral.py",
+    " M tests/test_source_epoch_time_contract.py",
+    " M tools/live_session.py",
+    "?? docs/audits/intraday/RUN_MANIFEST.json",
+    "?? docs/audits/intraday/index_current_reconcile.json",
+    "?? docs/audits/intraday/observation_ledger_cases.json",
+    "?? docs/audits/intraday/source_epoch_route_cases.json",
+    "?? docs/audits/intraday/time_policy_matrix.json",
+    "?? docs/audits/intraday/time_policy_matrix_check.json",
+    "?? docs/audits/intraday/universe_transport_reconcile.json",
+    "?? tests/test_index_current_view.py",
+    "?? tests/test_source_epoch_route.py",
+    "?? tests/test_time_policy_matrix.py"
+  ],
+  "diff_stat": [
+    "docs/ARCHITECTURE.md                           |  50 +++",
+    " docs/audits/intraday/source_time_contract.json |   7 +-",
+    " src/arad/capabilities.py                       |  52 ++-",
+    " src/arad/engine.py                             | 289 ++++++++++--",
+    " src/arad/rules/base.py                         |  10 +",
+    " src/arad/rules/limit_board.py                  |  40 +-",
+    " src/arad/rules/spirit_index.py                 |  22 +-",
+    " src/arad/sources/eastmoney.py                  | 250 +++++++----",
+    " tests/test_eastmoney_truncation.py             | 246 +++++++++++",
+    " tests/test_engine_admission_snapshot.py        |  19 +-",
+    " tests/test_live_session_observation.py         | 547 +++++++++++++++++++++++",
+    " tests/test_observation_ledger_buckets.py       | 159 ++++++-",
+    " tests/test_observation_naming_and_detail.py    |  20 +-",
+    " tests/test_rule_limit_board.py                 | 102 +++++",
+    " tests/test_source_epoch_behavioral.py          |  37 +-",
+    " tests/test_source_epoch_time_contract.py       |  52 ++-",
+    " tools/live_session.py                          | 586 ++++++++++++++++++++++++-",
+    " 17 files changed, 2298 insertions(+), 190 deletions(-)"
+  ],
+  "full_pytest": {
+    "exit_code": 0,
+    "summary": "1430 passed in 72.51s (0:01:12)",
+    "scope": [
+      "<full suite>"
+    ]
+  },
+  "gates": {
+    "check_audit_shots.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_bom.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_colors.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_config_consumed.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_config_wiring.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_orphan_config.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_readme_tools.py": {
+      "exit_code": 0,
+      "ok": true
+    },
+    "check_spirit_mapping.py": {
+      "exit_code": 0,
+      "ok": true
+    }
+  },
+  "dashboard_render_check": {
+    "exit_code": 0,
+    "ok": true
+  },
+  "all_gates_green": true,
+  "work_packages": {
+    "WP01_transport_usable_double_ledger": {
+      "status": "DONE",
+      "files": [
+        "src/arad/sources/eastmoney.py",
+        "tests/test_eastmoney_truncation.py"
+      ],
+      "artifact": "universe_transport_reconcile.json",
+      "teeth": {
+        "_method": "git stash push -- src/arad/sources/eastmoney.py",
+        "result": "9 failed / 20 passed",
+        "behavioral_red": [
+          "TestTransportUsableDoubleLedger::test_suspended_rows_keep_transport_complete",
+          "TestNewListingsEnterPoolDespiteInvalidRows::test_new_listings_enter_pool",
+          "TestNewListingsEnterPoolDespiteInvalidRows::test_new_listings_also_enter_when_pool_is_pinned_large"
+        ],
+        "behavioral_red_count": 3,
+        "structural_red_count": 6,
+        "_honest_note": "6 条 KeyError 只证明新键不存在（结构性），不当作业绩。真验牙是 3 条语义失败：停牌行把 transport 判 incomplete、以及 10 个新上市代码进不来（assert 0 != 0）。"
+      }
+    },
+    "WP02_route_specific_source_epoch": {
+      "status": "DONE",
+      "files": [
+        "src/arad/engine.py",
+        "tests/test_source_epoch_route.py"
+      ],
+      "artifact": "source_epoch_route_cases.json",
+      "teeth": {
+        "result": "13 failed / 0 passed",
+        "behavioral_red_count": 2,
+        "structural_red_count": 11
+      }
+    },
+    "WP03_time_policy_contract": {
+      "status": "DONE",
+      "files": [
+        "src/arad/engine.py",
+        "tests/test_time_policy_matrix.py"
+      ],
+      "artifact": "time_policy_matrix.json + time_policy_matrix_check.json",
+      "note": "下调上一轮：合同 freshness_allowed=false 时不做 hard stale reject，只记 age 诊断。硬拒绝能力按 (route, epoch) 保留。"
+    },
+    "WP04_observation_ledger_stale_bucket": {
+      "status": "DONE",
+      "files": [
+        "src/arad/capabilities.py",
+        "src/arad/engine.py",
+        "tests/test_observation_ledger_buckets.py",
+        "tests/test_observation_naming_and_detail.py"
+      ],
+      "artifact": "observation_ledger_cases.json",
+      "note": "stale_rejected 不再 alias 到 future_rejected —— 两个互斥的桶不再永远同值。"
+    },
+    "WP05_live_session_observation_aggregation": {
+      "status": "DONE",
+      "files": [
+        "tools/live_session.py",
+        "tests/test_live_session_observation.py"
+      ],
+      "note": "summarize_rounds 从 11 键扩到 37 键；evaluate_health 新增 coverage/capability 检查 + 三级 level(ok/warn/fail)。阈值有实测锚点：健康轮真实覆盖率 99.91%（5569 请求/5564 返回），故不得要求 100%。"
+    },
+    "WP06_index_current_only": {
+      "status": "DONE",
+      "files": [
+        "src/arad/rules/spirit_index.py",
+        "src/arad/rules/base.py",
+        "src/arad/engine.py",
+        "tests/test_index_current_view.py"
+      ],
+      "artifact": "index_current_reconcile.json",
+      "teeth": {
+        "result": "2 failed / 2 passed",
+        "behavioral_red_count": 2,
+        "structural_red_count": 0
+      }
+    },
+    "WP07_external_audit_followups": {
+      "status": "DONE",
+      "note": "他方审计（2026-09-20_21-36-00_JST.md，reviewed c38e79b）提出的 5 条新发现，在本轮全部收口。",
+      "items": {
+        "IT-P2-CONTRACT-SHA-TYPO": {
+          "status": "FIXED",
+          "file": "docs/audits/intraday/source_time_contract.json",
+          "what": "_reviewed_source_sha 末位 c -> f（…d47c 对象不存在，git cat-file exit 128；…d47f 存在）。并加 _sha_note 记录该更正。"
+        },
+        "IT-P2-STALE-COMMENT-STALE": {
+          "status": "FIXED",
+          "file": "src/arad/capabilities.py",
+          "what": "注释自称『当前不存在陈旧拒绝路径』却又描述 t_reject:stale，自相矛盾。改为『诊断存在、拒绝不存在』。"
+        },
+        "IT-P2-ENGINE-DOCSTRING-DRIFT": {
+          "status": "FIXED",
+          "file": "src/arad/engine.py::refresh_universe",
+          "what": "docstring 只列『失败页/截断』两种不完整原因，漏了 WP01 新增的『行数缩水』轴，且未说明停牌行不算不完整。"
+        },
+        "IT-P2-LIMIT-FIRST-BOARD-MULTI": {
+          "status": "FIXED",
+          "file": "src/arad/rules/limit_board.py",
+          "what": "max_per_round 截断发生在 _check_side 写状态**之后**，被截掉的告警状态已记 sealed，下一轮 prev=='sealed' 直接 return None —— 告警**永久丢失**。修复：记下每条告警写入前的状态，只回滚被截掉的那些。",
+          "teeth": {
+            "result": "2 failed / 81 passed（只回退 limit_board.py）",
+            "behavioral_red_count": 2,
+            "structural_red_count": 0,
+            "evidence": "第2轮=600001,600002 第3轮=[] 永久丢失=600003；被截断的 600002 状态实际 'sealed'（应为 'at_limit_unqualified'）"
+          }
+        },
+        "IT-P1-TIME-POLICY-001": {
+          "status": "FIXED",
+          "file": "docs/audits/intraday/source_time_contract.json",
+          "what": "审计建议 (a)：把 STALE_TOLERANCE_SECONDS 从合同里显式豁免，标 freshness_judgement_semantics='not_provider_semantics'。行为对齐由 WP03 完成（freshness_allowed=false -> 不硬拒绝，只诊断）。"
+        }
+      }
+    },
+    "WP08_index_request_accounting": {
+      "status": "DONE",
+      "files": [
+        "src/arad/engine.py",
+        "tests/test_observation_ledger_buckets.py",
+        "tests/test_engine_admission_snapshot.py"
+      ],
+      "fixes": {
+        "IT-P2-OBS-008": "没发出去的指数请求不能算 requested。旧实现无条件写 len(index_codes)，使 wants_indices=False 与 True 账本取值**完全相同**（requested=5/index_requested=3/coverage=0.40），正常配置被永久误报成丢数。",
+        "IT-P2-OBS-009": "请求了却没返回的**指数**必须进 unknown_missing。旧实现只遍历 self._codes（个股），指数码在整个账本里出现 0 次 —— 指数丢失完全不可观测。"
+      },
+      "teeth": {
+        "result": "只回退 engine.py：真验牙 AssertionError 两条（『没发指数请求就不能记 index_requested，实际 5』、『请求了却没返回的指数必须进 unknown_missing；缺失=[sh000001, sh000300, sh000688, sz399001, sz399006]』）",
+        "behavioral_red_count": 2
+      },
+      "_honest_note": "两条既有测试（test_stock_and_index_are_separately_accounted、test_far_future_not_counted_as_admitted）本身**编码了旧缺陷的假设**（无条件 len(index_codes)）。我按修正后的语义改写它们，并在 docstring 里写明『分账的前提是指数真的被请求了』—— 这是**语义修正**，不是为了让红变绿而放宽断言。"
+    },
+    "WP07_soft_partial_targeted_fallback": {
+      "status": "not_run",
+      "reason": "依赖 WP04 的 per-code provenance（code -> source / source_epoch / capabilities）。本轮只做到 route 级 epoch 与账本桶，per-code 来源归属尚未落到 Quote 上，因此无法在不伪造来源的前提下做有界 fallback。",
+      "renumbered": "原 WP07 编号已改用于『他方审计跟进项』（WP07_external_audit_followups，已 DONE）；本条即原 WP07，仍未启动。"
+    },
+    "WP09_observation_interval": {
+      "status": "not_run",
+      "reason": "需要给 history 增加 first_observed_at/last_observed_at/source_epoch 的区间结构，属独立数据模型改动；本轮未启动，避免与 WP01-WP06 的结构改动互相冲突。"
+    },
+    "WP09_SSE_durable_delivery": {
+      "status": "not_run",
+      "reason": "本轮未触碰 SSE 层。"
+    },
+    "WP10_real_data_model_certification": {
+      "status": "blocked",
+      "reason": "blocked_no_mounted_multiday_continuous_corpus —— 真实多日连续 A 股语料仍未挂载，Precision/Recall/漏事件率/收益全部 unavailable。未用 synthetic 数字冒充。"
+    }
+  },
+  "artifacts": {
+    "produced": [
+      "universe_transport_reconcile.json",
+      "source_epoch_route_cases.json",
+      "time_policy_matrix.json",
+      "time_policy_matrix_check.json",
+      "observation_ledger_cases.json",
+      "index_current_reconcile.json"
+    ],
+    "not_produced": {
+      "provider_coverage.csv": "not_run —— 需要真实多日 soak 的逐轮 coverage 序列；本轮只跑了单元/集成级，无真实 soak 数据，不填假数字。",
+      "observation_ledger_cases.json": "DONE（见上）",
+      "index_current_reconcile.json": "DONE（见上）"
+    },
+    "_note": "red.log / green.log / rollback-tooth.log 以**终端原始输出**形式记录在本轮审计报告中（含失败类型分类），未另存为独立文件 —— 因为分类结论（真验牙 vs 结构性）比裸日志更重要，已在报告中逐条列出。"
+  },
+  "known_limitations": [
+    "WP07/WP08/WP09 未启动（原因见 work_packages）。",
+    "WP10 blocked：真实多日语料未挂载。",
+    "当前**没有** provider-ts 驱动的陈旧拦截（WP03 合同 role=unknown 的必然代价），陈旧防护完全依赖 epoch 内乱序判定。",
+    "STALE_TOLERANCE_SECONDS=4h 现在只是 age 诊断参考线。",
+    "provider_coverage.csv 未产出（无真实 soak 数据）。"
+  ]
+}

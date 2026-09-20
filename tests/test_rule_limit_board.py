@@ -1448,3 +1448,105 @@ def test_detect_seal_off_records_qualified_state_without_alerting():
     assert rule._state["600000:up"] == "at_limit_unqualified"
     assert rule.evaluate(snap_of(ok), mk_ctx(st, now_ep=T0 + 60)) == []
     assert rule._state["600000:up"] == "sealed", "达标与否必须照实记账，与告警开关无关"
+
+
+# ---------------------------------------------------------------------------
+# IT-P2-LIMIT-FIRST-BOARD-MULTI：max_per_round 截断把告警**永久**吃掉
+# ---------------------------------------------------------------------------
+#
+# ``_check_side`` 会**顺带写状态**，而 ``max_per_round`` 的截断发生在它**之后**。
+# 于是被截掉的那条告警状态已经记成 ``sealed``，下一轮命中 ``prev == "sealed"``
+# 直接 ``return None`` —— 那条告警**永久消失**，不是"下轮再报"。
+#
+# 这是**既有遗留形态**（不是 IT-P1-LIMIT-001 引入的）：``max_per_round=0`` 时
+# 三只都能报，说明单只路径本来就对；只有"同轮多只首达 + 截断"才暴露。
+# 修复后：被截断的告警回滚状态，下一轮正常补报。
+
+
+def test_truncated_alerts_are_reported_next_round_not_lost():
+    """**真验牙**：3 只同轮首达 + ``max_per_round=2``，第 3 只必须下一轮补报。
+
+    修复前实测三轮为 ``([], 2 条, [])`` —— 第 3 只（``600003``）第 2、3 轮
+    都不出现，**永久丢失**。修复后为 ``([], 2 条, 1 条)``。
+    """
+    st = FakeState()
+    rule = build({"min_seal_amount_wan": 200, "max_per_round": 2,
+                  "cooldown_seconds": 0})
+    codes = ("600001", "600002", "600003")
+
+    weak = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(100.0, 11.0))
+            for c in codes]
+    ok = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(300.0, 11.0))
+          for c in codes]
+
+    # 第 1 轮：三只都不足门槛 -> 都不报（状态记 at_limit_unqualified）
+    assert rule.evaluate(snap_of(*weak), mk_ctx(st, now_ep=T0)) == []
+
+    # 第 2 轮：三只同时达标 -> 只报 2 只（截断生效）
+    r2 = rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 60))
+    assert len(r2) == 2, f"max_per_round=2 应只报 2 条，实际 {len(r2)}"
+    seen2 = {a.code for a in r2}
+
+    # 第 3 轮：仍达标 -> 被截掉的那只必须补报（这正是修复前缺失的行为）
+    r3 = rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 120))
+    seen3 = {a.code for a in r3}
+
+    missing = set(codes) - seen2 - seen3
+    assert not missing, (
+        f"被 max_per_round 截断的票必须下一轮补报，不能永久丢失；"
+        f"第2轮={sorted(seen2)} 第3轮={sorted(seen3)} 永久丢失={sorted(missing)}")
+
+    # 补报之后不许再重复报（第 4 轮应静默）—— 回滚不能变成"永远重报"
+    r4 = rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 180))
+    assert r4 == [], f"补报完成后必须恢复幂等，实际又报了 {[a.code for a in r4]}"
+
+
+def test_no_truncation_reports_all_and_stays_idempotent():
+    """回归保护：``max_per_round=0``（不限量）时三只都报，且随后幂等。
+
+    这条修复前后**都绿** —— 它挡住的是"为了修截断而把幂等改坏"。
+    """
+    st = FakeState()
+    rule = build({"min_seal_amount_wan": 200, "max_per_round": 0,
+                  "cooldown_seconds": 0})
+    codes = ("600001", "600002", "600003")
+    weak = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(100.0, 11.0))
+            for c in codes]
+    ok = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(300.0, 11.0))
+          for c in codes]
+
+    assert rule.evaluate(snap_of(*weak), mk_ctx(st, now_ep=T0)) == []
+    r2 = rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 60))
+    assert {a.code for a in r2} == set(codes), "不限量时三只都要报"
+    assert rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 120)) == []
+
+
+def test_truncated_alert_state_rollback_is_exact():
+    """被截断的票状态必须回滚到**调用前**的值，而不是一律清成 away。
+
+    一只**已封板多轮**的票本轮不产生新告警，本就不在 ``out`` 里，不该被回滚
+    逻辑碰到；只有"本轮真的产出了告警但被截掉"的才回滚。这条钉住回滚的精确性
+    —— 若实现改成"截断后把超出的 tag 全 pop 掉"，会误删历史状态，
+    下次封单波动就会重复报。
+    """
+    st = FakeState()
+    rule = build({"min_seal_amount_wan": 200, "max_per_round": 1,
+                  "cooldown_seconds": 0})
+    weak = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(100.0, 11.0))
+            for c in ("600001", "600002")]
+    ok = [limit_up_quote(code=c, bid_vol=vol_for_seal_wan(300.0, 11.0))
+          for c in ("600001", "600002")]
+
+    assert rule.evaluate(snap_of(*weak), mk_ctx(st, now_ep=T0)) == []
+    r2 = rule.evaluate(snap_of(*ok), mk_ctx(st, now_ep=T0 + 60))
+    assert len(r2) == 1, "max_per_round=1 只报 1 条"
+
+    reported = r2[0].code
+    withheld = "600002" if reported == "600001" else "600001"
+
+    # 报出去的那只：状态必须是 sealed（不能因为回滚而丢）
+    assert rule._state[f"{reported}:up"] == "sealed", "发出去的告警状态必须保留"
+    # 被截掉的那只：状态必须回滚到调用前的 at_limit_unqualified
+    assert rule._state[f"{withheld}:up"] == "at_limit_unqualified", (
+        f"被截断的 {withheld} 状态应回滚到 at_limit_unqualified，"
+        f"实际 {rule._state.get(withheld + ':up')!r}")

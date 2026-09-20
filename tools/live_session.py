@@ -60,11 +60,77 @@ if str(ROOT / "src") not in sys.path:
     sys.path.insert(0, str(ROOT / "src"))
 
 UA = "arad-live-session/1.0"
-REPORT_VERSION = 1
+#: 报告格式版本。2 = WP05/IT-P1-OBS-011：``metrics`` 新增观测账本聚合
+#: （coverage 分位、拒绝总计、source mix、capability 缺失、最差 N 轮），
+#: 并且 verdict 新增 ``warn``/``fail`` 与每项 ``level``。
+#: 消费旧报告的工具请按 ``report_version`` 分支（字段是**新增**，不是改名，
+#: 旧字段全部保留，所以只读旧字段的消费者不受影响）。
+REPORT_VERSION = 2
 DEFAULT_MINUTES = 10
+#: 观测健康阈值（WP05 / IT-P1-OBS-011），可被 ``evaluate_health(tolerances=...)``
+#: 逐项覆盖。**刻意不要求 100% 覆盖**：一轮要请求 5000+ 只票，停牌/新股/源端漏发
+#: 让它永远到不了 100%，把 100% 当门槛只会训练使用者忽略这一项。
+#:
+#: 取值依据 —— 先取一个**真实锚点**（tencent 主源，全市场，2026-09 实测 3 轮）：
+#:
+#:     requested=5569  returned=5564  coverage=0.9991  unavailable=0
+#:
+#: 即健康轮次的覆盖率是 **99.9%**，不是 100%。据此把"正常抖动"与"真的丢数据"
+#: 的分界定在下面这些位置（都留了 >=1.5 个百分点的余量，避免网络抖动误报）：
+#:
+#: * ``coverage_warn_p05`` 0.95 / ``coverage_fail_p05`` 0.90 —— p05 逼近"最差的
+#:   那几轮"。20 轮里最差几轮掉破 95% 就该看一眼；掉破 90%（5000 只里丢 500 只）
+#:   不是抖动，而是整批请求被砍（限流、半截快照）。
+#: * ``coverage_warn_p05/p50`` 的 fail 都取 0.90：93% 这种 soft-partial 是
+#:   **WARN** 而不是 FAIL —— 7% 的缺口值得警觉，但它不构成"这场 soak 白跑"，
+#:   判红会让这个工具在真实降级路径（切备用源）上天天报错，反而没人看。
+#: * ``coverage_warn_p50`` 0.97 —— 一半轮次都不到 97% 说明是**系统性**丢数，
+#:   不是个别轮次的坏运气。实测健康值 99.9%，这个门槛有近 3 个百分点余量。
+#: * ``coverage_warn_min`` 0.90 / ``coverage_fail_min`` 0.75 —— min 是唯一能抓住
+#:   "绝大多数轮都很好、就一轮几乎全丢"的指标（均值/中位数都抓不住）。fail 放到
+#:   0.75 是为了不跟 p05 的 fail 重复喊：单轮 80% 已经由 p05 抓，min 专门抓塌方。
+#: * ``unavailable_warn_ratio`` 0.0 / ``unavailable_fail_ratio`` 1.0 —— 只要有一轮
+#:   出现"这类规则本来源就评不了"就值得黄一下（能力缺失是硬缺口，不是网络抖动）；
+#:   **每一轮**都不可评估，说明整类规则在这整场 soak 里一次都没被验证过 ——
+#:   那是一场没测到的 soak，必须红。
+DEFAULT_OBSERVATION_TOLERANCES: dict[str, Any] = {
+    "coverage_warn_p05": 0.95,
+    "coverage_fail_p05": 0.90,
+    "coverage_warn_p50": 0.97,
+    "coverage_fail_p50": 0.90,
+    "coverage_warn_min": 0.90,
+    "coverage_fail_min": 0.75,
+    "unavailable_warn_ratio": 0.0,
+    "unavailable_fail_ratio": 1.0,
+}
+
 #: 允许的抓取失败比例。为什么不是 0：README §5.5 写得很清楚 —— 东财限流是常态，
 #: 主源偶发失败会由 SourceManager 自动退到备用源，这是**正常降级路径**而不是故障。
-DEFAULT_TOLERANCES: dict[str, Any] = {"max_error_ratio": 0.10, "min_rounds": 1}
+DEFAULT_TOLERANCES: dict[str, Any] = {
+    "max_error_ratio": 0.10, "min_rounds": 1, **DEFAULT_OBSERVATION_TOLERANCES}
+
+#: "最差 N 轮"摘要的默认条数。5 条足以回查坏轮，又不至于让报告退化成逐轮日志。
+DEFAULT_WORST_ROUNDS = 5
+
+#: 带观测账本的轮样本里会出现这些键（任一出现即认为该轮带账本）。
+#: 它是"这条轮样本来自新版本（有 observation）"的判据，也是
+#: "没采集到"与"确实是 0"的区分依据 —— 键不在 = 没采到，不能当 0 分。
+_OBSERVATION_MARKER_KEYS: tuple[str, ...] = (
+    "requested", "returned", "admitted", "coverage", "source",
+    "future_rejected", "stale_rejected", "out_of_order_rejected",
+    "unknown_missing", "rejected_quality", "unavailable_capability",
+    "observation_fields", "capabilities", "unavailable_by_reason",
+)
+
+#: 可观测性字段在轮样本里的"采集标记"：只有真的可测的字段才写进去。
+#: 见 ``make_round_sample`` 的说明 —— 值仍然是 _safe_int/_safe_float 归一化过的
+#: 旧形状（向后兼容），但汇总方靠这份标记就能分清 0 与"没采到"。
+_OBSERVATION_VALUE_FIELDS: tuple[str, ...] = (
+    "requested", "returned", "admitted", "coverage", "source",
+    "future_rejected", "stale_rejected", "out_of_order_rejected",
+    "unknown_missing", "rejected_quality", "unavailable_capability",
+    "capabilities", "unavailable_by_reason",
+)
 #: 股票池规模允许的膨胀倍数（首末对比）。留足余量：新股上市、股票池 TTL 到期后
 #: 从"自选股降级"恢复到全市场，都会让这个数字变大，那不是内存泄漏。
 MEM_GROWTH_LIMIT = 2.0
@@ -166,6 +232,12 @@ def make_round_sample(
         if fr is None:
             fr = obs.get("stale_rejected")
         out["future_rejected"] = _safe_int(fr)
+        # 旧键兜底时把原值也留下来：汇总方要能看出这个"未来拒绝"数其实来自
+        # 旧版本报告里的 ``stale_rejected``（IT-P1-OBS-006 改名前的数据），
+        # 并据此把 reject 总数记到 ``stale_total``。没有这一步，
+        # ``observation_fields`` 里写着采到了 stale_rejected，值却读不出来。
+        if "future_rejected" not in obs and "stale_rejected" in obs:
+            out["stale_rejected"] = _safe_int(obs.get("stale_rejected"))
         out["out_of_order_rejected"] = _safe_int(obs.get("out_of_order_rejected"))
         missing = obs.get("unknown_missing")
         out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
@@ -181,14 +253,71 @@ def make_round_sample(
         reasons = obs.get("unavailable_by_reason")
         out["unavailable_by_reason"] = (
             dict(reasons) if isinstance(reasons, dict) else {})
+        # --- WP05 / IT-P1-OBS-011：采集**标记** ---------------------------
+        # 汇总方必须能分清"这轮 coverage 真的是 0"和"这轮根本没采到 coverage"。
+        # 只看 ``out.get("coverage")`` 做不到：两者都读成 0.0/缺键，而"缺键"
+        # 又与"轮样本来自旧版本"混在一起。所以在轮样本里显式记一份"哪些字段
+        # 真的采集到了"（并在下面保留 ``None`` 语义给分位/最差轮用）。
+        present = [k for k in _OBSERVATION_VALUE_FIELDS if k in obs]
+        out["observation_fields"] = present
+        # None 明确表示"采到了字段但这个值是坏的"，与"没采到"（键不在标记里）
+        # 和"确实是 0"（标记里有且值是 0）三者互不混淆。
+        #
+        # 判定"坏"要连**越界**一起算：coverage 是比例，只能在 [0, 1]。
+        # 不拦的话 ``True`` 会被读成 0.0（bool 是 int 的子类）、``-1``/``1.5``
+        # 会被原样带进分位，于是汇总里出现"覆盖率 -100%"这种不可能的数字，
+        # 而它其实是脏数据 —— 记成 None（读不出）远好过记成假成绩。
+        cov = obs.get("coverage")
+        if "coverage" in obs:
+            bad_cov = (cov is None or isinstance(cov, bool)
+                       or not _finite(cov)
+                       or not 0.0 <= float(cov) <= 1.0)
+            if bad_cov:
+                out["coverage"] = None
+        out["observation_missing_fields"] = [
+            k for k in _OBSERVATION_VALUE_FIELDS if k not in obs]
     return out
 
 
-def summarize_rounds(rounds: Sequence[dict]) -> dict:
+def summarize_rounds(rounds: Sequence[dict], *,
+                     worst_n: int = DEFAULT_WORST_ROUNDS) -> dict:
     """逐轮样本 -> 聚合指标（纯函数）。
 
     输出的字段名就是报告里 ``metrics`` 的形状，``evaluate_health`` 直接消费它，
     两者之间没有第二套命名，避免"报告里是这个名、判定时读那个名"的错位。
+
+    WP05 / IT-P1-OBS-011：``make_round_sample()`` 早就把每轮的
+    ``requested / returned / admitted / coverage / rejections / capability``
+    采下来了，但这里以前把它们**全部丢掉** —— soak 报告里看不到观测覆盖率、
+    拒绝构成、来源混合、能力缺失，于是"覆盖率只有 93% 的 soft-partial"和
+    "整类规则一次都没被评估"这两种问题在报告里完全隐形。现在补齐六组聚合：
+
+    ``coverage`` / ``coverage_p05`` / ``coverage_p50`` / ``coverage_min``
+        **不给均值当结论**。均值会掩盖坏轮次：19 轮 99% 加 1 轮 40% 的均值仍有
+        96%，看起来一切正常。p05 逼近"最差的那几轮"，min 直接点名塌方那一轮。
+    ``requested_total`` / ``returned_total`` / ``admitted_total``
+        全场累计账本。三者一起看才知道丢在哪一段（源端没返回 / 被准入拒掉）。
+    ``missing_total`` / ``quality_total`` / ``future_total`` / ``stale_total`` /
+    ``ooo_total``
+        拒绝构成。``stale_total`` 只统计**旧样本**里显式写的 ``stale_rejected``
+        （IT-P1-OBS-006 已改名 future_rejected，新样本里不再有"陈旧拒绝"路径），
+        所以它与 ``future_total`` 不会重复计数。
+    ``source_mix``
+        ``{来源: 服务轮数}`` 及 ``source_mix_rounds`` / ``source_mix_unknown_rounds``。
+        混源是结论可解释性的前提：同一场 soak 里一半轮次其实走的备用源，
+        把这些轮次和主源轮次当同一条曲线比，任何结论都站不住。
+    ``capability_unavailable_total`` / ``capability_unavailable_rounds`` /
+    ``capability_unavailable_ratio`` / ``unavailable_by_reason``
+        能力缺失的总量与**轮覆盖率**。"整类规则不可评估"是 soak 最该报的
+        盲区之一：规则没告警到底是"没放量"还是"根本评不了"，只有这个数字能答。
+    ``worst_rounds``
+        按 coverage 升序取最差 N 轮，带 ``index`` 便于回查原始轮样本。
+
+    缺数据的安全处理（旧版本轮样本 / 脏值）：所有计数走 ``_safe_int`` /
+    ``_safe_float``，并且**只在真的采到该字段时才累计**（见
+    ``_round_observation_fields``）。没采到的轮次不进 ``rounds_with_observation``，
+    也不进 coverage 分位数 —— 绝不把"没采集到"伪造成 0 分成绩；一个有效
+    coverage 都没有时 ``coverage`` 是 ``None`` 而不是 ``0.0``。
     """
     rows = [r for r in (rounds or []) if isinstance(r, dict)]
     by_kind: dict[str, int] = {}
@@ -208,6 +337,124 @@ def summarize_rounds(rounds: Sequence[dict]) -> dict:
     # 降级判据：股票池规模不比自己那几只自选股大，说明全市场扫描没起来
     # （engine.run_forever 用的是同一个判据）。
     watch_only_rounds = sum(1 for r in rows if r.get("watchlist_only"))
+
+    # ---- WP05：观测账本聚合 ------------------------------------------------
+    def _row_index(r: dict, pos: int) -> Any:
+        """轮号：优先用样本自带的 index；没有/脏了就退回 1 基位置（不抛）。"""
+        idx = r.get("index")
+        if isinstance(idx, bool) or idx is None:
+            return pos + 1
+        try:
+            return int(idx)
+        except (TypeError, ValueError):
+            return pos + 1
+
+    obs_rounds = 0
+    coverage_vals: list[float] = []              # 只有**有效** coverage 才进
+    ranked: list[tuple[float, int, dict]] = []   # (coverage, 位置, 轮样本)
+    coverage_unreadable_rounds: list[Any] = []   # 采到了但值坏（None/NaN/非数）
+    totals = {"requested_total": 0, "returned_total": 0, "admitted_total": 0}
+    reject_totals = {out_key: 0 for _in_key, out_key in _REJECT_TOTAL_KEYS}
+    reject_totals["stale_total"] = 0
+    reject_rounds = {out_key: 0 for out_key in reject_totals}
+    source_mix: dict[str, int] = {}
+    source_unknown_rounds = 0
+    unavailable_total = 0
+    unavailable_rounds = 0
+    unavailable_by_reason: dict[str, int] = {}
+    capability_missing: dict[str, int] = {}      # {能力名: 有多少轮该源不提供}
+
+    for pos, r in enumerate(rows):
+        present = _round_observation_fields(r)
+        if not present:
+            continue                              # 旧版本样本：不参与观测聚合
+        obs_rounds += 1
+
+        # requested/returned/admitted：同一段管道的三个截面。缺的那个按 0 计，
+        # 但"缺"本身由 presence 记账，判定方能看到有多少轮真的带了这段账本。
+        for key, out_key in (("requested", "requested_total"),
+                             ("returned", "returned_total"),
+                             ("admitted", "admitted_total")):
+            if key in present:
+                totals[out_key] += _safe_int(r.get(key))
+
+        if "coverage" in present:
+            raw = r.get("coverage")
+            if raw is None or not _finite(raw):
+                # 采到了字段但值是坏的 —— 既不能算 0 分，也不能算 100%。
+                # 单独记账，判定时按"读不出覆盖率"处理。
+                coverage_unreadable_rounds.append(_row_index(r, pos))
+            else:
+                cov = float(raw)
+                coverage_vals.append(cov)
+                ranked.append((cov, pos, r))
+
+        # 拒绝构成。两个键都在的旧样本不会双计：新名优先，旧名只在
+        # 新名缺席时读（与 make_round_sample 的读取顺序一致）。
+        for in_key, out_key in _REJECT_TOTAL_KEYS:
+            if in_key in present:
+                n = _safe_int(r.get(in_key))
+            elif in_key == "future_rejected" and "stale_rejected" in present:
+                n = _safe_int(r.get("stale_rejected"))
+            else:
+                continue
+            reject_totals[out_key] += n
+            if n > 0:
+                reject_rounds[out_key] += 1
+        # 旧样本里显式写下的 stale_rejected（新样本已无此路径，不会双计）。
+        if "stale_rejected" in present and "future_rejected" not in present:
+            stale = _safe_int(r.get("stale_rejected"))
+            reject_totals["stale_total"] += stale
+            if stale > 0:
+                reject_rounds["stale_total"] += 1
+
+        # source mix：本轮是哪家源在供数（空/缺失归 unknown，不猜）。
+        if "source" in present:
+            src = str(r.get("source") or "").strip()
+            if src:
+                source_mix[src] = source_mix.get(src, 0) + 1
+            else:
+                source_unknown_rounds += 1
+
+        if "unavailable_capability" in present:
+            n = _safe_int(r.get("unavailable_capability"))
+            unavailable_total += n
+            if n > 0:
+                unavailable_rounds += 1
+        if "unavailable_by_reason" in present:
+            reasons = r.get("unavailable_by_reason")
+            if isinstance(reasons, dict):
+                for k, v in reasons.items():
+                    unavailable_by_reason[str(k)] = (
+                        unavailable_by_reason.get(str(k), 0) + _safe_int(v))
+        caps = r.get("capabilities") if "capabilities" in present else None
+        if isinstance(caps, dict):
+            for key, val in caps.items():
+                if key == "source":
+                    continue
+                if val is False:
+                    capability_missing[str(key)] = capability_missing.get(str(key), 0) + 1
+
+    # ---- 最差 N 轮：按 coverage 升序（同分保持轮号稳定），只收有效 coverage --
+    ranked.sort(key=lambda t: (t[0], t[1]))
+    worst: list[dict] = []
+    for cov, pos, r in ranked[:max(0, int(worst_n))]:
+        worst.append({
+            "index": _row_index(r, pos),
+            "coverage": round(cov, 4),
+            "requested": _safe_int(r.get("requested")),
+            "returned": _safe_int(r.get("returned")),
+            "admitted": _safe_int(r.get("admitted")),
+            "source": str(r.get("source") or ""),
+            "missing": _safe_int(r.get("unknown_missing")),
+            "quality": _safe_int(r.get("rejected_quality")),
+            "future": _safe_int(r.get("future_rejected")),
+            "ooo": _safe_int(r.get("out_of_order_rejected")),
+            "unavailable_capability": _safe_int(r.get("unavailable_capability")),
+        })
+
+    def _r4(v: float | None) -> float | None:
+        return None if v is None else round(float(v), 4)
 
     return {
         "rounds": len(rows),
@@ -230,6 +477,33 @@ def summarize_rounds(rounds: Sequence[dict]) -> dict:
             }
             for r in rows
         ],
+        # ---- WP05 观测聚合 -------------------------------------------------
+        "rounds_with_observation": obs_rounds,
+        "coverage_rounds": len(coverage_vals),
+        # 有效 coverage 一个都没有 -> None（**不是 0.0**）：0.0 会让判定误以为
+        # "覆盖率真的为 0"，None 才是"这次没读到"。
+        "coverage": _r4(sum(coverage_vals) / len(coverage_vals))
+        if coverage_vals else None,
+        "coverage_p05": _r4(percentile(coverage_vals, 5)),
+        "coverage_p50": _r4(percentile(coverage_vals, 50)),
+        "coverage_min": _r4(min(coverage_vals)) if coverage_vals else None,
+        "coverage_max": _r4(max(coverage_vals)) if coverage_vals else None,
+        "coverage_unreadable_rounds": coverage_unreadable_rounds,
+        **totals,
+        **reject_totals,
+        "rejection_rounds": reject_rounds,
+        "source_mix": source_mix,
+        "source_mix_rounds": sum(source_mix.values()),
+        "source_mix_unknown_rounds": source_unknown_rounds,
+        "capability_unavailable_total": unavailable_total,
+        "capability_unavailable_rounds": unavailable_rounds,
+        # 分母用"带账本的轮数"而不是全部轮：旧样本/失败轮没账本，
+        # 不该把它们算成"能力正常"而稀释掉真实缺口。
+        "capability_unavailable_ratio": (
+            round(unavailable_rounds / obs_rounds, 4) if obs_rounds else None),
+        "capability_missing_rounds": capability_missing,
+        "unavailable_by_reason": unavailable_by_reason,
+        "worst_rounds": worst,
     }
 
 
@@ -301,6 +575,33 @@ def empty_metrics() -> dict:
         "universe": {"first": 0, "last": 0, "min": 0, "max": 0},
         "watchlist_only_rounds": 0,
         "fell_back_to_watchlist": False,
+        # WP05：观测账本骨架。None 一律表示"没读到"，不是"读到了 0"。
+        "rounds_with_observation": 0,
+        "coverage_rounds": 0,
+        "coverage": None,
+        "coverage_p05": None,
+        "coverage_p50": None,
+        "coverage_min": None,
+        "coverage_max": None,
+        "coverage_unreadable_rounds": [],
+        "requested_total": 0,
+        "returned_total": 0,
+        "admitted_total": 0,
+        "missing_total": 0,
+        "quality_total": 0,
+        "future_total": 0,
+        "stale_total": 0,
+        "ooo_total": 0,
+        "rejection_rounds": {},
+        "source_mix": {},
+        "source_mix_rounds": 0,
+        "source_mix_unknown_rounds": 0,
+        "capability_unavailable_total": 0,
+        "capability_unavailable_rounds": 0,
+        "capability_unavailable_ratio": None,
+        "capability_missing_rounds": {},
+        "unavailable_by_reason": {},
+        "worst_rounds": [],
         "memory": {"bounded": True, "reason": "（未采样）"},
         "api": {"requests": 0, "non_200": 0, "malformed": 0, "unreachable": 0, "by_route": {}},
         "sse": {"connected": False, "stalled": False, "events_total": 0, "events_by_type": {},
@@ -343,6 +644,30 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     判定项只有"真的出错"的那几类，**告警条数不参与判定**（休市 0 条是正常的）。
     每项都带 ``detail``，因为"不健康"这三个字对使用者毫无信息量，必须说清哪项、
     差多少 —— 尤其是失败轮数 3 轮、容差 1 轮这种"只差一点"的情况。
+
+    WP05 / IT-P1-OBS-011：新增两项基于 observation 的检查，让以前**静默通过**的
+    两类问题显式变黄/红：
+
+    ``coverage``
+        用 ``coverage_p05`` / ``coverage_p50`` / ``coverage_min`` 三个分位判定
+        （见 ``DEFAULT_OBSERVATION_TOLERANCES`` 的取值依据）。**刻意不要求
+        100%** —— 一轮要请求 5000+ 只票，停牌/新股/源端漏发让它永远到不了 100%。
+        但 93% 这种 soft-partial 必须报出来：``coverage_p50`` 掉到 warn/fail 阈值
+        以下时该项变黄/红。
+    ``capability``
+        每轮 ``unavailable_capability > 0`` 的比例。只要出现就 WARN（能力缺失是
+        硬缺口，不是网络抖动）；**每一轮都不可评估**（比例 >= fail 阈值）说明整类
+        规则在这整场 soak 里一次都没被验证过，判红。
+
+    三级结论通过 ``checks[*]["level"]`` 暴露（``ok`` / ``warn`` / ``fail``）：
+    ``ok`` 仍是布尔，保持既有消费方（``healthy = all(ok)``）不变；``warn``
+    只降级不判死 —— 退出码仍是 0，但报告里看得见。
+
+    阈值全部可配置：``tolerances`` 里传入下列任一键即可覆盖默认值 ——
+    ``coverage_warn_p05`` / ``coverage_fail_p05`` / ``coverage_warn_p50`` /
+    ``coverage_fail_p50`` / ``coverage_warn_min`` / ``coverage_fail_min`` /
+    ``unavailable_warn_ratio`` / ``unavailable_fail_ratio`` /
+    ``require_observation``。
     """
     tol = dict(DEFAULT_TOLERANCES)
     tol.update(tolerances or {})
@@ -359,8 +684,52 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
 
     checks: list[dict] = []
 
-    def add(name: str, ok: bool, detail: str) -> None:
-        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+    def add(name: str, ok: bool, detail: str, *, level: str | None = None) -> None:
+        """记一项检查。``ok`` 保持布尔（既有消费方不变），``level`` 额外表达黄。"""
+        lvl = level or ("ok" if ok else "fail")
+        checks.append({"name": name, "ok": bool(ok), "level": lvl, "detail": detail})
+
+    def _num(key: str) -> float | None:
+        """读一个可配置阈值。
+
+        脏值（None / 非数字）**退回默认值**，不是退回 None：``None`` 会
+        静默关掉这一项判定，而"阈值写坏了"正是最该照默认档干活的时候
+        （见 ``test_missing_threshold_key_falls_back_to_default``）。
+        只有默认值也不存在时才返回 None。
+        """
+        default = DEFAULT_OBSERVATION_TOLERANCES.get(key)
+        try:
+            v = tol.get(key)
+        except (AttributeError, TypeError):
+            v = None
+        if v is not None:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                f = None
+            if f is not None and math.isfinite(f):
+                return f
+        try:
+            return float(default) if default is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _metric_float(key: str) -> float | None:
+        """读一个指标里的覆盖率；缺键/None/脏值一律 None（不是 0.0）。
+
+        WP05 的关键一步：**旧版本 soak 报告没有这个键**，此时必须说"读不出"，
+        绝不能把它当成 0% 覆盖率判红（那会把一份好报告打成不健康）。
+        """
+        if key not in m:
+            return None
+        raw = m.get(key)
+        if raw is None or isinstance(raw, bool):
+            return None
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return val if math.isfinite(val) else None
 
     min_rounds = int(tol.get("min_rounds") or 1)
     add("rounds", rounds >= min_rounds, f"完成 {rounds} 轮（下限 {min_rounds}）")
@@ -373,6 +742,108 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         f"容差 {budget} 轮（{ratio:.0%}）")
 
     add("data", quotes_max > 0, f"单轮最多拿到 {quotes_max} 只行情")
+
+    # ---- WP05：观测覆盖率判定（分位，不看均值） --------------------------
+    obs_rounds = int(m.get("rounds_with_observation") or 0)
+    cov_rounds = int(m.get("coverage_rounds") or 0)
+    cov_p05 = _metric_float("coverage_p05")
+    cov_p50 = _metric_float("coverage_p50")
+    cov_min = _metric_float("coverage_min")
+    unreadable = m.get("coverage_unreadable_rounds") or []
+    # "readable" 的判据是**指标里确实有 coverage 分位值**，而不是 rounds 计数：
+    # 旧报告两者都没有，此时必须跳过而不是判红。
+    have_cov = cov_p50 is not None or cov_p05 is not None or cov_min is not None
+
+    if not have_cov:
+        require = bool(tol.get("require_observation"))
+        missing_detail = (
+            f"无有效覆盖率读数（带账本轮数 {obs_rounds}/{rounds}"
+            + (f"，其中 {len(unreadable)} 轮 coverage 值不可读" if unreadable else "")
+            + "）—— 无法用真实覆盖率判定，本项跳过")
+        if require:
+            add("coverage", False,
+                missing_detail + "；require_observation=true 要求必须有可读账本")
+        else:
+            add("coverage", True,
+                missing_detail + "（旧版本报告/未采到，跳过不算失败）")
+    else:
+        w_p05 = _num("coverage_warn_p05")
+        f_p05 = _num("coverage_fail_p05")
+        w_p50 = _num("coverage_warn_p50")
+        f_p50 = _num("coverage_fail_p50")
+        w_min = _num("coverage_warn_min")
+        f_min = _num("coverage_fail_min")
+
+        def _below(val: float | None, warn: float | None,
+                   fail: float | None) -> str | None:
+            """返回 None=ok / 'warn' / 'fail'。fail 阈值优先（越低越糟）。"""
+            if val is None:
+                return None
+            if fail is not None and val < fail:
+                return "fail"
+            if warn is not None and val < warn:
+                return "warn"
+            return None
+
+        levels = {
+            "p05": _below(cov_p05, w_p05, f_p05),
+            "p50": _below(cov_p50, w_p50, f_p50),
+            "min": _below(cov_min, w_min, f_min),
+        }
+        if "fail" in levels.values():
+            cov_level = "fail"
+        elif "warn" in levels.values():
+            cov_level = "warn"
+        else:
+            cov_level = "ok"
+
+        def _fmt(v: float | None) -> str:
+            return "—" if v is None else f"{v:.1%}"
+
+        bad_parts = [f"{name}={_fmt(val)}" for name, val in
+                     (("p05", cov_p05), ("p50", cov_p50), ("min", cov_min))
+                     if levels[name] is not None]
+        detail = (
+            f"覆盖率 p05/p50/min = {_fmt(cov_p05)} / {_fmt(cov_p50)} / "
+            f"{_fmt(cov_min)}（{cov_rounds}/{obs_rounds} 轮有有效读数，"
+            f"共 {rounds} 轮）；阈值 warn {_fmt(w_p05)}/{_fmt(w_p50)}/{_fmt(w_min)}，"
+            f"fail {_fmt(f_p05)}/{_fmt(f_p50)}/{_fmt(f_min)}")
+        if bad_parts:
+            detail += f"；未达 warn 的分位：{', '.join(bad_parts)}"
+        if unreadable:
+            detail += f"（另有 {len(unreadable)} 轮 coverage 值不可读）"
+        add("coverage", cov_level != "fail", detail, level=cov_level)
+
+    # ---- WP05：能力缺失（整类规则不可评估）判定 -------------------------
+    unavail_rounds = int(m.get("capability_unavailable_rounds") or 0)
+    unavail_total = int(m.get("capability_unavailable_total") or 0)
+    unavail_ratio = _metric_float("capability_unavailable_ratio")
+    if unavail_ratio is None and obs_rounds > 0:
+        unavail_ratio = unavail_rounds / obs_rounds
+    u_warn = _num("unavailable_warn_ratio")
+    u_fail = _num("unavailable_fail_ratio")
+    if obs_rounds <= 0:
+        add("capability", True,
+            f"无观测账本，无法判定能力缺失（unavailable 合计 {unavail_total}）"
+            "（跳过不算失败）")
+    else:
+        if u_fail is not None and unavail_ratio is not None and unavail_ratio >= u_fail:
+            cap_level = "fail"
+        elif u_warn is not None and unavail_ratio is not None and unavail_ratio > u_warn:
+            cap_level = "warn"
+        else:
+            cap_level = "ok"
+        reasons = dict(m.get("unavailable_by_reason") or {})
+        detail = (
+            f"{unavail_rounds}/{obs_rounds} 轮出现'能力缺失导致规则无法评估'"
+            f"（比例 {unavail_ratio:.0%}），累计不可评估标的 {unavail_total} 个；"
+            f"阈值 warn >{u_warn:.0%}，fail >={u_fail:.0%}")
+        if reasons:
+            top = sorted(reasons.items(), key=lambda kv: (-int(kv[1]), str(kv[0])))[:5]
+            detail += f"；主要原因 {dict(top)}"
+        if cap_level == "fail":
+            detail += " —— 整类规则在这整场 soak 里一次都没被评估过"
+        add("capability", cap_level != "fail", detail, level=cap_level)
 
     req = int(api.get("requests") or 0)
     non200 = int(api.get("non_200") or 0)
@@ -400,11 +871,17 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     healthy = all(c["ok"] for c in checks)
     if rounds < min_rounds:
         # 一轮都没跑完 = harness 级失败，与"跑起来了但有问题"要能区分开
-        return {"healthy": False, "exit_code": EXIT_NO_DATA, "checks": checks}
+        return {"healthy": False, "exit_code": EXIT_NO_DATA, "checks": checks,
+                "warn": [c["name"] for c in checks if c.get("level") == "warn"],
+                "fail": [c["name"] for c in checks if not c["ok"]]}
     return {
         "healthy": healthy,
         "exit_code": EXIT_HEALTHY if healthy else EXIT_UNHEALTHY,
         "checks": checks,
+        # WP05：黄色项不改变退出码（避免真实但可接受的降级把 CI 打红），
+        # 但必须在报告里点名，否则 "warn" 就等于没说。
+        "warn": [c["name"] for c in checks if c.get("level") == "warn"],
+        "fail": [c["name"] for c in checks if not c["ok"]],
     }
 
 
@@ -517,6 +994,37 @@ def _safe_float(v: Any) -> float:
         return float(v)
     except (TypeError, ValueError):
         return 0.0
+
+
+def _round_observation_fields(row: dict) -> set[str]:
+    """这条轮样本里**真的采集到**的观测字段名集合（纯函数）。
+
+    这是"确实是 0"与"没采集到"的唯一区分手段，也是旧版本轮样本的探测器：
+
+    * 新版本（``make_round_sample`` 带 observation）会写
+      ``observation_fields`` 标记，直接用；
+    * 更早的版本没有标记，但有观测键 —— 回退成"看键在不在"。注意
+      ``stale_rejected`` 只在旧样本里出现（新写的是 ``future_rejected``），
+      所以两种命名都算"采到了拒绝数"；
+    * 什么都没有（离线造样本 / 只跑了 cache-size 统计的旧 soak）-> 空集，
+      汇总方**不得**把这些轮当成 0 分参与判定。
+
+    脏值（类型不对、NaN）不进集合：采到了字段但值是坏的，与"没采到"在
+    判定上等价 —— 都不该被当成一个真实读数。
+    """
+    known = set(row.get("observation_fields") or ())
+    if known:
+        return {str(k) for k in known}
+    return {k for k in _OBSERVATION_MARKER_KEYS if k in row}
+
+
+#: 拒绝计数字段 -> 汇总里的总计键名。
+_REJECT_TOTAL_KEYS: tuple[tuple[str, str], ...] = (
+    ("unknown_missing", "missing_total"),
+    ("rejected_quality", "quality_total"),
+    ("future_rejected", "future_total"),
+    ("out_of_order_rejected", "ooo_total"),
+)
 
 
 # ==========================================================================
@@ -761,9 +1269,45 @@ def _free_port() -> int:
 def _fmt_table(checks: Sequence[dict]) -> str:
     lines = []
     for c in checks:
-        lines.append(f"  {'✓' if c.get('ok') else '✗'} {c.get('name', '?'):<9}"
+        # WP05：warn 用 ~ 标出来。只显示 ✓/✗ 会把"说得出问题但没到失败"
+        # 这一档吞掉，而那正是 observation 覆盖率要表达的东西。
+        lvl = c.get("level") or ("ok" if c.get("ok") else "fail")
+        mark = {"ok": "✓", "warn": "~", "fail": "✗"}.get(str(lvl), "?")
+        lines.append(f"  {mark} {c.get('name', '?'):<11}"
                      f"{c.get('detail', '')}")
     return "\n".join(lines)
+
+
+def _fmt_observation_summary(metrics: dict) -> str:
+    """把 WP05 的观测聚合打印成一行（人读的结论表用）。"""
+    def _pct(v: Any) -> str:
+        return "—" if v is None else f"{float(v):.1%}"
+
+    def _fmt_worst(rows: Sequence[dict]) -> str:
+        if not rows:
+            return "（无有效 coverage 读数）"
+        return " ".join(f"#{r.get('index')}={_pct(r.get('coverage'))}"
+                        for r in rows)
+
+    return (
+        f"  观测覆盖：p05/p50/min/max = {_pct(metrics.get('coverage_p05'))} / "
+        f"{_pct(metrics.get('coverage_p50'))} / {_pct(metrics.get('coverage_min'))} / "
+        f"{_pct(metrics.get('coverage_max'))}"
+        f"（有效读数 {metrics.get('coverage_rounds')}/{metrics.get('rounds')} 轮，"
+        f"带账本 {metrics.get('rounds_with_observation')} 轮）\n"
+        f"  观测账本：请求 {metrics.get('requested_total')} / 返回 "
+        f"{metrics.get('returned_total')} / 准入 {metrics.get('admitted_total')}；"
+        f"拒绝 缺失 {metrics.get('missing_total')} 质量 {metrics.get('quality_total')} "
+        f"未来 {metrics.get('future_total')} 陈旧 {metrics.get('stale_total')} "
+        f"乱序 {metrics.get('ooo_total')}\n"
+        f"  来源混合：{metrics.get('source_mix') or '{}'}"
+        f"（未知来源 {metrics.get('source_mix_unknown_rounds')} 轮）\n"
+        f"  能力缺失：{metrics.get('capability_unavailable_rounds')} 轮出现，"
+        f"累计 {metrics.get('capability_unavailable_total')} 个标的不可评估"
+        f"（比例 {_pct(metrics.get('capability_unavailable_ratio'))}）"
+        f"{metrics.get('unavailable_by_reason') or ''}\n"
+        f"  最差轮次（按 coverage 升序）：{_fmt_worst(metrics.get('worst_rounds') or [])}"
+    )
 
 
 def _collect_config_snapshot(st: Any, engine: Any, watchlist: Sequence[str]) -> dict:
@@ -1115,14 +1659,30 @@ def run(args: argparse.Namespace) -> int:
     )
     verdict = evaluate_health(metrics)
     if fatal and verdict["exit_code"] == EXIT_HEALTHY:
-        verdict = {"healthy": False, "exit_code": EXIT_UNHEALTHY,
-                   "checks": verdict["checks"] + [
-                       {"name": "fatal", "ok": False, "detail": fatal}]}
+        checks = verdict["checks"] + [{"name": "fatal", "ok": False,
+                                       "level": "fail", "detail": fatal}]
+        verdict = {"healthy": False, "exit_code": EXIT_UNHEALTHY, "checks": checks,
+                   "warn": list(verdict.get("warn") or []),
+                   "fail": list(verdict.get("fail") or []) + ["fatal"]}
 
     notes = [
         "休市时行情为最后成交快照，0 条告警不等于故障",
         "force=True 已强制跑完整数据链路（否则休市时 poll_once 直接返回空）",
         f"抓取失败容差为 {DEFAULT_TOLERANCES['max_error_ratio']:.0%} 轮（东财限流是常态）",
+        # WP05 / IT-P1-OBS-011：阈值写进报告，否则两次运行的结论没法比较
+        # （不知道当时用的是哪档阈值）。
+        "观测覆盖率阈值（warn/fail）："
+        f"p05 {DEFAULT_OBSERVATION_TOLERANCES['coverage_warn_p05']:.0%}/"
+        f"{DEFAULT_OBSERVATION_TOLERANCES['coverage_fail_p05']:.0%}，"
+        f"p50 {DEFAULT_OBSERVATION_TOLERANCES['coverage_warn_p50']:.0%}/"
+        f"{DEFAULT_OBSERVATION_TOLERANCES['coverage_fail_p50']:.0%}，"
+        f"min {DEFAULT_OBSERVATION_TOLERANCES['coverage_warn_min']:.0%}/"
+        f"{DEFAULT_OBSERVATION_TOLERANCES['coverage_fail_min']:.0%}"
+        "（刻意不要求 100%：停牌/新股/源端漏发让它永远到不了 100%）",
+        "能力缺失阈值为『出现即警告』："
+        f"轮覆盖率 > {DEFAULT_OBSERVATION_TOLERANCES['unavailable_warn_ratio']:.0%} 记 warn，"
+        f">= {DEFAULT_OBSERVATION_TOLERANCES['unavailable_fail_ratio']:.0%} 记 fail"
+        "（每轮都不可评估 = 整类规则一次都没被验证过）",
     ]
     if flags.get("interrupted"):
         notes.append("本次运行被 Ctrl+C 中断，统计仅覆盖已完成的轮次")
@@ -1215,6 +1775,8 @@ def _print_summary(metrics: dict, verdict: dict, bounds: dict,
     print(f"  SSE：连接 {'是' if sse.get('connected') else '否'}，"
           f"事件 {sse.get('events_total')} 条 {sse.get('events_by_type') or '{}'}，"
           f"断流 {'是' if sse.get('stalled') else '否'}")
+    # --- WP05：观测账本（人只看这一段，所以关键数字必须都在这里）--------------
+    print(_fmt_observation_summary(metrics))
     print(f"  日志：{logs}")
 
     print()
@@ -1223,12 +1785,16 @@ def _print_summary(metrics: dict, verdict: dict, bounds: dict,
     print("=" * 66)
     print(_fmt_table(verdict.get("checks") or []))
     print()
+    warns = list(verdict.get("warn") or [])
     if verdict.get("healthy"):
         print(f"✓ 健康（exit {verdict.get('exit_code')}）")
     else:
         print(f"✗ 不健康（exit {verdict.get('exit_code')}）"
               f"  —— 失败项："
               f"{[c['name'] for c in verdict.get('checks') or [] if not c.get('ok')]}")
+    if warns:
+        # 黄色不改变退出码，但如果只写在 checks 里就等于没说 —— 必须显式点名。
+        print(f"⚠ 警告项（不影响退出码）：{warns}")
     if report_path is not None:
         print(f"报告：{report_path}")
     else:

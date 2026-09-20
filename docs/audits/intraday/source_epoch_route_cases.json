@@ -1,0 +1,37 @@
+{
+  "_doc": "WP02 / IT-P1-TIME-ROLE-001+004：route 级 source epoch 用例台账。verdict 来自**回退验牙实跑**：回退 engine.py 后逐条看失败类型。",
+  "file": "tests/test_source_epoch_route.py",
+  "total_cases": 13,
+  "cases": [
+    "test_index_route_gets_its_own_epoch",
+    "test_stocks_switch_does_not_clear_index_watermark",
+    "test_index_out_of_order_still_rejected_after_stocks_switch",
+    "test_code_collision_across_routes_is_isolated",
+    "test_a_to_b_to_a_per_route",
+    "test_same_route_same_source_is_idempotent",
+    "test_stale_first_packet_is_admitted_under_unknown_contract",
+    "test_stale_is_diagnosed_even_when_not_rejected",
+    "test_stale_rejected_per_route_epoch_when_freshness_trusted",
+    "test_fresh_first_packet_in_new_epoch_is_admitted",
+    "test_engine_index_epoch_opens_when_index_route_switches",
+    "test_engine_stocks_switch_does_not_admit_index_out_of_order",
+    "test_engine_stale_first_packet_in_new_epoch_is_admitted"
+  ],
+  "teeth": {
+    "_method": "git stash push -- src/arad/engine.py；保留全部新测试；按失败类型分类（AssertionError=真验牙 / TypeError等=结构性）",
+    "behavioral_red": [
+      "test_engine_index_epoch_opens_when_index_route_switches",
+      "test_engine_stocks_switch_does_not_admit_index_out_of_order"
+    ],
+    "behavioral_red_count": 2,
+    "structural_red_count": 11,
+    "regression_guards": [
+      "test_fresh_first_packet_in_new_epoch_is_admitted"
+    ],
+    "_honest_note": "11 条结构性红只证明『接口不存在』，不证明行为变了 —— 不当作业绩。真验牙是上面 2 条走真实 poll_once 的行为级用例。"
+  },
+  "run": {
+    "exit_code": 0,
+    "summary": "13 passed in 0.11s"
+  }
+}

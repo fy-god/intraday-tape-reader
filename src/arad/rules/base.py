@@ -43,6 +43,16 @@ class RuleContext:
     capabilities: object | None = None
     # 本轮观测账本（requested/returned/…），供规则写可观测性用。
     observation: object | None = None
+    #: 本轮**真正准入**的指数行情 ``code -> Quote``。
+    #:
+    #: IT-P1-INDEX-CURRENT-001：``state.quotes`` 是**累计 latest 缓存**（用于
+    #: 历史/回看），不是"本轮 current"。指数规则若直接遍历它，在指数路由某轮
+    #: 整体失败时会拿着**上一轮**的陈旧指数继续产告警 —— 看起来一切正常，
+    #: 实际数据已经断了。这里显式传本轮 current view，规则只认它。
+    #:
+    #: ``None`` 表示调用方没提供（老调用方/单测）—— 规则须回退到旧行为，
+    #: 但不能假装"本轮有指数"。
+    current_indices: object | None = None
 
     @property
     def now_epoch(self) -> float:

@@ -357,6 +357,56 @@ sources:
 **性能数字必须连机器负载一起说。** 上表最后一行是硬约束：同一套代码同一台机器，
 CPU 饱和时单轮从约 1s 膨胀到约 6s。任何"撑得住 / 撑不住"的结论，前提都是当时机器空闲。
 
+### 4.6 provider 时间语义与 source epoch
+
+本节记录**为什么引擎不直接相信 provider 的时间戳**，以及跨源切换时水位线怎么算。
+相关产物：`docs/audits/intraday/source_time_contract.json`（字段语义合同）、
+`docs/audits/intraday/time_policy_matrix.json`（策略矩阵）。
+
+**三家 provider 的时间字段语义都是 `unknown`。** 腾讯 `fields[30]`、新浪
+`fields[30]+[31]`、东财 `f124` 都被解析进 `Quote.ts`，但仓内**没有**任何权威字段
+规范能证明它们是 event time / publish time 还是 last trade time。三家
+`SourceCapabilities.provider_time` 也都是 `False`。社区资料称腾讯字段 30 为
+"数据更新时间"，但该说法在仓内无可核查来源 —— 按"证据不足写 unknown"处理。
+
+由此推出三条硬约束：
+
+1. **禁止跨源比较 `ts`。** 实测同一代码跨源 `ts` 相差 2328s / 2400s（见 13:39 审计）。
+2. **禁止用 provider `ts` 判新鲜度。** `freshness_allowed=false` 时 `_admit_time()`
+   只记 `time_age_seconds` 诊断，**不做** hard stale reject。硬拒绝能力保留在
+   `_admit_time(freshness_allowed=...)`，某源拿到权威语义后把 `TIME_POLICY` 里该源
+   置 `true` 即可启用，不需要改结构。
+3. **同 epoch 内允许排序。** 同一来源同一 epoch 的单调序号是可比的前提。
+
+**`STALE_TOLERANCE_SECONDS = 4h`** 现在只作为 age 诊断的参考线。它的保守取值
+（A 股冷门股可能几十分钟才成交一次，其 `ts` 表示"最后成交时间"本身就很旧）
+因此不再有误杀风险 —— 代价是当前**没有任何 provider-ts 驱动的陈旧拦截**，
+陈旧防护完全依赖 epoch 内乱序判定。这是 `role=unknown` 的**必然代价**，不是遗漏。
+
+**source epoch 必须按 route 分账。** `accepted_watermark_by_route[(route, code)]`
+的键**带 route**，理由有三：
+
+* 个股与指数是两个独立数据流，各有自己的 serving source 与切源时机。只按个股开
+  epoch 会有两个后果：指数自己切源时不重置水位线（新源首包被当乱序误杀），
+  个股切源时把指数水位线一起清掉（指数真实乱序被放行）。
+* `000001` 既是个股（平安银行）又是指数（上证指数）—— 两条路由**会撞码**，
+  key 本身就必须区分。
+* `EngineState.begin_source_epoch(route, source_tag, source_name=...)` 的标签是
+  **"名字#下标"**：配置里两个源重名（例如都叫 `sina`）时，只用名字会让切换前后
+  标签相同、判为幂等而不重置水位线，跨源误杀就原样回来。
+
+`begin_source_epoch` 是**幂等**的（同一 route 同一来源重复上报返回 `False`），
+否则每次轮询都清水位线，epoch 内的真实乱序就再也拒不住。A→B→A 是**三个** epoch，
+所以存标签而不是布尔。新 epoch 会同时清 `seen_in_epoch`（该 route 的"本 epoch
+首见"标记）—— 只清水位线会让同码在新 epoch 被当成"全局非首见"而绕过陈旧下限。
+
+`EngineState.accepted_watermark` / `source_epoch` 保留为**默认 route（个股）的兼容
+视图**，供既有调用方（含看板与旧测试）继续工作；新代码请直接用 `*_by_route` 表。
+
+`tests/test_time_policy_matrix.py` 把 `source_time_contract.json` ↔
+`time_policy_matrix.json` ↔ `engine.TIME_POLICY` **三方绑死**，任一方漂移立刻变红 ——
+上一轮的缺陷本质正是"实现与自己的合同矛盾"而无人发现。
+
 ---
 
 ## 5. 短线精灵展示层（`src/arad/spirit.py`）

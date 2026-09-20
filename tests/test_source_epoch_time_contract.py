@@ -204,23 +204,51 @@ def test_normal_past_ts_raw_equals_effective():
 
 
 # ===========================================================================
-# 003 —— 首见码必须有陈旧下限
+# 003 —— 陈旧判定（**本轮下调**：改为合同驱动）
 # ===========================================================================
-def test_first_seen_stale_packet_is_rejected():
-    """首见码喂 3 天前的 ts 必须被拒（修复前是无条件接受）。"""
+def test_stale_packet_admitted_when_contract_says_unknown():
+    """WP03：合同三源 `freshness_allowed=false` -> 不得用 provider ts 硬拒绝。
+
+    这是本轮对上一轮 `100e06a` 的**明确下调**：上一轮断言"3 天前首见码必须被拒"，
+    但那与 `source_time_contract.json`（三源 role=unknown）自相矛盾。
+    现在只有**受信任来源**才硬拒绝。
+    """
     st = _state()
-    admitted = st.update([_q("999999", NOW - timedelta(days=3))], NOW)
-    assert "999999" not in admitted, (
-        "首见码接受了 3 天前的 ts —— 跨源切换会把陈旧价格当新鲜行情")
-    assert st.stats.get("t_reject:stale", 0), "应计入 t_reject:stale"
+    st.begin_source_epoch("stocks", "tencent#0", source_name="tencent")
+    st.update([_q("999999", NOW - timedelta(days=3))], NOW, route="stocks")
+    assert "999999" in st.quotes, (
+        "合同 freshness_allowed=false 时硬拒绝了 provider ts —— 与合同矛盾")
+    assert st.stats.get("t_reject:stale", 0) == 0, "不该计入 stale 硬拒绝"
 
 
-def test_stale_rejection_does_not_add_history():
-    """被拒的陈旧首见码不得留下 history/quotes 痕迹。"""
+def test_stale_packet_rejected_when_source_is_trusted():
+    """受信任来源（freshness_allowed=true）仍必须硬拒绝 3 天前的首包。
+
+    这条保证"下调"没有把能力删掉 —— 只是把它置于合同开关之下。
+    """
+    from arad import engine as eng_mod
+
+    saved = dict(eng_mod.TIME_POLICY.get("tencent", {}))
+    eng_mod.TIME_POLICY["tencent"] = {"freshness_allowed": True,
+                                      "strict_ordering_allowed": True}
+    try:
+        st = _state()
+        st.begin_source_epoch("stocks", "tencent#0", source_name="tencent")
+        admitted = st.update([_q("999999", NOW - timedelta(days=3))], NOW,
+                             route="stocks")
+        assert "999999" not in admitted, "受信任来源的陈旧首包应被拒"
+        assert st.stats.get("t_reject:stale", 0) >= 1, "应计入 t_reject:stale"
+    finally:
+        eng_mod.TIME_POLICY["tencent"] = saved
+
+
+def test_stale_is_diagnosed_under_unknown_contract():
+    """不拦也要留痕：age 诊断必须写进 time_age_seconds。"""
     st = _state()
-    st.update([_q("999999", NOW - timedelta(days=3))], NOW)
-    assert "999999" not in st.quotes
-    assert "999999" not in st.history
+    st.begin_source_epoch("stocks", "tencent#0", source_name="tencent")
+    st.update([_q("999999", NOW - timedelta(days=3))], NOW, route="stocks")
+    assert st.time_age_seconds.get("999999", 0) > 4 * 3600
+    assert st.stale_diagnosed.get("stocks", 0) >= 1
 
 
 def test_first_seen_fresh_packet_is_admitted():

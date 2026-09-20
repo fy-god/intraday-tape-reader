@@ -319,12 +319,24 @@ class SpiritIndexRule:
                 and ctx.session not in CONTINUOUS:
             return []
 
-        # 指数行情在 state.quotes 里（引擎不把指数放进 snap.quotes，
-        # 否则个股规则会对指数误报）。
+        # IT-P1-INDEX-CURRENT-001：指数候选必须来自**本轮 current view**。
+        #
+        # ``ctx.state.quotes`` 是**累计 latest 缓存**，不是 current：指数路由
+        # 某轮整体失败时，它里面仍是上一轮的指数 —— 直接遍历会让规则拿着陈旧
+        # 数据继续产告警，而观测账本显示 index_admitted=0，两边对不上。
+        # 所以优先用 ``ctx.current_indices``（引擎每轮填的本轮准入集）。
         candidates: dict[str, Quote] = {}
-        for code, q in (getattr(ctx.state, "quotes", None) or {}).items():
-            if q is not None and is_index_quote(q):
-                candidates[code] = q
+        current = getattr(ctx, "current_indices", None)
+        if current is not None:
+            for code, q in current.items():
+                if q is not None and is_index_quote(q):
+                    candidates[code] = q
+        else:
+            # 兼容老调用方/单测：没有 current view 时回退到累计缓存
+            # （这是**旧行为**，不代表本轮真的有指数）。
+            for code, q in (getattr(ctx.state, "quotes", None) or {}).items():
+                if q is not None and is_index_quote(q):
+                    candidates[code] = q
         # 兼容：若调用方（测试/回放）确实把指数放进了快照，也认
         for code, q in (snap.quotes or {}).items():
             if q is not None and is_index_quote(q):

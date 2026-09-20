@@ -1,7 +1,8 @@
 {
   "_doc": "IT-P1-TIME-ROLE-001：provider 时间字段的语义合同。每条都必须有可核查的仓内证据；证据不足以判定语义时写 unknown，禁止猜测。",
   "_generated_at_jst": "2026-09-20T17:00:43+09:00",
-  "_reviewed_source_sha": "f6a064bc787b1bea5e8edfa521b9575a8047d47c",
+  "_reviewed_source_sha": "f6a064bc787b1bea5e8edfa521b9575a8047d47f",
+  "_sha_note": "IT-P2-CONTRACT-SHA-TYPO：本字段曾把末位 f 误写成 c（…d47c），该对象在仓库中**不存在**（git cat-file exit 128，且非浅克隆）。真值 …d47f 存在，是 100e06a 的父提交。本文件的所有 provider_field 证据行号均以该提交为准。",
   "_schema": {
     "provider_field": "解析进 Quote.ts 的原始字段名/下标",
     "role": "该字段的语义角色：event_time | publish_time | last_trade_time | update_time | unknown",
@@ -53,7 +54,9 @@
     "cross_source_comparison": "禁止。三家 role 均为 unknown，跨源比较 ts 无依据；实测同一代码跨源 ts 相差 2328s / 2400s（见 13:39 报告）。",
     "cross_source_watermark_sharing": "禁止。这正是 IT-P1-TIME-ROLE-001：水位线必须按实际 serving source 分段（source epoch）。",
     "within_epoch_ordering": "允许。同一来源同一 epoch 内的单调 ts 可比 —— 但若将来某源被证实 role 不是事件时间，该许可必须重新评估。",
-    "freshness_judgement": "禁止基于 provider ts 判定新鲜度。STALE_TOLERANCE_SECONDS 只在**首见码**上作为保守兜底（4 小时），它不是基于 provider 语义的判定，而是防止『数天前的陈旧数据被当新鲜行情』的最后一道闸。",
+    "freshness_judgement": "禁止基于 provider ts 判定新鲜度。STALE_TOLERANCE_SECONDS（4 小时）与 provider 语义**无关**，它是与 `role` 无关的保守兜底 —— 防止『数天前的陈旧数据被当新鲜行情』。语义上它不是「新鲜度判定」，而是「拒绝明显不属于本轮的远古包」。",
+    "freshness_judgement_note": "IT-P1-TIME-POLICY-001 收口：本字段曾只说『禁止』却没说明 STALE_TOLERANCE_SECONDS 的豁免地位，导致『合同说禁止、代码却硬拒绝』看起来是分叉。现已按审计建议 (a) 显式标为 not_provider_semantics。**行为已由 WP03 对齐**：三个源的 freshness_allowed=false 时引擎**不做** hard stale reject（只记 provider_stale_diagnosed 诊断），硬拒绝能力保留在 engine.TIME_POLICY 里、某源拿到权威语义后打开即可。守卫见 tests/test_time_policy_matrix.py（合同↔矩阵↔engine.TIME_POLICY 三方绑死）与 tests/test_observation_ledger_buckets.py::test_stale_diagnosis_is_per_round_not_cumulative。",
+    "freshness_judgement_semantics": "not_provider_semantics",
     "provider_ts_raw": "必须留存。轻微超前会被夹到 now 入库（既有契约），原始值经 EngineState.provider_ts_raw 保留，否则跨源对账无据。"
   },
   "verification": {

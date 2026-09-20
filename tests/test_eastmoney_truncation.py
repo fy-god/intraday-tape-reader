@@ -22,6 +22,9 @@ import urllib.parse
 
 import pytest
 
+from arad.config import load_settings
+from arad.engine import Engine
+from arad.session import TradingCalendar
 from arad.sources.eastmoney import EastmoneySource, PAGE_LIMIT
 
 # 真实量级：2026-09-15 探针实测全市场 total=5913，page_size 被服务端压到 100。
@@ -412,6 +415,249 @@ class TestConfigContractUnchanged:
         quotes = src.universe()
         assert len(quotes) == CLIST_TOTAL
         assert src.universe_info()["complete"] is True
+
+
+# ==========================================================================
+# 7. WP01 / IT-P1-COMPLETE-001-R1：transport 与 usable **双账**
+# ==========================================================================
+#: 修复前：``shortfall = expected_total - len(out)``，而 ``len(out)`` 是 post-parse
+#: 的 usable Quote 数、``expected_total`` 是 API 的 transport/universe 总数。
+#: 契约明文允许 parser 丢弃停牌/无效行（``docs/DATA_CONTRACT.md`` 第 2.2 节），
+#: 于是「传输完全健康 + 市场里有停牌股」被误判成 transport incomplete，
+#: ``engine.py`` 的 ``complete`` 门控拒绝刷新已有池 —— 新上市代码永远进不来。
+#
+#: 修复后：两个口径分开记账，``complete`` 只由 transport 决定。
+NEW_CODES = ["605999", "605998", "605997", "605996", "605995",
+             "605994", "605993", "605992", "605991", "605990"]
+
+
+def _suspended_row(code: str) -> dict:
+    """停牌/无效行：``f2`` 为 ``"-"``，按契约必须整条丢弃。"""
+    row = _row(code)
+    row["f2"] = "-"
+    row["f18"] = "-"
+    return row
+
+
+def _suspend_every_fetcher(every: int, total: int = CLIST_TOTAL,
+                           new_codes: list[str] | None = None) -> FakeFetcher:
+    """每页**足额**返回（raw transport 健康），但每 ``every`` 行插 1 行停牌。
+
+    ``every=0`` -> 无停牌。``new_codes`` 追加在末尾，池子总数因此变成
+    ``total + len(new_codes)``（模拟新上市让全市场变大）。
+
+    停牌只打在**原有**代码上（``index < total``）：现实的停牌是老股票，而
+    新上市代码正是因为在交易才需要进池。停牌行**仍有唯一 code**，只是价格
+    无效 —— 这正是两个口径必须分开的地方。
+    """
+    extra = list(new_codes or [])
+    codes = [f"{600000 + i}" for i in range(total)] + extra
+    feed_total = len(codes)
+
+    def responder(url: str):
+        pn = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["pn"][0])
+        start = (pn - 1) * 100
+        rows = []
+        for i, c in enumerate(codes[start:start + 100]):
+            idx = start + i
+            bad = every > 0 and idx < total and (idx % every == 0)
+            rows.append(_suspended_row(c) if bad else _row(c))
+        return _payload(feed_total, rows)
+
+    return FakeFetcher(responder)
+
+
+def _dup_code_fetcher(unique_per_page: int = 50) -> FakeFetcher:
+    """raw 行数够（6000 行）但 unique code 只有 3000（大量重复 code）。
+
+    页码步进 50，每页 100 行、只有 50 个唯一 code 重复两次 —— raw 行数
+    溢出 ``total``，但真实代码覆盖只有一半。
+    """
+    def responder(url: str):
+        pn = int(urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["pn"][0])
+        base = (pn - 1) * unique_per_page
+        rows = [_row(f"{600000 + base + (i % unique_per_page)}") for i in range(100)]
+        return _payload(CLIST_TOTAL, rows)
+
+    return FakeFetcher(responder)
+
+
+def _engine_with_pool(pool: list[str]):
+    """构造一个离线 Engine，股票池专用来源留给调用方注入。"""
+    st = load_settings(use_cache=False)
+    st.section("sources")["universe"] = ["eastmoney"]
+    cal = TradingCalendar(holidays=set())
+    eng = Engine(source=None, settings=st, rules=[], notifiers=[],
+                 watchlist=[], calendar=cal)
+    eng._codes = list(pool)
+    return eng
+
+
+class TestTransportUsableDoubleLedger:
+    """``transport_complete``（传输/池规模）与 ``usable_coverage``（解析可用率）分开。"""
+
+    def test_suspended_rows_keep_transport_complete(self):
+        """**真验牙**：raw code 全覆盖 + 约 6% 行 parse 不可用。
+
+        每页足额 100 行、无失败页、未截断，唯一的变化是市场里有停牌股
+        （``f2="-"``，契约要求丢弃）。修复前 ``complete=False``（红）；
+        修复后 ``transport_complete is True`` 且 ``usable_coverage < 1.0``。
+        """
+        src = EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=16))
+        quotes = src.universe()
+        info = src.universe_info()
+
+        # 传输轴完全健康（旧字段，修复前后都存在）
+        assert info["pages_requested"] == 60
+        assert info["pages_failed"] == 0
+        assert info["truncated"] is False
+        assert info["required_pages"] == 60 <= info["max_pages"]
+
+        # **先断言语义**：修复前 complete=False（红），不能只因为缺新键而红。
+        # 用 .get 取新键，缺失即 None -> 在传输轴语义上失败，而不是 KeyError。
+        assert info.get("transport_complete") is True, (
+            f"传输完全健康，停牌行不该让 transport 判 incomplete: {info}")
+        assert info["complete"] is True, "兼容字段必须跟随 transport_complete"
+        assert info.get("usable_coverage") is not None
+        assert info["usable_coverage"] < 1.0, (
+            f"usable_coverage 必须单独暴露解析损失: {info}")
+
+        # 双账：raw 覆盖满，usable 少一截
+        assert info["transport_expected_total"] == CLIST_TOTAL
+        assert info["raw_rows"] == CLIST_TOTAL, f"raw 行数应足额: {info}"
+        assert info["raw_unique_codes"] == CLIST_TOTAL, f"raw code 应全覆盖: {info}"
+        assert info["usable_quotes"] == len(quotes) == 5543
+        assert info["dropped_invalid"] == 370
+        assert info["duplicate_codes"] == 0
+        assert info["usable_coverage"] == pytest.approx(5543 / CLIST_TOTAL)
+
+    def test_double_ledger_reconciles_exactly(self):
+        """两侧账本必须能对上（供 universe_transport_reconcile.json 用）。"""
+        src = EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=16))
+        src.universe()
+        info = src.universe_info()
+
+        assert info["raw_rows"] == info["usable_rows"] + info["dropped_invalid"]
+        assert (info["raw_unique_codes"] + info["duplicate_codes"]
+                == info["raw_code_rows"])
+        assert info["usable_quotes"] <= info["usable_rows"] <= info["raw_rows"]
+        assert info["returned"] == info["usable_quotes"]
+
+    def test_complete_field_mirrors_transport_complete(self):
+        """兼容要求：``meta["complete"] = meta["transport_complete"]``。
+
+        ``engine.py`` 的 ``if not meta.get("complete", True)`` 必须继续工作。
+        """
+        for every, expected in ((0, True), (16, True), (1, True)):
+            src = EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=every))
+            src.universe()
+            info = src.universe_info()
+            assert info["complete"] is info["transport_complete"] is expected, info
+
+    def test_shrinking_pages_break_transport_coverage(self):
+        """回归保护：每页**真的**缩水 -> ``transport_complete=False``。
+
+        这条保住 IT-P1-COMPLETE-001（16:25 修的轴）与旧 ``shortfall`` 判据同向。
+        """
+        f = _shrinking_fetcher(rows_per_page=10)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        # 先断言修复前后都存在字段的语义（旧判据同向），再查新键
+        assert info["truncated"] is False and info["pages_failed"] == 0
+        assert len(quotes) == 600
+        assert info["complete"] is False, info
+        assert info["expected_total"] == CLIST_TOTAL
+        assert info["returned"] == 600
+        assert "行数缩水" in (info["reason"] or ""), info
+
+        assert info["raw_rows"] == 600
+        assert info["raw_unique_codes"] == 600
+        assert info["transport_expected_total"] == CLIST_TOTAL
+        assert info["shortfall"] == CLIST_TOTAL - 600
+        assert info["transport_complete"] is False, info
+
+    def test_duplicate_codes_break_transport_coverage(self):
+        """raw 行数够但 unique code 不足（大量重复 code）-> False。"""
+        src = EastmoneySource(EM_CFG, fetcher=_dup_code_fetcher())
+        src.universe()
+        info = src.universe_info()
+
+        assert info["complete"] is False, info
+        assert info["raw_rows"] == 6000 >= CLIST_TOTAL, "raw 行数确实够"
+        assert info["raw_unique_codes"] == 3000 < CLIST_TOTAL, "唯一 code 不足"
+        assert info["duplicate_codes"] == 3000
+        assert info["shortfall"] == CLIST_TOTAL - 3000
+        assert info["transport_complete"] is False, info
+
+    def test_upward_overlap_stays_transport_complete(self):
+        """翻页边界重叠（unique code 略多于 total）仍是正常完整。
+
+        回归保护：判据必须是「不少于」而非「等于」。
+        """
+        f = _shrinking_fetcher(rows_per_page=120, clip=False)
+        src = EastmoneySource(EM_CFG, fetcher=f)
+        quotes = src.universe()
+        info = src.universe_info()
+
+        assert len(quotes) == 6020 > info["expected_total"] == CLIST_TOTAL
+        assert info["complete"] is True, info
+        assert info["reason"] == "已按总数翻完", info
+        assert info["raw_unique_codes"] == 6020
+        assert info["shortfall"] == 0
+        assert info["transport_complete"] is True, info
+
+    def test_no_total_still_transport_incomplete(self):
+        """没有总数就没有基准 -> transport 仍不可证明为完整。"""
+        src = EastmoneySource(EM_CFG, fetcher=FakeFetcher(lambda u: '{"rc":0,"data":null}'))
+        assert src.universe() == []
+        info = src.universe_info()
+        assert info["complete"] is False
+        assert info["transport_complete"] is False
+
+
+class TestNewListingsEnterPoolDespiteInvalidRows:
+    """真实业务后果验收：正常无效行不得阻止新上市代码进入股票池。"""
+
+    def test_new_listings_enter_pool(self):
+        """**真验牙**：现有 5913 只全市场池 + 10 只新上市 + 约 6% 停牌。
+
+        修复前 ``complete=False`` -> 走 partial 分支 -> 「不得小于现有池」
+        保护拒绝覆盖 -> ``refresh_universe() == 0``，新代码 0/10 进入（红）。
+        修复后 transport 完整 -> 立即采纳 -> 10/10 进入。
+        """
+        new = list(NEW_CODES)
+        pool = [q.code for q in
+                EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=0)).universe()]
+        assert len(pool) == CLIST_TOTAL
+
+        src = EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=16, new_codes=new))
+        eng = _engine_with_pool(pool)
+        eng._universe_src = [src]
+
+        n = eng.refresh_universe()
+        info = src.universe_info()
+
+        # **先断言业务后果**：修复前这里就是 0/10（红）。
+        entered = sorted(c for c in new if c in set(eng._codes))
+        assert entered == sorted(new), (
+            f"新上市代码必须全部进入股票池，实际 {len(entered)}/{len(new)}: {entered}；"
+            f"refresh_universe 返回 {n}；complete={info.get('complete')}")
+        assert n != 0, f"完整 transport 结果必须被采纳，实际 refresh_universe 返回 {n}"
+        # 再查账本
+        assert info.get("transport_complete") is True, info
+        assert info["transport_expected_total"] == CLIST_TOTAL + len(new)
+
+    def test_new_listings_also_enter_when_pool_is_pinned_large(self):
+        """现有池比 usable 结果更大时也要采纳（新股增长不能被尺寸保护挡住）。"""
+        new = list(NEW_CODES)
+        src = EastmoneySource(EM_CFG, fetcher=_suspend_every_fetcher(every=16, new_codes=new))
+        eng = _engine_with_pool([f"{600000 + i}" for i in range(CLIST_TOTAL)])
+        eng._universe_src = [src]
+
+        assert eng.refresh_universe() != 0
+        assert all(c in set(eng._codes) for c in new)
 
 
 if __name__ == "__main__":   # pragma: no cover

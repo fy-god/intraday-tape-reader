@@ -1,0 +1,26 @@
+{
+  "_doc": "WP03 一致性守卫：合同 JSON ↔ 策略矩阵 JSON ↔ engine.TIME_POLICY 三方绑死。",
+  "file": "tests/test_time_policy_matrix.py",
+  "total_cases": 10,
+  "cases": [
+    "test_matrix_covers_exactly_the_contract_sources",
+    "test_matrix_role_matches_contract",
+    "test_freshness_flag_is_consistent_with_contract",
+    "test_engine_policy_matches_matrix",
+    "test_unregistered_source_uses_strict_default",
+    "test_unknown_source_name_is_not_trusted",
+    "test_contract_false_means_no_hard_reject",
+    "test_hard_reject_capability_is_retained",
+    "test_age_diagnostic_always_recorded",
+    "test_matrix_documents_that_downgrade_is_deliberate"
+  ],
+  "three_way_binding": [
+    "source_time_contract.json（语义来源）",
+    "time_policy_matrix.json（可执行投影）",
+    "src/arad/engine.py::TIME_POLICY（真正生效的策略）"
+  ],
+  "run": {
+    "exit_code": 0,
+    "summary": "10 passed in 0.06s"
+  }
+}

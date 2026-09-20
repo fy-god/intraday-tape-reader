@@ -55,6 +55,43 @@ FUTURE_TOLERANCE_SECONDS = 120.0
 #: 某源根本不是"事件时间"，应先在该合同里标 ``unknown``，而不是靠这个下限兜底。
 STALE_TOLERANCE_SECONDS = 4 * 3600.0
 
+#: 默认路由名。个股请求走它；``EngineState`` 的兼容视图也指向它。
+DEFAULT_ROUTE = "stocks"
+
+#: IT-P1-TIME-ROLE-003-R1 / WP03：各来源的 provider 时间语义策略。
+#:
+#: 由 ``docs/audits/intraday/source_time_contract.json`` 驱动 —— 那份合同对三家
+#: 都写 ``role=unknown``、``freshness_allowed=false``，因为仓内**没有**权威字段
+#: 规范能证明这些字段是 event time / publish time / last trade time。
+#:
+#: 于是这里必须与合同一致：``freshness_allowed=false`` 的来源**不做** hard stale
+#: reject，只记 age 诊断。上一轮（``100e06a``）直接用 provider ts 做 4 小时硬拒绝
+#: 是**与自己的合同矛盾**的 —— 本轮下调。
+#:
+#: 将来某来源拿到权威语义（例如确认某字段确为 snapshot publish time）时，
+#: 把该来源的 ``freshness_allowed`` 打开，硬拒绝能力已就绪（见 ``_admit_time``
+#: 的 ``freshness_allowed`` 参数），无需再改结构。
+#:
+#: ``tests/test_time_policy_matrix.py`` 把本表与合同 JSON 绑死，防止两者漂移。
+TIME_POLICY: dict[str, dict[str, bool]] = {
+    "tencent": {"freshness_allowed": False, "strict_ordering_allowed": True},
+    "sina": {"freshness_allowed": False, "strict_ordering_allowed": True},
+    "eastmoney": {"freshness_allowed": False, "strict_ordering_allowed": True},
+}
+
+#: 未知来源的兜底：**同样不允许**用 provider ts 判新鲜度。
+#: 默认从严（不给未登记的来源任何"权威时间"假设）。
+DEFAULT_TIME_POLICY: dict[str, bool] = {
+    "freshness_allowed": False,
+    "strict_ordering_allowed": True,
+}
+
+
+def time_policy_for(source_name: str) -> dict[str, bool]:
+    """按来源名取时间策略；未登记的来源用 ``DEFAULT_TIME_POLICY``。"""
+    return TIME_POLICY.get(str(source_name or "").strip().lower(),
+                           DEFAULT_TIME_POLICY)
+
 
 # ==========================================================================
 # 状态
@@ -67,25 +104,40 @@ class EngineState:
     history: dict[str, deque] = field(default_factory=dict)
     first_seen: dict[str, Quote] = field(default_factory=dict)
     last_price: dict[str, float] = field(default_factory=dict)
-    #: code -> 已准入观测量的事件时间上界（秒）。乱序判定的**显式**水位线。
+    #: ``(route, code) -> 已准入观测量的事件时间上界``（秒）。乱序判定的**显式**水位线。
     #: 必须与 ``history`` 解耦：``history`` 只在价格/量变化时追加（服务窗口
     #: 采样），若借用它的尾部时间当水位线，平价新鲜观测就不推进水位线，
     #: 迟到的旧点会被误准入（IT-P0-002-R2）。
-    accepted_watermark: dict[str, float] = field(default_factory=dict)
-    #: IT-P1-TIME-ROLE-001：当前**实际供数源**的 epoch 标签。
     #:
-    #: 水位线按来源分段：供数源一变就开新 epoch，新 epoch 的水位线从该 epoch
-    #: 自己的数据重新起算，不被上一个 epoch 的硬水位线否决。
+    #: IT-P1-TIME-ROLE-004：键必须**带 route**。个股与指数是两个独立的数据流，
+    #: 各有自己的 serving source 与切源时机。用全局 ``code -> ts`` 会有两个后果：
+    #: ① 指数路由自己切源时不开 epoch，指数新源首包被旧水位线误杀；
+    #: ② 个股切源会把**指数**的水位线一起清掉，指数那边真实的乱序就钻过去。
+    #: 另外 ``000001`` 既是个股（平安银行）又是指数（上证指数），**会撞码** ——
+    #: 所以带 route 不只是为了切源，key 本身就必须区分。
+    accepted_watermark_by_route: dict[tuple[str, str], float] = field(
+        default_factory=dict)
+    #: IT-P1-TIME-ROLE-003-R1：``(route, code) -> 该 route 当前 epoch 内是否见过``。
     #:
-    #: 为什么必须有这个：``accepted_watermark`` 是 ``code -> timestamp``，
-    #: **不含来源**。A 源先接受 10:30:40；供数切到 B 源、B 首包 10:30:05 ——
-    #: 按事件时间它比水位线旧，于是被当"乱序"静默丢弃（实测
-    #: ``admitted=[]``、``t_reject:out_of_order=1``）。但 B 的时间轴是**另一个
-    #: epoch 的起点**，不是倒退。epoch **之内**的真实乱序仍然照拒。
+    #: 陈旧下限只对"本 epoch 首见"生效。若沿用全局 ``first_seen``，切源后同一
+    #: 代码在全局表里"已见过"，新 epoch 的首包就绕过了陈旧下限（实测 3 天前的
+    #: 首包被接受）。按 route 分账后，新 epoch 的该码重新算"首见"。
+    seen_in_epoch: dict[tuple[str, str], bool] = field(default_factory=dict)
+    #: ``route -> 当前 epoch 标签``。A→B→A 是**三个** epoch，所以存标签而非布尔；
+    #: 同一来源连续上报是幂等的。
+    source_epochs: dict[str, str] = field(default_factory=dict)
+    #: ``route -> 当前供数源的名字``（用于查 ``source_time_contract.json`` 的时间策略）。
+    #: 与 ``source_epochs`` 的标签分开存：标签是"名字#下标"的复合标识，直接用标签
+    #: 查策略会查不到（策略表按纯名字登记）。
+    source_names: dict[str, str] = field(default_factory=dict)
+    #: ``code -> 最近一次算出的 age 诊断``（**秒**，provider ts 相对接收时刻有多旧）。
     #:
-    #: 注意 A→B→A 是**三个** epoch，不能复用最早 A 的水位线 —— 所以这里存标签
-    #: 而不是布尔，且同一来源连续上报是幂等的。
-    source_epoch: str = ""
+    #: IT-P1-TIME-ROLE-003-R1：合同 ``freshness_allowed=false`` 时不做硬拒绝，
+    #: 但**必须**留下这个诊断 —— 否则"该源时间是否可信"就完全无从观察，
+    #: 将来某源拿到权威语义时也没有历史依据可查。
+    time_age_seconds: dict[str, float] = field(default_factory=dict)
+    #: 诊断计数：``route -> 陈旧包出现次数``（未被拦截的那些）。
+    stale_diagnosed: dict[str, int] = field(default_factory=dict)
     #: IT-P1-TIME-ROLE-002：``code -> provider 原始 ts``（秒）。
     #:
     #: 轻微超前（时钟抖动内）的点会被夹到 ``now`` 入库 —— 那是既有且被测试
@@ -160,7 +212,8 @@ class EngineState:
         return min((p[1] for p in pts), default=None)
 
     # ---- 写入 ---------------------------------------------------------
-    def update(self, quotes: Iterable[Quote], now: datetime) -> dict[str, Quote]:
+    def update(self, quotes: Iterable[Quote], now: datetime,
+               *, route: str = DEFAULT_ROUTE) -> dict[str, Quote]:
         """把一轮快照并入状态，**返回本轮真正被准入的标的**。
 
         曾经有个 ``eligible=`` 关键字参数，但函数体从未读过它 —— 调用方以为
@@ -189,18 +242,29 @@ class EngineState:
         推进了 ``quotes``/``last_price``，却**不推进水位线**；下一个真正迟到
         的点因 ``q_ep >= h[-1][0]`` 被放行，覆盖缓存并让时间序列尾部倒挂。
         现在水位线在**准入成功时无条件推进**，与 history 的追加策略解耦。
+
+        IT-P1-TIME-ROLE-004：水位线与"本 epoch 是否见过"都按 **route** 分账。
+        个股与指数是两个独立数据流，各有自己的 serving source 与切源时机。
         """
         ep = now.timestamp()
+        route = str(route or DEFAULT_ROUTE)
         self.seq += 1
         admitted: dict[str, Quote] = {}
+        # IT-P1-TIME-ROLE-003-R1：陈旧硬拒绝是否可用，由该 route 的供数源的
+        # 时间语义合同决定（三家目前都是 freshness_allowed=false）。
+        _policy = time_policy_for(self.source_names.get(route, ""))
+        _fresh_ok = bool(_policy.get("freshness_allowed", False))
         for q in quotes:
             if q.price <= 0:
                 continue
 
+            wm_key = (route, q.code)
             # --- 写前时间准入 -------------------------------------------
-            # first_seen 在**准入之前**取：陈旧下限只对首见码生效。
+            # "本 route 本 epoch 是否首见"在**准入之前**取：
+            # 陈旧下限只对首见码生效（IT-P1-TIME-ROLE-003）。
             ts_ok, q_ep, why = self._admit_time(
-                q, now, ep, first_seen=q.code not in self.first_seen)
+                q, now, ep, first_seen=wm_key not in self.seen_in_epoch,
+                freshness_allowed=_fresh_ok)
             if not ts_ok:
                 self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
                 continue
@@ -209,7 +273,16 @@ class EngineState:
             # "接收时间"。入库仍用夹过的 q_ep（既有契约），但原始值不丢。
             if q.ts is not None:
                 try:
-                    self.provider_ts_raw[q.code] = float(q.ts.timestamp())
+                    _raw = float(q.ts.timestamp())
+                    self.provider_ts_raw[q.code] = _raw
+                    # IT-P1-TIME-ROLE-003-R1：无论是否拦得住，都留下 age 诊断。
+                    # 合同 freshness_allowed=false 时这是**唯一**可观察"该源时间
+                    # 是否可信"的地方，不能因为"不拦"就不记。
+                    _age = ep - _raw
+                    self.time_age_seconds[q.code] = _age
+                    if _age > STALE_TOLERANCE_SECONDS:
+                        self.stale_diagnosed[route] = \
+                            self.stale_diagnosed.get(route, 0) + 1
                 except (AttributeError, OSError, ValueError):
                     pass
             self.effective_event_time[q.code] = q_ep
@@ -218,9 +291,9 @@ class EngineState:
             # --- 乱序准入：用显式水位线，必须在任何写入之前判定 ----------
             # 水位线在每次准入成功时无条件推进（见函数末尾），因此"平价新鲜
             # 观测"也会推高它，迟到的旧点就再也钻不过去（IT-P0-002-R2）。
-            # IT-P1-TIME-ROLE-001：水位线**按 source epoch 分段**，跨 epoch 的
-            # 旧时间戳不算"倒退"（见 begin_source_epoch）。
-            wm = self.accepted_watermark.get(q.code)
+            # IT-P1-TIME-ROLE-001/004：水位线**按 (route, source epoch) 分段**，
+            # 跨 epoch 的旧时间戳不算"倒退"（见 begin_source_epoch）。
+            wm = self.accepted_watermark_by_route.get(wm_key)
             if wm is not None and q_ep < wm:
                 self.stats["t_reject:out_of_order"] = \
                     self.stats.get("t_reject:out_of_order", 0) + 1
@@ -241,12 +314,15 @@ class EngineState:
                 h.append((q_ep, q.price, q.volume_lots))
             self.last_price[q.code] = q.price
             # 无条件推进水位线（与 history 是否追加无关）
-            self.accepted_watermark[q.code] = q_ep if wm is None else max(wm, q_ep)
+            self.accepted_watermark_by_route[wm_key] = (
+                q_ep if wm is None else max(wm, q_ep))
+            self.seen_in_epoch[wm_key] = True
             admitted[q.code] = q
         return admitted
 
     def _admit_time(self, q: Quote, now: datetime, ep: float,
-                    *, first_seen: bool = False) -> tuple[bool, float, str]:
+                    *, first_seen: bool = False,
+                    freshness_allowed: bool = False) -> tuple[bool, float, str]:
         """写前时间准入。返回 ``(是否接纳, 用于入库的时间戳, 拒绝原因)``。
 
         事件时间缺失时按"接收时间"处理（视作准时），这是兼容既有行为：
@@ -256,6 +332,12 @@ class EngineState:
         如果带着数天前的 ``ts``，说明这个源的时间轴与本地时钟不同源（或数据
         本身陈旧），此时把它当新鲜行情接纳是错的。**已有水位线的码不走这条**：
         它的陈旧由 epoch 内乱序判定负责，重复加下限只会互相干扰。
+
+        IT-P1-TIME-ROLE-003-R1 / WP03：``freshness_allowed`` 来自
+        ``source_time_contract.json``（经 ``time_policy_for``）。合同对三家都写
+        ``false``，所以**默认不对 provider ts 做硬陈旧拒绝** —— 只记 age 诊断。
+        硬拒绝能力保留在代码里，等某个来源拿到权威时间语义后打开即可，
+        不需要再改结构。
         """
         if q.ts is None:
             return True, ep, ""
@@ -265,14 +347,23 @@ class EngineState:
             return True, ep, ""
         if q_ep > ep + FUTURE_TOLERANCE_SECONDS:
             return False, q_ep, "future"
-        if first_seen and q_ep < ep - STALE_TOLERANCE_SECONDS:
+        # 陈旧判定只在两个条件**同时**成立时才硬拒绝：
+        #   ① 该来源的时间语义允许判新鲜度（合同 freshness_allowed）；
+        #   ② 这是本 route 本 epoch 的首见包（已有水位线的码由乱序判定负责）。
+        # 否则只记诊断，不拦截 —— 这与 source_time_contract.json 一致。
+        if first_seen and freshness_allowed and q_ep < ep - STALE_TOLERANCE_SECONDS:
             return False, q_ep, "stale"
         if q_ep > ep:
             return True, ep, ""          # 轻微超前 -> 夹到 now，保留数据
         return True, q_ep, ""
 
-    def begin_source_epoch(self, source: str) -> bool:
-        """IT-P1-TIME-ROLE-001：供数源变化时开一个新 epoch。
+    def begin_source_epoch(self, route: str, source: str | None = None, *,
+                           source_name: str | None = None) -> bool:
+        """IT-P1-TIME-ROLE-001/004：某条 **route** 的供数源变化时开一个新 epoch。
+
+        签名是 ``(route, source)``。兼容旧的单参调用
+        ``begin_source_epoch("sina")`` —— 那种写法会被当成
+        ``route=DEFAULT_ROUTE, source="sina"``（见下）。
 
         返回是否真的开了新 epoch。同一来源重复上报是**幂等**的（返回 False）——
         否则每次轮询都把水位线清掉，epoch 内的真实乱序就再也拒不住了。
@@ -280,16 +371,48 @@ class EngineState:
         由调用方传入**实际 serving source**（``SourceManager.serving_of(route)``），
         而不是 ``SourceManager.current``：热备期间由备用源实际供数，
         ``current`` 还是主源，按它分 epoch 会把两段混成一段。
+
+        为什么按 route 分账（IT-P1-TIME-ROLE-004）：个股与指数是两个独立数据流，
+        各有自己的切源时机。全局分账会有两个后果 —— 指数自己切源不开 epoch
+        （新源首包被误杀），个股切源清掉指数水位线（指数真实乱序被放行）。
         """
+        # 兼容旧签名 begin_source_epoch("sina")：单参时它是 source，route 取默认。
+        if source is None:
+            route, source = DEFAULT_ROUTE, route
+        route = str(route or DEFAULT_ROUTE)
         tag = str(source or "")
-        if tag == self.source_epoch:
+        # 供数源的**纯名字**单独记一份，用于查 source_time_contract.json 的
+        # 时间策略表（策略按纯名字登记，不是"名字#下标"的复合标签）。
+        self.source_names[route] = str(source_name or tag.split("#")[0])
+        if tag == self.source_epochs.get(route):
             return False
-        self.source_epoch = tag
-        # 新 epoch：水位线必须从该 epoch 自己的数据重新起算。
-        # 这里**清空**所有码的水位线，而不是逐码比较 —— 逐码比较无法处理
-        # "该码在新 epoch 还没出现过"的情况，而那正是跨源首包的场景。
-        self.accepted_watermark.clear()
+        self.source_epochs[route] = tag
+        # 新 epoch：**该 route** 的水位线与"本 epoch 首见"标记都要重新起算。
+        #
+        # 清 first_seen 的分账表是关键（IT-P1-TIME-ROLE-003-R1）：只清水位线
+        # 会让该码在新 epoch 被当成"全局非首见"，于是 3 天前的首包绕过陈旧下限。
+        for key in [k for k in self.accepted_watermark_by_route if k[0] == route]:
+            self.accepted_watermark_by_route.pop(key, None)
+        for key in [k for k in self.seen_in_epoch if k[0] == route]:
+            self.seen_in_epoch.pop(key, None)
         return True
+
+    # ---- 向后兼容视图 ---------------------------------------------------
+    @property
+    def accepted_watermark(self) -> dict[str, float]:
+        """**兼容视图**：默认 route（个股）的 ``code -> ts`` 快照。
+
+        水位线的真实存储是 ``accepted_watermark_by_route[(route, code)]``
+        （IT-P1-TIME-ROLE-004）。这里给旧调用方一个只读快照，语义等价于
+        "个股路由的水位线"。新代码请直接用 by_route 表。
+        """
+        return {code: ts for (r, code), ts in self.accepted_watermark_by_route.items()
+                if r == DEFAULT_ROUTE}
+
+    @property
+    def source_epoch(self) -> str:
+        """**兼容视图**：默认 route（个股）的 epoch 标签。"""
+        return self.source_epochs.get(DEFAULT_ROUTE, "")
 
     def prune(self, keep_codes: set[str] | None = None) -> int:
         """丢弃不再关注的股票历史，控制内存。返回清理条数。"""
@@ -301,13 +424,20 @@ class EngineState:
             self.last_price.pop(c, None)
             # 水位线必须与 history 一起回收，否则 prune 后残留的水位线
             # 会让重新关注的代码被旧水位线误判为"迟到"。
-            self.accepted_watermark.pop(c, None)
+            # IT-P1-TIME-ROLE-004：水位线/首见标记按 route 分账，**所有** route
+            # 都要一起回收。
+            for key in [k for k in self.accepted_watermark_by_route
+                        if k[1] == c]:
+                self.accepted_watermark_by_route.pop(key, None)
+            for key in [k for k in self.seen_in_epoch if k[1] == c]:
+                self.seen_in_epoch.pop(key, None)
             self.first_seen.pop(c, None)
             # IT-P1-TIME-ROLE-002 的留痕表必须与 history 一起回收，
             # 否则长时间运行会随着关注池轮换而无界增长。
             self.provider_ts_raw.pop(c, None)
             self.effective_event_time.pop(c, None)
             self.received_at.pop(c, None)
+            self.time_age_seconds.pop(c, None)
         # 冷却表按时间过期
         cutoff = time.time() - 3600
         stale = [k for k, v in self.last_alert.items() if v < cutoff]
@@ -762,9 +892,22 @@ class Engine:
         按 ``sources.universe`` 的顺序依次尝试，采用第一个**可用**结果：
 
         * 完整结果（``complete=True``）**立即采用**，后续来源不再尝试；
-        * 不完整结果（``complete=False``，即分页中途失败/翻页被截断）只作为
-          **兜底候选**，继续往后试，只有所有来源都没给出完整结果时才采用其中
-          最大的那个 —— 且**绝不用它覆盖更大的已有股票池**（IT-P1-006）。
+        * 不完整结果（``complete=False``）只作为**兜底候选**，继续往后试，
+          只有所有来源都没给出完整结果时才采用其中最大的那个 —— 且**绝不用它
+          覆盖更大的已有股票池**（IT-P1-006）。
+
+        ``complete`` 的语义是**传输口径**（服务端有没有把池子给全），具体三种
+        不完整原因（见 ``sources/eastmoney.py``，WP01 已拆轴）：
+
+        * 分页中途有失败页（``pages_failed > 0``）；
+        * 翻页被 ``max_pages`` 截断（``truncated``）；
+        * 行数缩水：``raw_unique_codes < transport_expected_total``。
+
+        **停牌/无效行不再算不完整。** parser 按契约丢弃 ``price<=0`` 的行是
+        **正常**的，它只影响 ``usable_coverage``（诊断轴），不影响
+        ``transport_complete``。把两者混用会让"市场里有停牌股"被误判成
+        "服务端少给了数据"，进而让引擎拒绝刷新已有股票池
+        （IT-P1-COMPLETE-001-R1）。
 
         为什么必须这样：新浪 ``universe()`` 中途某页失败会返回前缀，东财被限流
         时也会少几页。没有完整性判断时，「5563 只的完整池」会被「3000 只的部分
@@ -949,26 +1092,37 @@ class Engine:
 
         # 指数与个股共用同一准入合同（IT-P0-002-R1：股票和指数不得两套口径）。
         #
-        # IT-P1-TIME-ROLE-001：准入前先按**实际供数源**开 epoch。
+        # IT-P1-TIME-ROLE-001/004：准入前按**每条 route 各自的**实际供数源开 epoch。
         # 用 serving_of 而不是 current —— 热备期间由备用源实际供数，current
         # 还是主源，按它分段会把两个 epoch 混成一段，跨源首包照样被误杀。
+        #
+        # 必须**两条 route 都开**：个股与指数是两个独立数据流，各有自己的切源
+        # 时机。只开个股会有两个后果 —— 指数自己切源不开 epoch（新源首包被
+        # 误杀），个股切源清掉指数水位线（指数真实乱序被放行）。
         #
         # epoch 标签用「下标 + 名字」而不是只用名字：若配置里两个源重名
         # （例如都叫 sina），只用名字会让切换前后标签相同，begin_source_epoch
         # 判为幂等而不重置水位线 —— 跨源误杀就原样回来了。
-        _serving_idx = self.sources.serving_of(ROUTE_STOCKS)
-        if _serving_idx is not None:
+        for _route in (ROUTE_STOCKS, ROUTE_INDEX):
+            _serving_idx = self.sources.serving_of(_route)
+            if _serving_idx is None:
+                continue
             try:
                 _serving_name = self.sources.sources[_serving_idx].name
             except (IndexError, AttributeError):
                 _serving_name = "?"
-            self.state.begin_source_epoch(f"{_serving_name}#{_serving_idx}")
+            self.state.begin_source_epoch(
+                _route, f"{_serving_name}#{_serving_idx}",
+                source_name=_serving_name)
 
         # 先记准入计数基线，用来算"本轮"拒绝数（stats 是累计值）。
         _t0_future = int(self.state.stats.get("t_reject:future", 0))
         _t0_ooo = int(self.state.stats.get("t_reject:out_of_order", 0))
-        idx_admitted = self.state.update(idx_quotes, now) if idx_quotes else {}
-        admitted = self.state.update(quotes, now)
+        # WP04 / IT-P1-OBS-010：陈旧**诊断**也要按轮差分 —— 它是累计值。
+        _t0_stale_diag = dict(self.state.stale_diagnosed)
+        idx_admitted = (self.state.update(idx_quotes, now, route=ROUTE_INDEX)
+                        if idx_quotes else {})
+        admitted = self.state.update(quotes, now, route=ROUTE_STOCKS)
 
         # 粗筛：只有**本轮真正被准入**且合格的标的进入规则。
         #
@@ -1031,35 +1185,76 @@ class Engine:
         req_stocks = len(self._codes)
         raw_stock = list(quotes)
         raw_idx = list(idx_quotes)
+        # IT-P2-OBS-008：**没发出去的请求不能算"请求了"**。
+        #
+        # ``_fetch_indices()`` 在 ``spirit_index`` 关闭时会直接返回 []（故意不发
+        # 请求，省流量）。以前 ``index_requested`` 无条件写 ``len(self.index_codes)``，
+        # 于是 ``wants_indices=False`` 与 ``True`` 的账本**取值完全相同**
+        # （requested=5 / index_requested=3 / coverage=0.40）—— 观测层无法区分
+        # "指数抓了但没回来"和"根本没抓"。后者不是数据质量事故，
+        # 按前者记账会让 coverage 恒低、把正常配置误报成丢数。
+        _idx_dispatched = bool(self.index_codes) and self._wants_indices
+        index_requested = len(self.index_codes) if _idx_dispatched else 0
         future_rej = int(self.state.stats.get("t_reject:future", 0)) - _t0_future
         ooo_rej = int(self.state.stats.get("t_reject:out_of_order", 0)) - _t0_ooo
+        # WP04：陈旧诊断的**本轮增量**，按 route 分账后再合计。
+        stale_diag_by_route = {
+            r: int(n) - int(_t0_stale_diag.get(r, 0))
+            for r, n in self.state.stale_diagnosed.items()
+            if int(n) - int(_t0_stale_diag.get(r, 0)) > 0
+        }
+        stale_diag = sum(stale_diag_by_route.values())
+        # 被诊断的**代码集合**：age 表超线的那些（本轮原始返回中出现过）。
+        _stale_codes = {
+            q.code for q in (raw_stock + raw_idx)
+            if self.state.time_age_seconds.get(q.code, 0.0) > STALE_TOLERANCE_SECONDS
+        }
 
         # 质量不可用：provider 返回了但 price<=0（update 内部第 145 行丢弃）
         quality_bad = tuple(
             q.code for q in (raw_stock + raw_idx) if q.price <= 0
         )
         # 完全没返回：既不在原始返回里，也不是质量/时间问题
+        #
+        # IT-P2-OBS-009：**指数也要进 missing**。以前这里只遍历 ``self._codes``
+        # （个股），于是"指数请求发了、provider 返回空"时 ``index_admitted=0``
+        # 而 ``unknown_missing=()`` —— 指数码在整个账本里出现 **0 次**，
+        # 指数丢失完全不可观测（个股丢失有 missing 兜底，指数没有）。
+        # 现在 requested 里的每个码都必须能被某个桶解释。
         raw_codes = {q.code for q in raw_stock if q.price > 0}
+        idx_raw_ok = {q.code for q in raw_idx if q.price > 0}
         time_rejected_codes = {
             q.code for q in raw_stock
             if q.price > 0 and q.code not in admitted
         }
+        idx_time_rejected = {
+            q.code for q in raw_idx
+            if q.price > 0 and q.code not in idx_admitted
+        }
+        # 只有**真的发出去**的请求才进 missing 候选（与 index_requested 同口径）。
+        requested_codes = list(self._codes) + (
+            list(self.index_codes) if index_requested else [])
         observation = RoundObservationSet(
             source=str(getattr(serving_src, "name", "")),
             capabilities=caps,
-            requested=req_stocks + len(self.index_codes),
-            index_requested=len(self.index_codes),
+            requested=req_stocks + index_requested,
+            index_requested=index_requested,
             returned=len(raw_stock) + len(raw_idx),
             admitted=len(admitted) + len(idx_admitted),
             index_admitted=len(idx_admitted),
             unknown_missing=tuple(
-                c for c in self._codes
-                if c not in raw_codes and c not in time_rejected_codes
+                c for c in requested_codes
+                if c not in raw_codes and c not in idx_raw_ok
+                and c not in time_rejected_codes and c not in idx_time_rejected
                 and c not in quality_bad
             ),
             rejected_quality=quality_bad,
             future_rejected=max(future_rej, 0),
             out_of_order_rejected=max(ooo_rej, 0),
+            # WP04 / IT-P1-OBS-010：陈旧是**诊断**，与 future 分账。
+            provider_stale_diagnosed=max(stale_diag, 0),
+            provider_stale_diagnosed_codes=_stale_codes,
+            provider_stale_by_route=stale_diag_by_route,
         )
 
         ctx = RuleContext(
@@ -1073,6 +1268,10 @@ class Engine:
             focus=self.focus,
             capabilities=caps,
             observation=observation,
+            # IT-P1-INDEX-CURRENT-001：本轮**真正准入**的指数。
+            # 规则不得再从累计 state.quotes 猜 current —— 指数路由整体失败时
+            # 那里面是上一轮的数据，会让规则拿陈旧指数继续报。
+            current_indices=idx_admitted,
         )
 
         now_ep = now.timestamp()

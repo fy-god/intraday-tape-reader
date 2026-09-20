@@ -93,6 +93,20 @@ class LimitBoardRule:
         self._reset_if_new_day(now)
         now_ep = ctx.now_epoch
         out: list[Alert] = []
+        #: 与 ``out`` 平行：每条告警对应 (tag, 调用前的状态)。
+        #:
+        #: IT-P2-LIMIT-FIRST-BOARD-MULTI：``_check_side`` 会**顺带写状态**，
+        #: 而 ``max_per_round`` 的截断发生在**之后**。于是被截掉的那条告警
+        #: 状态已经写成 ``sealed``，下一轮命中 ``prev == "sealed"`` 直接
+        #: ``return None`` —— 告警**永久丢失**，不是"下轮再报"。
+        #: 实测：3 只票同轮首达、``max_per_round=2`` 时第 3 只
+        #: （``600003``）第 2/3 轮都不报，永久消失。
+        #:
+        #: 修法：记下每条告警写入前的状态，**被截断的那些回滚状态** ——
+        #: 下一轮它们仍是"未报过的跃迁"，于是能正常补报。
+        #: 只能对"本轮真正没发出去"的告警回滚：发出去了就必须保留状态，
+        #: 否则下一轮会重复报同一条。
+        meta: list[tuple[str, str]] = []
 
         for code, q in snap.quotes.items():
             if q is None or q.is_suspended or q.price <= 0 or q.prev_close <= 0:
@@ -105,17 +119,35 @@ class LimitBoardRule:
 
             # 天地板：同一只股票可能同时命中"曾涨停后炸板"与"现封跌停"，
             # 两个方向是独立事件，都要报，不能先到先得互相遮蔽。
+            tag_up = f"{code}:up"
+            prev_up = self._state.get(tag_up, "away")
             up_alert = self._check_side(q, ctx, now, now_ep, up=up, down=down, rising=True)
             if up_alert is not None:
                 out.append(up_alert)
+                meta.append((tag_up, prev_up))
             if self.cfg.get("detect_limit_down", True) and down > 0:
+                tag_dn = f"{code}:down"
+                prev_dn = self._state.get(tag_dn, "away")
                 down_alert = self._check_side(q, ctx, now, now_ep, up=up, down=down, rising=False)
                 if down_alert is not None:
                     out.append(down_alert)
+                    meta.append((tag_dn, prev_dn))
 
-        out.sort(key=lambda a: (-a.severity, -abs(a.pct)))
-        if self.max_per_round > 0:
-            out = out[: self.max_per_round]
+        # 排序 + 截断时必须让 meta 跟着一起走，否则回滚会张冠李戴。
+        order = sorted(range(len(out)),
+                       key=lambda i: (-out[i].severity, -abs(out[i].pct)))
+        out = [out[i] for i in order]
+        meta = [meta[i] for i in order]
+
+        if self.max_per_round > 0 and len(out) > self.max_per_round:
+            keep = self.max_per_round
+            # 回滚**被截掉**那些的状态：它们本轮没发出去，不该留下"已报过"的记忆。
+            for tag, prev in meta[keep:]:
+                if prev == "away":
+                    self._state.pop(tag, None)
+                else:
+                    self._state[tag] = prev
+            out = out[:keep]
         return out
 
     # ------------------------------------------------------------------

@@ -104,18 +104,28 @@ def test_future_rejected_is_the_real_field():
 
     obs = cap.obs[-1]
     assert obs.future_rejected == 1
-    assert obs.stale_rejected == 1, "弃用别名必须返回同一值（不打断调用方）"
-    assert obs.future_rejected == obs.stale_rejected
+    # WP04 / IT-P1-OBS-010：别名**不再**等于 future_rejected —— 那正是原缺陷
+    # （两个互斥的桶永远同值，消费方无从分辨"太旧"还是"来自未来"）。
+    # 别名现在指向**陈旧诊断**；本用例是"超前"，所以陈旧诊断应为 0。
+    assert obs.provider_stale_diagnosed == 0
+    assert obs.stale_rejected == obs.provider_stale_diagnosed
+    assert obs.stale_rejected != obs.future_rejected, \
+        "陈旧与超前是两个互斥的桶，别名不得再让它们同值"
 
 
 def test_as_dict_prefers_new_name_but_keeps_old():
     obs = RoundObservationSet(
         source="tencent", capabilities=SourceCapabilities(source="tencent"),
-        requested=1, returned=1, admitted=1, future_rejected=3)
+        requested=1, returned=1, admitted=1, future_rejected=3,
+        provider_stale_diagnosed=7)
     d = obs.as_dict()
     assert d["future_rejected"] == 3
-    # 旧键不再出现在 as_dict（改名已贯通 Store/SSE），但属性别名仍在
-    assert obs.stale_rejected == 3
+    # WP04：陈旧是**诊断**计数，单独导出，与 future 不同值。
+    assert d["provider_stale_diagnosed"] == 7
+    assert obs.stale_rejected == 7, "弃用别名指向陈旧诊断"
+    assert obs.stale_rejected != obs.future_rejected
+    # schema note 必须说清"诊断不是拒绝"，避免又被误读成拒绝计数
+    assert "不是" in d["_schema_note"]["provider_stale_diagnosed"]
 
 
 def test_future_rejected_zero_when_all_fresh():

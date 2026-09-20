@@ -1,0 +1,53 @@
+{
+  "_doc": "WP03 / IT-P1-TIME-ROLE-003-R1：provider 时间**策略矩阵**。本文件是 source_time_contract.json 的**可执行投影** —— 合同说 role=unknown / freshness_allowed=false，本矩阵就规定 Engine 不得据此硬拒绝。由 tests/test_time_policy_matrix.py 与 src/arad/engine.py 的 TIME_POLICY 双向绑死。",
+  "_generated_at_jst": "2026-09-20T21:00:00+09:00",
+  "_reviewed_source_sha": "100e06aeda7dc5605ac20b3f8511ec34ea40e9b6",
+  "_contract": "source_time_contract.json",
+  "_schema": {
+    "source": "来源名，必须与 source_time_contract.json 的 sources 键一致",
+    "role": "从合同抄录，不得本文件自行判定",
+    "freshness_allowed": "是否允许用 provider ts 做 hard stale reject",
+    "strict_ordering_allowed": "是否允许在同一 (route, source epoch) 内拒绝乱序",
+    "hard_reject_enabled": "本矩阵的结论：引擎当前是否真的会硬拒绝陈旧包",
+    "age_diagnostic": "不硬拒绝时是否仍记录 age（必须为 true，否则无从观察）"
+  },
+  "policy": {
+    "tencent": {
+      "role": "unknown",
+      "freshness_allowed": false,
+      "strict_ordering_allowed": true,
+      "hard_reject_enabled": false,
+      "age_diagnostic": true,
+      "scope": "per (route, source_epoch)"
+    },
+    "sina": {
+      "role": "unknown",
+      "freshness_allowed": false,
+      "strict_ordering_allowed": true,
+      "hard_reject_enabled": false,
+      "age_diagnostic": true,
+      "scope": "per (route, source_epoch)"
+    },
+    "eastmoney": {
+      "role": "unknown",
+      "freshness_allowed": false,
+      "strict_ordering_allowed": true,
+      "hard_reject_enabled": false,
+      "age_diagnostic": true,
+      "scope": "per (route, source_epoch)"
+    }
+  },
+  "_unregistered_source_default": {
+    "freshness_allowed": false,
+    "strict_ordering_allowed": true,
+    "hard_reject_enabled": false,
+    "age_diagnostic": true,
+    "rationale": "默认从严：未登记的来源不获得任何『权威时间』假设"
+  },
+  "_capability_retained": {
+    "stale_hard_reject": "能力保留在 _admit_time(freshness_allowed=...)，某源拿到权威语义后把该源 freshness_allowed 置 true 即可启用，无需改结构。",
+    "scope_requirement": "启用后必须按 (route, source_epoch) 判『首见』，不得沿用全局 first_seen —— 否则切源后同码在新 epoch 会绕过陈旧下限（IT-P1-TIME-ROLE-003-R1）。",
+    "verification": "tests/test_source_epoch_route.py::test_stale_rejected_per_route_epoch_when_freshness_trusted"
+  },
+  "_known_limitation": "STALE_TOLERANCE_SECONDS=4h 目前只作为 age 诊断的参考线，**不再**触发硬拒绝。它的保守取值（冷门股最后成交时间可能很旧）因此不再有误杀风险 —— 但也意味着当前**没有**任何 provider-ts 驱动的陈旧拦截，陈旧防护完全依赖 epoch 内乱序判定。这是合同 role=unknown 的**必然代价**，不是遗漏。"
+}

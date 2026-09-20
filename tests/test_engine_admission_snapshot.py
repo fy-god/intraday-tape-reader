@@ -159,11 +159,20 @@ def test_far_future_not_counted_as_admitted():
     assert obs.admitted == 1, f"admitted 应为 1（只有 600001），实际 {obs.admitted}"
     # provider 原始返回了 2 只 —— returned 记录原始量，admitted 记录准入量
     assert obs.returned == 2
-    # requested = 个股 2 + 配置里的指数（settings.yaml poll.index_codes 有 5 个）
-    assert obs.requested == 2 + len(eng.index_codes), (
-        f"requested 应为 个股+指数 = {2 + len(eng.index_codes)}，实际 {obs.requested}")
-    # far-future 必须被记为 stale_rejected（而不是静默丢掉）
-    assert obs.stale_rejected == 1
+    # requested = 个股 2 + **真的发出去了的**指数请求。
+    #
+    # IT-P2-OBS-008：``_CapturingRule`` 没声明 ``wants_indices``，引擎就**不发**
+    # 指数请求，所以这里不能再拿 ``len(eng.index_codes)`` 去加 —— 那样等于把
+    # "根本没抓"记成"抓了没回来"。断言改为与真实派发一致。
+    _idx_req = len(eng.index_codes) if getattr(rule, "wants_indices", False) else 0
+    assert obs.index_requested == _idx_req, (
+        f"index_requested 必须反映是否真的发请求，实际 {obs.index_requested}")
+    assert obs.requested == 2 + _idx_req, (
+        f"requested 应为 个股+实发指数 = {2 + _idx_req}，实际 {obs.requested}")
+    # far-future（ts 超前）必须被记为 future_rejected（而不是静默丢掉）。
+    # WP04/IT-P1-OBS-010：stale_rejected 不再 alias 到 future —— 超前用
+    # future_rejected，陈旧用 provider_stale_diagnosed。
+    assert obs.future_rejected == 1
 
 
 def test_all_far_future_yields_empty_snapshot():

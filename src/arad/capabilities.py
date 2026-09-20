@@ -191,11 +191,32 @@ class RoundObservationSet:
     #: 消费方 ``tools/live_session.py`` 早就把它输出成 ``future_rejected``，
     #: 说明"未来"才是真实语义。现按实际语义改名。
     #:
-    #: 注意：**当前不存在"陈旧拒绝"路径**。``_admit_time()`` 对任何早于 now
-    #: 的 ``ts`` 都无条件接受（首见码甚至接受数天前的 ``ts``，见
-    #: IT-P1-TIME-ROLE-003），所以不要指望这里能反映"数据太旧"。
+    #: 注意：WP03 之后**仍不存在**由 provider ts 驱动的陈旧**拒绝**路径 ——
+    #: 合同三源 ``freshness_allowed=false``，``_admit_time()`` 对任何早于 now 的
+    #: ``ts`` 都接受（只记 age 诊断），所以不要指望这里能反映"数据太旧"。
+    #: **真正的陈旧观测在** :attr:`provider_stale_diagnosed` —— 那是诊断计数，
+    #: 不是拒绝计数，两者不可混为一条曲线。
+    #:
+    #: （更正 IT-P2-STALE-COMMENT-STALE：上一版注释一边写"当前不存在陈旧拒绝
+    #: 路径"，一边又描述 ``t_reject:stale``，与自身语义自相矛盾。准确说法是
+    #: **诊断存在、拒绝不存在** —— 除非某源将来打开
+    #: ``TIME_POLICY[*].freshness_allowed``。）
     future_rejected: int = 0
     out_of_order_rejected: int = 0
+    #: WP04 / IT-P1-OBS-010：provider ts 被判定"过旧"的**诊断**条数
+    #: （``age > STALE_TOLERANCE_SECONDS``），**不是**拒绝计数。
+    #:
+    #: 为什么必须有它：WP03 之后陈旧包**不再被拦**，陈旧这件事就只剩诊断
+    #: 可见。若无此桶，"某源时间轴整体偏移"在观测里完全隐形。
+    #:
+    #: 与 :attr:`future_rejected` **必须分开** —— 上一轮的缺陷正是
+    #: ``stale_rejected`` 被 alias 成 ``future_rejected``，两条互斥的曲线
+    #: 同值，谁也无法分辨"数据太旧"还是"数据来自未来"。
+    provider_stale_diagnosed: int = 0
+    #: 其中被诊断的代码集合（不是次数）。
+    provider_stale_diagnosed_codes: set[str] = field(default_factory=set)
+    #: 各 route 的陈旧诊断次数（``route -> 次数``）。
+    provider_stale_by_route: dict[str, int] = field(default_factory=dict)
     # 因能力缺失而无法评估的**代码集合**（不是次数）。同一只票可能同时缺
     # turnover 与 volume_ratio，按次数记会把"1 只票不可评估"夸大成 2，
     # 覆盖率数字就失真了。decisions 里仍逐 (code, field) 留明细。
@@ -218,12 +239,17 @@ class RoundObservationSet:
 
     @property
     def stale_rejected(self) -> int:
-        """**已弃用别名** —— 请改用 :attr:`future_rejected`。
+        """**已弃用** —— 新代码用 :attr:`future_rejected`（超前）或
+        :attr:`provider_stale_diagnosed`（陈旧诊断）。
 
-        保留它只为不打断既有调用方（含 SSE 载荷与旧测试）。名字是错的
-        （详见 :attr:`future_rejected` 的说明），新代码不要使用。
+        WP04 / IT-P1-OBS-010：上一轮这里直接 ``return self.future_rejected``，
+        于是"陈旧"与"未来"两个**互斥**的桶永远同值 —— 消费方无法分辨。
+        现在返回**陈旧诊断数**（该名字真正想表达的量），并在 ``as_dict()``
+        里标注两个键的来源，避免继续把两条曲线混为一谈。
+
+        注意它**不是**拒绝计数：WP03 之后陈旧包不再被拦。
         """
-        return self.future_rejected
+        return self.provider_stale_diagnosed
 
     def coverage(self) -> float:
         """本轮返回率（requested 为 0 时返回 0，不伪造 1.0）。"""
@@ -255,6 +281,18 @@ class RoundObservationSet:
             "rejected_quality": list(self.rejected_quality),
             "future_rejected": self.future_rejected,
             "out_of_order_rejected": self.out_of_order_rejected,
+            # --- WP04 / IT-P1-OBS-010：陈旧诊断与"未来"必须是两条曲线 ---------
+            # 上一轮 stale_rejected 被 alias 成 future_rejected，两个互斥的桶
+            # 永远同值。现在分别导出，并把陈旧说清是**诊断**不是拒绝。
+            "provider_stale_diagnosed": self.provider_stale_diagnosed,
+            "provider_stale_diagnosed_codes": sorted(
+                self.provider_stale_diagnosed_codes)[:50],
+            "provider_stale_by_route": dict(self.provider_stale_by_route),
+            "_schema_note": {
+                "provider_stale_diagnosed": "诊断计数（age 超线），**不是**拒绝",
+                "future_rejected": "超前拒绝计数；与陈旧互斥",
+                "stale_rejected": "已弃用的别名，指向 provider_stale_diagnosed",
+            },
             "unavailable_capability": self.unavailable_capability,
             # --- IT-P1-OBS-007：把"是哪只票、缺什么"带出 poll_once -------------
             # 有界样本：最多 50 条明细，避免无界载荷

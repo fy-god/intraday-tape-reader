@@ -1,0 +1,33 @@
+{
+  "_doc": "WP06 / IT-P1-INDEX-CURRENT-001：指数规则只消费本轮 current view，不再从累计 state.quotes 猜 current。",
+  "file": "tests/test_index_current_view.py",
+  "total_cases": 4,
+  "cases": [
+    "test_rule_fires_when_current_has_the_index",
+    "test_rule_ignores_cumulative_cache_when_current_is_empty",
+    "test_rule_falls_back_to_cache_when_current_is_none",
+    "test_engine_fills_current_indices"
+  ],
+  "mechanism": {
+    "before": "SpiritIndexRule.evaluate() 遍历 ctx.state.quotes（累计 latest 缓存）挑指数 -> 指数路由整体失败时仍拿上一轮数据继续产告警",
+    "after": "引擎每轮把 idx_admitted 放进 ctx.current_indices；规则只认它；current_indices is None 时回退旧行为（老调用方/回测）",
+    "history_preserved": "state.quotes 与 state.history **未清**，仍服务历史/回看"
+  },
+  "teeth": {
+    "_method": "git stash push -- spirit_index.py engine.py rules/base.py",
+    "behavioral_red": [
+      "test_rule_ignores_cumulative_cache_when_current_is_empty",
+      "test_engine_fills_current_indices"
+    ],
+    "behavioral_red_count": 2,
+    "structural_red_count": 0,
+    "regression_guards": [
+      "test_rule_fires_when_current_has_the_index",
+      "test_rule_falls_back_to_cache_when_current_is_none"
+    ]
+  },
+  "run": {
+    "exit_code": 0,
+    "summary": "4 passed in 0.06s"
+  }
+}
