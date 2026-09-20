@@ -1,17 +1,85 @@
 # 最新审计
 
-**最新本地 Agent 轮（本轮）**：[`2026-09-21_00-52-00_JST.md`](./2026-09-21_00-52-00_JST.md)  
+**最新本地 Agent 轮（本轮）**：[`2026-09-21_02-24-00_JST.md`](./2026-09-21_02-24-00_JST.md)  
+**上一份本地 Agent 轮**：[`2026-09-21_00-52-00_JST.md`](./2026-09-21_00-52-00_JST.md)  
 **最新云端独立审计**：[`2026-09-21_01-40-00_JST.md`](./2026-09-21_01-40-00_JST.md)（r2，792 行，被审 `e729c1f`）  
 **最新云端 Agent 任务书**：[`2026-09-21_00-14-53_JST_AGENT_TASK.md`](./2026-09-21_00-14-53_JST_AGENT_TASK.md)  
-**上一份本地 Agent 轮**：[`2026-09-20_21-49-29_JST.md`](./2026-09-20_21-49-29_JST.md)  
 **可评估性证据**：[`signal_evaluability_cases.json`](./signal_evaluability_cases.json)  
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)  
-本轮起点产品提交：[`ffabc57`](https://github.com/fy-god/intraday-tape-reader/commit/ffabc5723846479fa5ec3fc1a9503ad646b3b6b1)  
+本轮起点产品提交：[`c4254dc`](https://github.com/fy-god/intraday-tape-reader/commit/c4254dc)  
+本轮产出提交：[`1713f4f`](https://github.com/fy-god/intraday-tape-reader/commit/1713f4f)、[`3decac9`](https://github.com/fy-god/intraday-tape-reader/commit/3decac9)  
 
 ---
 
-## 2026-09-21 00:52 JST 本地 Agent 轮（本轮）
+## 2026-09-21 02:24 JST 本地 Agent 轮（本轮）
+
+> **本轮方法论的转变**：不再读代码找 bug、不再只跑回放 ——
+> **用真实网络行情跑全市场（腾讯，5564 只）**，让缺陷自己暴露。
+> 结果：一次就抓到 **3 个**此前所有单测/回放都没发现的真实缺陷。
+
+### 本轮主结论
+
+1. **`IT-P1-NEWLIST-001` 新股无涨跌幅限制却被套 ±10%（已修）**。
+   `601091 C沈鼓` 当日 **+177.74%**、现价 57.77，却算出 `limit_up=22.88`
+   → `limit_board` 误报「**打开跌停 +208.60%**」，同轮还报「低开高走 +285.1%」，
+   **自相矛盾**。修复：无约束时限价返回 **`0.0`**（哨兵值＝"无此约束"），
+   并新增 `has_price_limit` / `is_at_limit_up` / `is_at_limit_down`
+   （**直接用 `q.price >= q.limit_up_price` 在无约束股上恒真**）。
+2. **`IT-P1-NEWLIST-002` 新股过滤第二层缺失（已修）**。
+   `filters.min_list_days = 11` **完全不生效** —— `list_dates` 只有东财提供，
+   而东财在本机被 IP 封禁，实际走腾讯（`list_date` 为空串），
+   `_too_new` 按"数据缺失放行"直接返回 False。第二层防线不存在。
+   修复：无精确上市日时退回**名称前缀**（`N`＝首日、`C`＝第 2~5 日，
+   判据＝"首字母 N/C 且第二字符为**中文**"）。
+   实测 5564 只中符合者**恰好 2 只、零假阳性**。
+3. **`IT-P1-REPLAY-DETERMINISM-001` 回放确定性承诺是假的（已修）**。
+   `replay.py:374` 用 `hash(s.code)` 播种，而 CPython 对 `str` 的 `hash()`
+   按 `PYTHONHASHSEED` **每进程随机化**。三进程实测指纹互不相同；
+   固定 `PYTHONHASHSEED=0` 后一致 → **根因确证**。
+   后果：`selftest` 告警数在 **68/69/71 漂移，不能当回归判据**；
+   历次报告里"selftest N 条告警"**全都不是稳定不变量**。
+   修复：改用 SHA-256 派生稳定种子。修复后 6 次连跑**全部 68 条**。
+
+### 回归与验牙（我自己复跑）
+
+- 全量 **`1545 passed`**（改动前 1495）；**8/8 gate 全绿**；
+  `selftest` **68 条**（6 次连跑一致）。
+- 回退验牙（逐条单独运行分类）：`models.py` → **9 条 AssertionError 真验牙**
+  （+3 AttributeError / 2 ImportError 结构性）；`filters.py` → **7 条，零结构性**；
+  `replay.py` → **3 条，零结构性**。
+
+### 真实行情端到端证据（本轮核心）
+
+- 链路打通：默认 4 规则 / 打开 spirit 后 7 规则；`run_daemon.py` 常驻看板，
+  `/api/status`、`/api/spirit`、`/api/alerts`、`/api/health` 均 200；
+  SSE `/api/stream` 持续推出 `tick` / `phase` 事件。
+- 真实全市场 4 轮：55 / 20 / 20 / 20 条告警；`institution_buy` 11 条、
+  `institution_sell` 9 条 —— 证明 `IT-P1-CAPABILITY-004` 修复在真实数据上生效。
+- 4 个**成交类** pattern 休市时缺席**是正确行为**（`d_volume == 0` → 不可判），
+  已用真实 Quote + 人为推进内外盘证明 8/8 pattern 均可产出。
+
+### 必须如实说明的三件事
+
+- **修好 bug ≠ 用户明天能收到有用告警**。本轮修的是"会不会报错"，
+  **不是"报得准不准"**。真实 Precision / Recall / 漏报率 / 交易收益
+  **依然是 `unavailable`**，不给任何编造数字。
+- **`spirit_*` 三条规则默认仍是 `enabled: false`**（`settings.yaml:188/223/257`）。
+  配置注释要求"先在真实行情里观察命中质量再打开"——**我还没有足够证据建议打开**。
+  连续竞价时段的实测（09:30 后）是下一步（已挂 `schedule-5` 于 09:32 CST）。
+- **已知残留缺口**：次新股上市第 6 日起名称前缀脱落，只能靠依赖东财的
+  `min_list_days` 第一层，而腾讯链路上该层仍缺失 → 第 6 日起的次新股**无过滤**。
+  另有北交所是否用 N/C 前缀未核实、N/C 判据样本极小（仅一次快照 2 只）。
+
+### 职责边界
+
+本轮只做（a）读 GitHub 审计报告、（b）改产品代码、（c）上传。
+**未**动部署配置、Actions、PR、行情服务、Windows 计划任务。
+临时探针一律放 `$env:TEMP`，**未**污染 `tools/`（否则触发 `check_readme_tools.py`）。
+
+---
+
+## 2026-09-21 00:52 JST 本地 Agent 轮（保留要点）
 
 - `round_start_sha`：`ffabc5723846479fa5ec3fc1a9503ad646b3b6b1`（`git pull --ff-only` 后 clean worktree）。
 - **真实 clean 基线（只读冻结树 `asr-r3` @`ffabc57`，`status --porcelain` 为空）**：
@@ -47,6 +115,14 @@
    验收 12 条，其中**真行为级验牙只有 1 条**（其余为结构性/契约断言，已在报告 §2.2 分类）。
 3. `IT-P1-CAPABILITY-004`（`spirit_order` L1 数量兜底 + 逐 pattern 账本）**进行中**，
    属另一工作包；截至本轮报告撰写时尚未产出测试。
+   → **已于 02:24 JST 轮完成并发布 `1713f4f`**：`_best_order` 增加 `l1_lots` 参数，
+   `not vols` 时用**真实的** `q.bid_vol`/`q.ask_vol`（手）当唯一一档
+   （此前传的是 `_num(q.bid1, 0.0)` —— 那是**价格**）；逐 pattern 账本
+   `spirit_order.<pattern>`；新增 `check_capability_declaration()`。
+   我在**真实行情**上独立复跑验证：Sina 链路告警 **0 → 2**，
+   账本 `institution_buy/sell ev=1 cov=1.0`；回退验牙 **15 条 AssertionError
+   真验牙 + 3 条 ImportError 结构性**（新符号 import 已移入测试函数内部，
+   否则旧版整体收集失败、红得没有行为意义）。
 
 ### 必须如实说明的三件事
 
