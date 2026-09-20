@@ -1,131 +1,153 @@
 # 最新审计
 
-最新完整报告：[`2026-09-20_16-17-25_JST.md`](./2026-09-20_16-17-25_JST.md)  
-本轮本地 Agent 任务书：[`2026-09-20_16-17-25_JST_AGENT_TASK.md`](./2026-09-20_16-17-25_JST_AGENT_TASK.md)
+最新完整报告：[`2026-09-20_16-25-44_JST.md`](./2026-09-20_16-25-44_JST.md)  
+本轮云端审计：[`2026-09-20_16-17-25_JST.md`](./2026-09-20_16-17-25_JST.md)  
+本轮云端 Agent 任务书：[`2026-09-20_16-17-25_JST_AGENT_TASK.md`](./2026-09-20_16-17-25_JST_AGENT_TASK.md)
 
-## 版本与证据边界（2026-09-20 16:17 JST）
+## 版本与证据边界（2026-09-20 16:25 JST）
 
 - 仓库与分支：`fy-god/intraday-tape-reader` / `main`。
-- 本轮开始 HEAD：`6ef855fa8227f0dc4bcb6863db846fee5f92363d`。
-- `reviewed_source_sha`：`020f2bb5f45a50bb3367ea631654702b37b3aab9`。
-- 从 `020f2bb` 到本轮开始 HEAD 只有上一轮报告和索引，无产品代码变化。
-- 报告发布 commit：`01a294b670d14334c3a7d51f40078ba4522ec0f2`。
-- Agent 任务书发布 commit：`06491bc7f53e68241276223cff7e2a8f830b8586`。
-- PR：0。
-- 本轮执行位置：隔离 Linux 沙箱；无完整 checkout，故本轮**没有重跑**全量 pytest。
-- 上一 13:39 JST 独立本地 checkout 归档的 `1241 passed in 66.92s` 仅作为历史证据，本轮没有冒充重新执行。
-- 真实多日连续 A 股语料仍未挂载；本轮研究为既有 77,271 行 synthetic row predictions 的二次诊断，不是实盘结果。
+- 本轮开始 HEAD：`020f2bb`；`reviewed_source_sha`（**产品**提交）：`020f2bb`。
+- 本轮执行位置：**本机本地 checkout**（`D:\ccc\ashare-radar`）。
+- **本轮实测全量**：`python -m pytest -o addopts="" -q` → **`1260 passed in 68.00s`，exit 0**。
+  起始基线 `1241`（`020f2bb`），本轮新增 19 项。
+- 云端 16:17 轮为隔离沙箱、无完整 checkout，其 `1241 passed` 是转引 13:39 的历史证据。
+- 真实多日连续 A 股语料仍 `blocked_no_mounted_multiday_continuous_corpus`。
 
-## 本轮新增/深化
+## 本轮起因：上游复核抓到了我两个错误 —— 两条都成立，我错了
 
-### `IT-P1-TIME-ROLE-001` 继续最高优先
+上游 `2026-09-20_13-39-26_JST.md` 独立复核了我上一轮提交 `020f2bb`。它证实了主结论
+（`IT-P0-001` 已修、危害真实），**同时指出我两处叙述错误**。我逐条复现：
 
-当前 `EngineState.accepted_watermark` 仍是 `code -> timestamp`，没有 `route/source_epoch/time_role`。本轮最小机制反例确认：A 源先接受 10:00:40 后，若实际供数切到 B 源且 B 的首包时间为 10:00:05，code-only watermark 会把 B 首包当乱序拒绝；按 source epoch 分段则可接受 B 首包，同时仍能拒绝 B epoch 内真正倒退的 10:00:01。
+### (a) `IT-P0-001` 的"分母稀释"因果链 —— **我的叙述错误**
 
-修复不能只把 source 名拼进 key；应在**实际 serving source** 每次变化时生成新的 route epoch，A→B→A 形成三个 epoch。
+我写过：把 14:57-15:00 计入分母会让 `volume_burst` 的
+`avg_per_min = volume_lots / elapsed * 60` 把放量速率**稀释**。
 
-### `IT-P1-TIME-ROLE-002/003` 仍开放
-
-- 轻微 future provider timestamp 当前被改写为 receive `now`，raw provider time 丢失；
-- 首见 code 没有 stale 下限，`now-3天` 的 provider ts 仍能被接受；
-- stale 阈值不能先拍脑袋设，必须先确认 provider 时间角色。
-
-三家 parser 都填 `Quote.ts`，但 capability 表又把三家 `provider_time` 都声明为 false。当前只能从社区资料得到 Tencent 字段 30 常被称为“数据更新时间”、Sina 30/31 为日期/时间、Eastmoney f124 为时间戳；没有权威字段规范证明它们是 snapshot publish time 还是 last trade time，因此 `source_time_contract` 必须允许 `unknown`。
-
-### `IT-P2-OBS-008`（本轮新确认）
-
-默认配置有 5 个 `index_codes`，但 `spirit_index.enabled=false` 时 `_wants_indices=false`，引擎不会发 index 网络请求；Observation Ledger 却仍执行：
-
-```python
-requested = req_stocks + len(self.index_codes)
-index_requested = len(self.index_codes)
-```
-
-因此“配置过”被记成“实际请求过”。机制例：实际 100/100 股票全部返回、0 次 index 请求，当前 ledger 会显示 100/105=95.24% coverage；候选正确值应为 100/100=100%。全市场 5563 只时偏差约 0.09 个百分点，但 watchlist-only 10 只时会被放大为 10/15=66.7%。
-
-### `IT-P2-OBS-009`（本轮新确认）
-
-index route 真正请求 5 个、只回 4 个时，当前 `unknown_missing` 只遍历股票 `_codes`，缺失指数没有 code-level 明细。下一版必须按 route 保存 `requested_codes/provider_object_codes/missing/rejected`。
-
-### `IT-P1-INDEX-CURRENT-001` 本轮重新确认
-
-`SpiritIndexRule.evaluate()` 仍从累计 `ctx.state.quotes` 构造指数 current candidates。若 R1 指数成功、R2 index route 失败，R1 的缓存指数仍可能被 R2 规则消费。默认 `spirit_index=false`，但启用后会重新出现“latest cache 冒充 current”的旧型风险。
-
-### `IT-P1-COMPLETE-001`：缺陷成立，但修法需要更正
-
-当前 Eastmoney `complete` 仍不检查真实覆盖；13:39 报告发现的缩水页缺陷成立。但不能直接用 `len(out) >= expected_total` 修：`out` 是 post-parse usable Quote，而 API `total` 是 transport/universe 口径。正确方案应分别记录：
+**这是错的。** `volume_burst.py:119` 的 `only_continuous` 门控在 **`:123` 读取
+`elapsed` 之前**就已 `return []`。本机四分组合实测：
 
 ```text
-raw_rows
-raw_unique_codes
-usable_quotes
-expected_total
-required_pages
-pages_requested
-pages_failed
-truncated
+MORNING        elapsed=14280  告警=1
+MORNING        elapsed=14220  告警=1
+CLOSE_AUCTION  elapsed=14220  告警=0
+CLOSE_AUCTION  elapsed=14400  告警=0     <- 与上行完全相同
 ```
 
-`transport_complete` 由 raw unique code / page contract 判断；`usable_coverage` 单独报告。否则“传输完整但有少数无效 Quote”会被错误判成 transport incomplete。
+**若"稀释"成立，后两行应有不同结果。** 真实影响是该时段 7 个
+`only_continuous` 规则由"被评估"变为"被静音"。时钟修正本身仍正确必要，
+但**因果解释是错的**。已改 `session.py` docstring。
 
-## 研究：`EXP-IT-CAP-004-disagreement-and-blend`
+### (b) `is_tradable_window()` 的"两个历史调用点" —— **我的陈述不实**
 
-本轮不重复 fit 模型，而用已有 77,271 行 synthetic row predictions 检查两个新点子。
+本机实测 `git grep is_tradable_window`：`src/` **1 处（就是定义行）**、
+`tools/` **0 处**。它是**纯测试 API**，从来没有生产调用点。已改为如实陈述。
 
-总体：
+> 这也让我上轮"不过度修正"的论证依据需要更正：把 `CLOSE_AUCTION` 放进
+> `OBSERVABLE` 依然是对的（引擎门控用的是这个集合），**但我用错了依据**。
+
+`IT-P0-001` **本身仍是已修**（上游独立复核补上决定性危害证据：旧代码 14:58
+`elapsed=14280 告警=1` / 新代码 `elapsed=14220 告警=0`）。
+
+## 本轮修复
+
+| 编号 | 级别 | 来源 | 验牙 |
+|---|---|---|---|
+| `IT-P1-OBS-006` `stale_rejected` 名实相反 | P1 | 上游 13:39 | 改名 `future_rejected` + 弃用别名；11 项红 |
+| `IT-P1-OBS-007` 账本在 Store 边界丢明细 | P1 | 上游 13:39 | 有界样本 ≤50 + 聚合计数 + 截断标志 |
+| `IT-P1-COMPLETE-001` `complete` 未与 `returned` 挂钩 | P1 | 上游 13:39 | 缩水轴修复；5 项红 |
+| `IT-P1-INFO-001` docstring 陈述不实 | P2 | 上游 13:39 | 改为如实陈述 |
+
+### `IT-P1-OBS-006` 关键佐证
+
+消费方 `tools/live_session.py:163` **早就**把它输出成 `future_rejected` ——
+说明"未来"才是真实语义。字段注释同时写明：**当前不存在"陈旧拒绝"路径**。
+
+### `IT-P1-OBS-007` 为什么是"有界样本"
+
+导出 `unavailable_sample`（**≤50 条**）+ `unavailable_by_reason`（全量聚合）+
+`decisions_truncated`。既恢复"哪只票缺什么"的可诊断性，又不把全市场成千上万条
+明细塞进 Store/SSE。
+
+### `IT-P1-COMPLETE-001` 的上限与云端更正（**仍未闭环**）
+
+本轮修法是 `complete` 增加 `shortfall == 0`（判据"不少于"）。云端 16:17 报告
+指出**该修法口径不纯**：`out` 是 post-parse 的 usable Quote，而 API `total` 是
+transport/universe 口径，两者混在一起会把"传输完整但有少数无效 Quote"误判成
+transport incomplete。
+
+**我认可这条。** 正确方案是分开记录（`raw_rows` / `raw_unique_codes` /
+`usable_quotes` / `expected_total` / `required_pages` / `pages_requested` /
+`pages_failed` / `truncated`），把 `transport_complete` 与 `usable_coverage`
+拆开。本轮修法**比修复前严格更安全**（不再静默报 complete），但**不是终态** ——
+已列入下一轮。另需补"raw 全但部分 Quote 不可用"与"raw row 数够但 code 重复"
+两轴测试。
+
+## 上轮结论复核
+
+- `IT-P0-001`（修复与危害）：**确认成立、无回归**；
+- `IT-P0-002-R1/R2`、`IT-P2-OBS-003/004/005`、`IT-P0-003`、`IT-P1-006` 主体、
+  `IT-P1-007`、`IT-P0-004/005`（BOM）：**确认已修、无回归**；
+- `IT-P1-CAPABILITY-001`：仍为**阶段一部分修复**，**不下调**。
+
+## 云端 16:17 轮新确认（本轮未做，如实登记）
+
+- `IT-P1-TIME-ROLE-001/002/003` —— **最高优先，仍未修**。`accepted_watermark`
+  仍是 `code -> timestamp`，无 `route/source_epoch/time_role`；轻微 future `ts`
+  被改写为本地 now；首见码无 stale 下限；
+- `IT-P2-OBS-008` —— 未实际发 index 请求，却把配置里的 index 计入 `requested`；
+- `IT-P2-OBS-009` —— index 缺失没有 code-level `unknown_missing`；
+- `IT-P1-INDEX-CURRENT-001` —— index 规则仍从累计 `state.quotes` 取 current。
+
+## 测试与门禁（真实执行）
 
 ```text
-base PR       0.68531
-capmask PR    0.69451
-specialist PR 0.70022
-universal PR  0.67305
+python -m pytest -o addopts="" -q   -> 1260 passed / 0 failed  (68s)
+                                       基线 1241；本轮新增 19 项
+tools/check_*.py                    -> 8 个全部 exit 0
+node tools/dash_render_check.js     -> exit 0
+python tools/check_bom.py           -> exit 0
 ```
 
-### 否定 disagreement-abstention
+合并回退验牙（回退 `capabilities.py`/`engine.py`/`live_session.py` 到 `020f2bb`）：
+**11 failed, 1 passed**；恢复后 **12 passed**。
 
-只保留 `|specialist-capmask| <= 0.03`：coverage 62.54%，specialist PR 0.70308；为了约 +0.00286 PR 丢掉 37.46% coverage，不划算。
+## 下一轮必须核查（按云端任务书优先级）
 
-更关键：高分歧 `>0.08` 的 4,178 行里 specialist PR=0.70668，而 capmask PR=0.64747；大分歧并不等于 specialist 不可信，反而是 specialist 相对 capmask 更有价值的区域之一。
+1. **`IT-P1-TIME-ROLE-001/002/003`**（P1 最高）：建立 source-epoch/time-role
+   时间合同。先写红测：跨源首包、同 epoch 真乱序、A→B→A 三段 epoch、
+   flat observation 仍推进 ordering state、`source_time_contract.json`
+   （证据不足写 `unknown`）、`provider_ts_raw` 不因 clamp 消失。
+   新增 `tests/test_source_epoch_time_contract.py`；
+2. **`IT-P2-OBS-008/009`**：`requested` 从真实 dispatch 产生，stock/index
+   分 route 记录，缺失 code-level，coverage 分母只含真实请求；
+3. **`IT-P1-INDEX-CURRENT-001`**：传本轮 current index view；
+4. **`IT-P1-COMPLETE-001` 终态**：拆 `transport_complete` / `usable_coverage`；
+5. 其后：`IT-P1-SOURCE-EMPTY-001`、per-code provenance、`IT-P1-WINDOW-001`、
+   `IT-P1-LIMIT-001`、`IT-P1-008/009/003`。
 
-结论：**不实现“分歧大就 abstain”。**
+### 欠账（措辞更正）
 
-### 否定 blend 复杂度
-
-`0.75*specialist + 0.25*capmask` 在四个既有 synthetic lockbox 的平均 PR=0.7002487，纯 specialist=0.7002152，增量只有约 `+0.0000335`；specialist 的平均 ROC/Brier/LogLoss 还更好。
-
-结论：**不增加 blend；provider-specialist 继续只作为真实数据候选。**
-
-## 继续开放
-
-- `IT-P1-WINDOW-001`
-- `IT-P1-LIMIT-001`
-- `IT-P1-SOURCE-EMPTY-001`
-- `IT-P1-CAPABILITY-002`
-- `IT-P1-OBS-006/007`
-- `IT-P1-008/009/003`
-- `IT-P1-INFO-001`
-
-已修继续回归：`IT-P0-003`、`IT-P0-001`、`IT-P1-006-R1`（max_pages 截断窄义）、`IT-P1-007`。
-
-## 下一轮必须检查的产物
-
-1. `source_time_contract.json`：三源 provider time field / role / evidence / strict-ordering policy；
-2. source epoch 的真实 repo 红测、绿测与回退验牙；
-3. `observation_ledger_cases.json`：index disabled / 5回5 / 5回4 / exception / future / zero-price；
-4. `index_current_reconcile.json`：R1成功、R2 index缺失时 current candidates 必须为空且 history 保留；
-5. `universe_transport_reconcile.json`：raw_rows/raw_unique_codes/usable_quotes 双账；
-6. `provider_coverage.csv`；
-7. `git diff` + SHA256、`red.log`、`green.log`、`rollback-tooth.log`、`RUN_MANIFEST.json`、`NEXT_STEPS.md`。
-
-真实多日数据到位以后只先比较冻结的 HGB base / capmask / provider-specialist；不扩 TCN/Transformer，不实现 disagreement-abstention 或 blend。
+- `tests/test_full_day_simulation.py` —— **从未入库**，应称"待新增测试"，不是"回归缺陷"；
+- `tools/check_phase_sets.py` —— **尚未创建**（`tools/check_*.py` 实有 8 个）。
 
 ## 历史线索
 
-- [2026-09-20 16:17 JST](2026-09-20_16-17-25_JST.md) — 本轮；source-epoch/time-role、index ledger/current、transport completeness 修法更正、模型分歧负实验
-- [2026-09-20 13:39 JST](2026-09-20_13-39-26_JST.md) — 独立复核 `020f2bb`，1241 passed，COMPLETE/TIME/OBS 新问题
+- [2026-09-20 16:25 JST](2026-09-20_16-25-44_JST.md) — 本轮；改我自己的两处错误 + OBS-006/007 + COMPLETE-001 缩水轴
+- [2026-09-20 16:17 JST](2026-09-20_16-17-25_JST.md) — 云端；source-epoch/time-role、index ledger/current、transport 修法更正、模型分歧负实验
+- [2026-09-20 13:39 JST](2026-09-20_13-39-26_JST.md) — 独立复核 `020f2bb`，指出我的叙述错误
 - [2026-09-20 13:16 JST](2026-09-20_13-16-06_JST.md) — 关闭 close-auction 与 max_pages 截断窄义
-- [2026-09-20 12:07 JST](2026-09-20_12-07-11_JST.md) — Observation Contract / provider-specialist 研究
+- [2026-09-20 12:19 JST](2026-09-20_12-19-36_JST.md) — IT-P0-002-R2 + 三账本桶
+- [2026-09-20 12:07 JST](2026-09-20_12-07-11_JST.md)
+- [2026-09-20 09:32 JST](2026-09-20_09-32-43_JST.md)
 - [2026-09-20 08:10 JST](2026-09-20_08-10-29_JST.md)
-- [2026-09-20 04:05 JST](2026-09-20_04-05-31_JST.md)
+- [2026-09-20 05:30 JST](2026-09-20_05-30-48_JST.md)
+
+## 研究约束（沿用云端结论，不重复造 synthetic）
+
+- **不实现** disagreement-abstention（高分歧区 specialist PR 反而更高）；
+- **不实现** blend（+0.0000335 增量不划算）；
+- provider-specialist 仍只是待真实数据验证候选。真实数据到位前**不继续造新
+  synthetic 模型刷指标**，继续完成工程合同、数据 manifest、真实数据扫描器。
 
 后续仍只在本目录新增审计 Markdown / Agent 任务书并更新本索引；文档提交不计作产品源码升级。
