@@ -104,6 +104,48 @@ def _healthy(port: int) -> bool:
         return False
 
 
+def _child_owns_service(port: int, child_pid: int, timeout: float = 15.0) -> bool:
+    """端口上的服务是否**确实是这个子进程**提供的（而不是已有实例）。
+
+    IT-P2-DAEMON-HEALTH-001（云端 04:10 报告指出，确实是真缺陷）：
+    原来只轮询 ``_healthy(port)``。若 8899 上**已经有**一个健康服务，
+    新起的 child 会因为单实例检查而立刻退出，但父进程仍会因为
+    "端口返回 200" 而打印"启动成功"——把**旧服务**误认成**新 PID** 的成绩。
+    用户于是拿到一句假的成功提示，而他要的那个新进程根本没起来。
+
+    判据改为**绑定身份**：状态文件里的 ``pid`` 必须等于新 child 的 pid，
+    且该 pid 仍然活着、端口同时健康。三者同时成立才算成功。
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        st = _read_state()
+        st_pid = int(st.get("pid") or 0)
+        # 状态文件必须已经是**新 child** 写的，且它活着，且端口健康
+        if st_pid == int(child_pid) and _pid_alive(child_pid) \
+                and _healthy(port):
+            return True
+        if not _pid_alive(child_pid):
+            return False                 # child 已退出：绝不算成功
+        time.sleep(0.25)
+    return False
+
+
+def _preflight(args: argparse.Namespace) -> str | None:
+    """``--detach`` 之前的占用检查；返回占用原因，``None`` 表示可以启动。
+
+    必须在 Popen **之前**做（IT-P2-DAEMON-HEALTH-001）：否则新 child 会
+    因为"已有实例"直接退出，而父进程却已经准备好把旧服务当成自己的成功。
+    """
+    st = _read_state()
+    busy = int(st.get("pid") or 0)
+    if busy and busy != os.getpid() and _pid_alive(busy) \
+            and int(st.get("port") or 0) == int(args.port):
+        return f"端口 {args.port} 上已有守护在跑（PID {busy}）"
+    if _healthy(args.port):
+        return f"{args.port} 端口已有服务在响应（不是本守护启动的）"
+    return None
+
+
 def cmd_status(port: int) -> int:
     st = _read_state()
     if not st:
@@ -176,7 +218,20 @@ def _detach_and_return(args: argparse.Namespace) -> int:
     为什么不直接给子进程加标志了事：守护自己必须是"脱离"的那个进程，
     而当前进程已经附着在终端上了 —— 窗口一关它就没了。
     只有**另起一个脱离进程**才能真正做到。
+
+    ⚠ 非 Windows 平台上 ``_detach_flags()`` 返回 0，也就是**做不到**真正
+    脱离。那种情况下**不打印 Windows 等价的成功承诺**，明确告知用户
+    这个进程仍会随终端结束（IT-P2-DAEMON-HEALTH-001 的第二条）。
     """
+    # 必须在 Popen 之前查占用：否则新 child 会因"已有实例"退出，
+    # 而父进程会把旧服务的 200 当成新进程的成功（IT-P2-DAEMON-HEALTH-001）。
+    reason = _preflight(args)
+    if reason:
+        print(f"[!] {reason} —— 不重复启动")
+        print(f"    查状态：python tools/run_daemon.py --status")
+        return 2
+
+    truly_detaches = bool(_detach_flags())
     argv = [sys.executable, str(Path(__file__).resolve())]
     if args.host:
         argv += ["--host", args.host]
@@ -207,24 +262,26 @@ def _detach_and_return(args: argparse.Namespace) -> int:
             print(f"[✗] --detach 启动失败：{exc}")
             return 2
 
-    # 脱离进程要一点时间才能写好状态文件 / 起来监听
-    ok = False
-    for _ in range(60):                     # 最多等 15 秒
-        time.sleep(0.25)
-        if _healthy(args.port):
-            ok = True
-            break
-        if not _pid_alive(child.pid):
-            break
+    # 判据必须**绑定新 child 的身份**，不能只看端口 200
+    ok = _child_owns_service(args.port, child.pid)
 
     print(f"[√] 已脱离终端启动守护 PID {child.pid}；看板 http://127.0.0.1:{args.port}/")
     print(f"    日志：{LOG_FILE}")
     print(f"    查状态：python tools/run_daemon.py --status")
-    if ok:
-        print("    [√] 健康检查通过 —— 现在可以关闭这个窗口了")
+    if ok and truly_detaches:
+        print("    [√] 健康检查通过（已确认是该 PID 提供的服务）"
+              " —— 现在可以关闭这个窗口了")
         return 0
-    print("    [!] 15 秒内未通过健康检查，请查日志（守护进程本身仍在）")
-    return 0 if _pid_alive(child.pid) else 3
+    if ok and not truly_detaches:
+        print("    [!] 服务已起来，但**本平台不支持真正的脱离**"
+              "（非 Windows）—— 关闭终端仍会停止它")
+        return 0
+    if _pid_alive(child.pid):
+        print("    [!] 15 秒内未确认「该 PID 提供的服务」——请查日志（进程仍在）")
+        return 0
+    print("    [✗] 新守护进程已退出，启动失败 —— 请查日志")
+    print(f"    {LOG_FILE}")
+    return 3
 
 
 def run(args: argparse.Namespace) -> int:

@@ -177,13 +177,35 @@ def test_minutes_to_close(cal):
     ("830799", "艾融软件", Board.BJ, 0.30),
     ("430047", "诺思兰德", Board.BJ, 0.30),
     ("920001", "某北交所", Board.BJ, 0.30),
-    ("600001", "ST某", Board.MAIN, 0.05),
-    ("000002", "*ST某", Board.MAIN, 0.05),
+    ("600001", "ST某", Board.MAIN, 0.10),         # 2026-07-06 起主板 ST 为 10%
+    ("000002", "*ST某", Board.MAIN, 0.10),
     ("300001", "ST创业板", Board.GEM, 0.20),      # ST 不改变双创 20%
 ])
 def test_board_and_limit_rate(code, name, board, rate):
     assert board_of(code, name) is board
     assert limit_rate_of(code, name) == pytest.approx(rate)
+
+
+@pytest.mark.parametrize("code,name,when,rate", [
+    # 主板风险警示：制度在 2026-07-06 由 5% 变 10%（IT-P1-MARKET-RULE-20260706-001）
+    ("600001", "ST某", date(2026, 7, 3), 0.05),
+    ("600001", "ST某", date(2026, 7, 5), 0.05),
+    ("600001", "ST某", date(2026, 7, 6), 0.10),     # 边界当天即新规
+    ("000002", "*ST某", date(2026, 7, 3), 0.05),
+    ("000002", "*ST某", date(2026, 7, 6), 0.10),
+    ("600001", "ST某", datetime(2026, 7, 5, 14, 30), 0.05),
+    ("600001", "ST某", None, 0.10),                 # 无日期 = 现行制度
+    # 双创 ST 一直是 20%，不因日期变
+    ("300001", "ST创业板", date(2026, 7, 3), 0.20),
+    ("300001", "ST创业板", date(2026, 9, 21), 0.20),
+    ("688001", "ST科创", date(2026, 7, 3), 0.20),
+    # 非 ST 主板不受该制度影响
+    ("600000", "浦发银行", date(2026, 7, 3), 0.10),
+    ("600000", "浦发银行", date(2026, 9, 21), 0.10),
+])
+def test_st_limit_rate_is_trade_date_aware(code, name, when, rate):
+    """主板 ST 涨跌幅必须按**交易日**取，不能写死 5%。"""
+    assert limit_rate_of(code, name, when) == pytest.approx(rate)
 
 
 def _q(code, name, pc):
@@ -199,12 +221,32 @@ def _q(code, name, pc):
     ("300750", "宁德时代", 100.00, 120.00, 80.00),
     ("688111", "金山办公", 100.00, 120.00, 80.00),
     ("830799", "艾融软件", 10.00, 13.00, 7.00),
-    ("600001", "ST某", 10.00, 10.50, 9.50),
+    ("600001", "ST某", 10.00, 11.00, 9.00),        # 现行制度 10%
 ])
 def test_limit_prices_rounded_to_cent(code, name, pc, up, dn):
     q = _q(code, name, pc)
     assert q.limit_up_price == pytest.approx(up, abs=0.005)
     assert q.limit_down_price == pytest.approx(dn, abs=0.005)
+
+
+def test_st_quote_uses_its_own_trade_date_not_runtime_clock():
+    """``Quote`` 的限价必须按**行情自己的交易日**算，而不是运行当天。
+
+    这是本制度修复的核心判据：同一只 ST 股、同一价格，``ts`` 在 2026-07-03
+    就要给 5% 的板，``ts`` 在 2026-09-21 就要给 10% 的板。
+    若实现里偷偷用 ``date.today()``，两组会得到**同一个**结果，本测试即失败。
+    """
+    q_old = _q("600001", "ST某", 10.00)
+    q_old.ts = datetime(2026, 7, 3, 10, 0)
+    q_new = _q("600001", "ST某", 10.00)
+    q_new.ts = datetime(2026, 9, 21, 10, 0)
+
+    assert q_old.limit_up_price == pytest.approx(10.50, abs=0.005)
+    assert q_old.limit_down_price == pytest.approx(9.50, abs=0.005)
+    assert q_new.limit_up_price == pytest.approx(11.00, abs=0.005)
+    assert q_new.limit_down_price == pytest.approx(9.00, abs=0.005)
+    assert q_old.limit_up_price != q_new.limit_up_price, \
+        "旧/新交易日给出了相同限价 —— 说明没有真的按交易日判定"
 
 
 def test_suspended_minus_one_limit_price_is_recomputed():

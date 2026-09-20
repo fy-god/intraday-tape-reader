@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from enum import Enum
 import math
 
@@ -19,6 +19,11 @@ __all__ = [
     "guess_prefix",
     "limit_rate_of",
     "LIMIT_RATE",
+    "ST_LIMIT_RATE_LEGACY",
+    "ST_LIMIT_RATE_CURRENT",
+    "ST_LIMIT_RATE_CHANGED_ON",
+    "st_limit_rate_on",
+    "market_rule_version",
 ]
 
 # 各板块涨跌停比例
@@ -30,8 +35,53 @@ LIMIT_RATE: dict[str, float] = {
     "index": 0.0,
     "other": 0.10,
 }
-# ST 股主板 ±5%
-ST_LIMIT_RATE = 0.05
+
+# ---- 主板风险警示（ST/*ST）涨跌幅：**制度在 2026-07-06 变过**
+#
+# 背景（IT-P1-MARKET-RULE-20260706-001）：沪深主板风险警示股票涨跌幅限制
+# 自 **2026-07-06** 起由 ±5% 调整为 ±10%（上交所《交易规则》2026 年修订
+# 及官方修订说明；深交所风险警示板指南同日施行）。此前一直是 ±5%。
+#
+# 为什么不能只改一个常量：本项目有**历史回放**（replay 会指定任意交易日），
+# 2026-07-06 之前的交易日仍必须按 5% 判定，否则会把那之前的行情
+# 算成"没到板"从而漏报、或把 `limit_board` 状态机判错。
+#
+# 为什么用**日期边界 + 函数**而不是一个 dict：边界哪天再变都有可能，
+# 集中在一处才好改；而且判定必须走"交易日"而不是"看到代码的那天"。
+ST_LIMIT_RATE_LEGACY = 0.05          # 2026-07-06 之前
+ST_LIMIT_RATE_CURRENT = 0.10         # 2026-07-06 起
+ST_LIMIT_RATE_CHANGED_ON = date(2026, 7, 6)
+
+
+def market_rule_version(when: date | datetime | None = None) -> str:
+    """该交易日适用的市场规则版本号（可写入告警/样本身份，便于事后追溯）。"""
+    d = _as_date(when)
+    if d is not None and d < ST_LIMIT_RATE_CHANGED_ON:
+        return "cn-2026-07-05"
+    return "cn-2026-07-06"
+
+
+def _as_date(when: date | datetime | None) -> date | None:
+    """把 ``date``/``datetime`` 归一成 ``date``；``None``/非法值返回 ``None``。"""
+    if when is None:
+        return None
+    if isinstance(when, datetime):
+        return when.date()
+    if isinstance(when, date):
+        return when
+    return None
+
+
+def st_limit_rate_on(when: date | datetime | None) -> float:
+    """**指定交易日**沪深主板风险警示股的涨跌幅比例。
+
+    ``when`` 为 ``None`` 时返回**现行**比例（调用方拿不到交易日时，
+    只能按当前制度算；回放/实时链路都应传真实交易日）。
+    """
+    d = _as_date(when)
+    if d is not None and d < ST_LIMIT_RATE_CHANGED_ON:
+        return ST_LIMIT_RATE_LEGACY
+    return ST_LIMIT_RATE_CURRENT
 
 
 class Board(str, Enum):
@@ -163,10 +213,15 @@ def is_new_listing(name: str) -> bool:
     return not nm[1].isascii()
 
 
-def limit_rate_of(code: str, name: str = "") -> float:
-    """该股票的涨跌停比例（ST 主板 5%，其余按板块）。
+def limit_rate_of(code: str, name: str = "",
+                  when: date | datetime | None = None) -> float:
+    """该股票的涨跌停比例（主板 ST 按**交易日**取 5% 或 10%，其余按板块）。
 
     只按**板块**决定比例：双创的 ST 股仍是 20%。
+
+    ``when`` = 该行情所属的**交易日**（``Quote.ts`` / 回放时钟 / ``ctx.now``）。
+    主板 ST 的比例在 2026-07-06 变过（5% → 10%），所以必须按交易日取，
+    不能写死（IT-P1-MARKET-RULE-20260706-001）。``when=None`` 时按现行制度。
 
     ⚠ **不适用于新股**：上市前 5 个交易日无涨跌幅限制，调用方应先看
     :meth:`Quote.has_price_limit`。这里**不**把新股特判成某个比例 ——
@@ -177,7 +232,7 @@ def limit_rate_of(code: str, name: str = "") -> float:
     else:
         b = board_of(str(code or ""), name)
     if b in (Board.MAIN, Board.OTHER) and ("ST" in (name or "").upper()):
-        return ST_LIMIT_RATE
+        return st_limit_rate_on(when)
     return LIMIT_RATE.get(b.value, 0.10)
 
 
@@ -273,6 +328,16 @@ class Quote:
         return not is_new_listing(self.name)
 
     @property
+    def trade_date(self) -> date | None:
+        """该行情所属**交易日**（来自 ``ts``）；无 ``ts`` 时返回 ``None``。
+
+        涨跌停比例依赖交易日（主板 ST 在 2026-07-06 由 5% 变 10%），
+        所以限价推算必须用**行情自己的**日期，而不是运行当天 ——
+        否则历史回放会套用今天的制度（IT-P1-MARKET-RULE-20260706-001）。
+        """
+        return _as_date(self.ts)
+
+    @property
     def limit_up_price(self) -> float:
         """涨停价；**无涨跌幅限制时返回 0.0**（表示"没有这个约束"）。
 
@@ -285,7 +350,8 @@ class Quote:
             return self.limit_up
         if not self.has_price_limit:
             return 0.0
-        return round(self.prev_close * (1 + limit_rate_of(self.code, self.name)), 2)
+        return round(self.prev_close
+                     * (1 + limit_rate_of(self.code, self.name, self.trade_date)), 2)
 
     @property
     def limit_down_price(self) -> float:
@@ -294,7 +360,8 @@ class Quote:
             return self.limit_down
         if not self.has_price_limit:
             return 0.0
-        return round(self.prev_close * (1 - limit_rate_of(self.code, self.name)), 2)
+        return round(self.prev_close
+                     * (1 - limit_rate_of(self.code, self.name, self.trade_date)), 2)
 
     def is_at_limit_up(self, tol: float = 1e-6) -> bool:
         """现价是否**贴着**涨停（无涨跌幅限制时恒为 False）。

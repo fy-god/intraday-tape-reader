@@ -33,7 +33,7 @@ B 组专门钉新 API 的契约，如实标注为结构性。
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -91,7 +91,9 @@ def test_n_first_day_limits_are_unconstrained():
     ("600000", "浦发银行", 10.00, 10.00, 11.00, 9.00),      # 主板 10%
     ("300750", "宁德时代", 10.00, 10.00, 12.00, 8.00),      # 创业板 20%
     ("688111", "金山办公", 10.00, 10.00, 12.00, 8.00),      # 科创板 20%
-    ("600519", "ST测试", 10.00, 10.00, 10.50, 9.50),        # 主板 ST 5%
+    # 主板 ST：现行制度（2026-07-06 起）为 10%；历史交易日见
+    # test_session_boards.py::test_st_limit_rate_is_trade_date_aware
+    ("600519", "ST测试", 10.00, 10.00, 11.00, 9.00),
 ])
 def test_normal_stock_limits_unchanged(code, name, price, prev, exp_up, exp_dn):
     """正常股限价行为必须**逐字不变** —— 防止修复误伤。
@@ -132,16 +134,16 @@ def test_limit_price_boundary_by_name(name, expect_unconstrained):
     漏判新股只是少过滤一次；误判会把正常股的涨跌停约束摘掉，后果更严重。
     这里只断言 ``limit_up_price``，所以回退时是真 AssertionError。
 
-    期望值由 ``limit_rate_of`` 现算，而不是写死 22.88 —— 因为 ST 股是 5%
-    （``limit_up_price`` 21.84），且 ``"CTest".upper()`` 含子串 ``"ST"``
-    会命中 ST 分支（``limit_rate_of`` 的既有行为，本次不涉及）。
-    写死数字会让测试钉住无关细节。
+    期望值由 ``limit_rate_of`` 现算，而不是写死 22.88 —— 因为 ST 股的板率
+    依赖交易日（主板 ST 自 2026-07-06 起 10%），且 ``"CTest".upper()``
+    含子串 ``"ST"`` 会命中 ST 分支（``limit_rate_of`` 的既有行为，
+    本次不涉及）。写死数字会让测试钉住无关细节。
     """
     q = _q("600000", name, price=20.80, prev=20.80)
     if expect_unconstrained:
         assert q.limit_up_price == 0.0, f"{name!r} 应视为无涨跌幅限制"
     else:
-        exp = round(20.80 * (1 + limit_rate_of("600000", name)), 2)
+        exp = round(20.80 * (1 + limit_rate_of("600000", name, q.trade_date)), 2)
         assert q.limit_up_price == pytest.approx(exp), (
             f"{name!r} 是正常股，必须保留按板块/ST 算出的涨停约束 {exp}")
 
@@ -154,7 +156,10 @@ def test_limit_rate_of_keeps_pure_board_semantics():
     """
     assert limit_rate_of("601091", "C沈鼓") == pytest.approx(0.10)
     assert limit_rate_of("688837", "C信诺维") == pytest.approx(0.20)
-    assert limit_rate_of("600519", "ST测试") == pytest.approx(0.05)
+    # 主板 ST 按**交易日**取：2026-07-05 及以前 5%，2026-07-06 起 10%
+    assert limit_rate_of("600519", "ST测试", date(2026, 7, 3)) == pytest.approx(0.05)
+    assert limit_rate_of("600519", "ST测试", date(2026, 9, 21)) == pytest.approx(0.10)
+    assert limit_rate_of("600519", "ST测试") == pytest.approx(0.10)
 
 
 def test_limit_board_silent_on_new_listing():
