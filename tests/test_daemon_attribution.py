@@ -50,7 +50,7 @@ class _Args:
 def test_preflight_blocks_when_existing_daemon_alive(monkeypatch):
     """已有守护在跑 -> preflight 必须拦下，理由里要带 PID。"""
     monkeypatch.setattr(rd, "_read_state",
-                        lambda: {"pid": 4321, "port": 8899})
+                        lambda port=None: {"pid": 4321, "port": 8899})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: pid == 4321)
     monkeypatch.setattr(rd, "_healthy", lambda port: False)
 
@@ -61,7 +61,7 @@ def test_preflight_blocks_when_existing_daemon_alive(monkeypatch):
 
 def test_preflight_blocks_when_port_already_serving(monkeypatch):
     """端口上已有**别的**健康服务 -> 也必须拦下（这正是审计的场景）。"""
-    monkeypatch.setattr(rd, "_read_state", lambda: {})
+    monkeypatch.setattr(rd, "_read_state", lambda port=None: {})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(rd, "_healthy", lambda port: True)
 
@@ -72,7 +72,7 @@ def test_preflight_blocks_when_port_already_serving(monkeypatch):
 
 def test_preflight_allows_when_clean(monkeypatch):
     """端口空、无守护 -> 必须放行（否则功能不可用）。"""
-    monkeypatch.setattr(rd, "_read_state", lambda: {})
+    monkeypatch.setattr(rd, "_read_state", lambda port=None: {})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(rd, "_healthy", lambda port: False)
     assert rd._preflight(_Args(port=8899)) is None
@@ -85,7 +85,7 @@ def test_child_owns_service_rejects_other_pids_service(monkeypatch):
     只看端口会误判成功；绑定身份才会正确返回 False。
     """
     monkeypatch.setattr(rd, "_read_state",
-                        lambda: {"pid": 9999, "port": 8899})   # 旧服务的 PID
+                        lambda port=None: {"pid": 9999, "port": 8899})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: pid == 9999)
     monkeypatch.setattr(rd, "_healthy", lambda port: True)      # 端口确实健康
 
@@ -96,7 +96,7 @@ def test_child_owns_service_rejects_other_pids_service(monkeypatch):
 def test_child_owns_service_accepts_matching_pid(monkeypatch):
     """状态文件 pid == child pid、child 活着、端口健康 -> 才算成功。"""
     monkeypatch.setattr(rd, "_read_state",
-                        lambda: {"pid": 1234, "port": 8899})
+                        lambda port=None: {"pid": 1234, "port": 8899})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: pid == 1234)
     monkeypatch.setattr(rd, "_healthy", lambda port: True)
 
@@ -105,7 +105,7 @@ def test_child_owns_service_accepts_matching_pid(monkeypatch):
 
 def test_child_owns_service_returns_false_when_child_died(monkeypatch):
     """child 已退出 -> 立刻 False，不要傻等满超时。"""
-    monkeypatch.setattr(rd, "_read_state", lambda: {"pid": 1234})
+    monkeypatch.setattr(rd, "_read_state", lambda port=None: {"pid": 1234})
     monkeypatch.setattr(rd, "_pid_alive", lambda pid: False)
     monkeypatch.setattr(rd, "_healthy", lambda port: True)
 

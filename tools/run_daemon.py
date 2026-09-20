@@ -38,7 +38,23 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 RUN_DIR = ROOT / "data" / "run"
 LOG_FILE = RUN_DIR / "arad-daemon.log"
-STATE_FILE = RUN_DIR / "arad-daemon.json"
+
+# 状态文件**按端口分文件**（IT-P2-DAEMON-STATE-001）。
+#
+# 原来固定叫 `arad-daemon.json`，是**单槽**的。一旦用户按"先用 8905 看回放
+# 预览、正式守护仍在 8899"这种很自然的用法跑第二个守护，后启动的就会
+# **覆盖**先启动的进程记录：`--status` 从此报的是另一个端口的守护，
+# 单实例检查也会看错对象（拿 8905 的记录去判 8899 是否重复）。
+#
+# 实测过这个坑：8899 守护（PID 12180）还活着，`--status` 却显示 8905 的
+# PID 31516 —— 记录被顶掉了。按端口分文件后各端口互不干扰。
+def _state_file(port: int | None = None) -> Path:
+    if port is None:
+        return RUN_DIR / "arad-daemon.json"      # 兼容旧路径（--status 无端口时）
+    return RUN_DIR / f"arad-daemon-{int(port)}.json"
+
+
+STATE_FILE = _state_file()                        # 旧名保留，避免外部引用炸
 
 # 退避表：崩溃越快，等得越久；避免坏配置把 CPU 打满
 BACKOFF = [5, 10, 20, 40, 60]
@@ -77,21 +93,61 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _read_state() -> dict:
+def _read_state(port: int | None = None) -> dict:
+    """读状态。``port`` 给定时读该端口自己的文件，否则读旧的单槽文件。"""
+    path = _state_file(port)
+    if port is not None and not path.exists():
+        # 向后兼容：旧版本只写单槽文件；若它的 port 正好匹配就当自己的
+        legacy = _state_file()
+        if legacy.exists():
+            try:
+                st = json.loads(legacy.read_text(encoding="utf-8"))
+                if int(st.get("port") or 0) == int(port):
+                    return st
+            except Exception:  # noqa: BLE001
+                pass
+        return {}
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001  缺文件/半截写入都当没有
         return {}
 
 
-def _write_state(**kw) -> None:
+def _write_state(_port: int | None = None, **kw) -> None:
+    """写状态。端口既可位置传入，也可放在 ``port=`` 里。
+
+    ⚠ 第一个形参刻意叫 ``_port`` 而**不是** ``port``：若叫 ``port``，
+    调用方写 ``_write_state(args.port, port=args.port)`` 会让 CPython 在
+    **进入函数体之前**就抛 ``TypeError: got multiple values for argument
+    'port'`` —— 函数内部再 ``pop`` 也拦不住（我实际踩过：守护启动即崩）。
+    改名后两种写法都安全。
+    """
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    st = _read_state()
+    kw_port = kw.pop("port", None)
+    port = _port if _port is not None else kw_port
+    path = _state_file(port)
+    st = _read_state(port)
     st.update(kw)
+    st["port"] = port if port is not None else st.get("port")
     st["updatedAt"] = datetime.now().isoformat(timespec="seconds")
-    tmp = STATE_FILE.with_suffix(".json.tmp")
+    tmp = path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)          # 原子替换，避免读到写一半的文件
+    tmp.replace(path)                # 原子替换，避免读到写一半的文件
+    if port is not None:
+        # 同时刷新单槽文件，作为 `--status`（不带端口）的"最近一个"兜底
+        _write_legacy_slot(st)
+
+
+def _write_legacy_slot(st: dict) -> None:
+    """把状态同步写入旧的单槽文件，仅供不带端口的 `--status` 兜底。"""
+    try:
+        path = _state_file()
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(st, ensure_ascii=False, indent=2),
+                       encoding="utf-8")
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001  兜底失败不该影响守护
+        pass
 
 
 def _healthy(port: int) -> bool:
@@ -118,7 +174,7 @@ def _child_owns_service(port: int, child_pid: int, timeout: float = 15.0) -> boo
     """
     end = time.time() + timeout
     while time.time() < end:
-        st = _read_state()
+        st = _read_state(port)
         st_pid = int(st.get("pid") or 0)
         # 状态文件必须已经是**新 child** 写的，且它活着，且端口健康
         if st_pid == int(child_pid) and _pid_alive(child_pid) \
@@ -136,10 +192,9 @@ def _preflight(args: argparse.Namespace) -> str | None:
     必须在 Popen **之前**做（IT-P2-DAEMON-HEALTH-001）：否则新 child 会
     因为"已有实例"直接退出，而父进程却已经准备好把旧服务当成自己的成功。
     """
-    st = _read_state()
+    st = _read_state(args.port)
     busy = int(st.get("pid") or 0)
-    if busy and busy != os.getpid() and _pid_alive(busy) \
-            and int(st.get("port") or 0) == int(args.port):
+    if busy and busy != os.getpid() and _pid_alive(busy):
         return f"端口 {args.port} 上已有守护在跑（PID {busy}）"
     if _healthy(args.port):
         return f"{args.port} 端口已有服务在响应（不是本守护启动的）"
@@ -147,20 +202,42 @@ def _preflight(args: argparse.Namespace) -> str | None:
 
 
 def cmd_status(port: int) -> int:
-    st = _read_state()
+    st = _read_state(port)
     if not st:
-        print("没有守护状态文件 —— 守护没跑过（或已清理）")
+        print(f"没有端口 {port} 的守护状态文件 —— 该端口的守护没跑过（或已清理）")
+        others = _list_state_files()
+        if others:
+            print()
+            print("其它端口上的守护：")
+            for p in others:
+                _print_state_one(p, _read_state(p))
         return 1
+    _print_state_one(port, st)
+    return 0 if _pid_alive(int(st.get("pid") or 0)) else 1
+
+
+def _list_state_files() -> list[int]:
+    """列出所有**按端口分文件**的状态（IT-P2-DAEMON-STATE-001）。"""
+    out: list[int] = []
+    try:
+        for f in RUN_DIR.glob("arad-daemon-*.json"):
+            stem = f.stem[len("arad-daemon-"):]
+            if stem.isdigit():
+                out.append(int(stem))
+    except Exception:  # noqa: BLE001
+        pass
+    return sorted(out)
+
+
+def _print_state_one(port: int, st: dict) -> None:
     pid = int(st.get("pid") or 0)
     alive = _pid_alive(pid)
-    print(f"守护 PID      ：{pid}（{'运行中' if alive else '已退出'}）")
-    print(f"子进程 PID    ：{st.get('childPid')}")
-    print(f"端口          ：{st.get('port')}")
-    print(f"启动于        ：{st.get('startedAt')}")
-    print(f"重启次数      ：{st.get('restarts')}")
-    print(f"最近健康检查  ：{'通过' if _healthy(port) else '失败'}  /api/status")
-    print(f"日志          ：{LOG_FILE}")
-    return 0 if alive else 1
+    print(f"[端口 {port}] 守护 PID {pid}（{'运行中' if alive else '已退出'}）")
+    print(f"  子进程 PID    ：{st.get('childPid')}")
+    print(f"  启动于        ：{st.get('startedAt')}")
+    print(f"  重启次数      ：{st.get('restarts')}")
+    print(f"  最近健康检查  ：{'通过' if _healthy(port) else '失败'}  /api/status")
+    print(f"  日志          ：{LOG_FILE}")
 
 
 # ==========================================================================
@@ -174,6 +251,17 @@ def _child_argv(args: argparse.Namespace) -> list[str]:
         argv += ["--watch-only"]
     if args.config:
         argv += ["--config", args.config]
+    # 回放预览也要能常驻：休市时用户想随时打开看板看短线精灵效果
+    if getattr(args, "replay", False):
+        argv += ["--replay"]
+        if getattr(args, "stocks", None):
+            argv += ["--stocks", str(args.stocks)]
+        if getattr(args, "seed", None) is not None:
+            argv += ["--seed", str(args.seed)]
+        if getattr(args, "minutes", None):
+            argv += ["--minutes", str(args.minutes)]
+        if getattr(args, "speed", None):
+            argv += ["--speed", str(args.speed)]
     return argv
 
 
@@ -244,6 +332,13 @@ def _detach_and_return(args: argparse.Namespace) -> int:
         argv += ["--no-restart"]
     if args.max_restarts:
         argv += ["--max-restarts", str(args.max_restarts)]
+    if getattr(args, "replay", False):
+        argv += ["--replay", "--stocks", str(getattr(args, "stocks", 30)),
+                 "--seed", str(getattr(args, "seed", 42))]
+        if getattr(args, "minutes", None):
+            argv += ["--minutes", str(args.minutes)]
+        if getattr(args, "speed", None):
+            argv += ["--speed", str(args.speed)]
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open("ab") as log:
@@ -293,19 +388,18 @@ def run(args: argparse.Namespace) -> int:
         return _detach_and_return(args)
 
     # --- 单实例：同端口已有活着的守护就别再起 ---
-    st = _read_state()
+    st = _read_state(args.port)
     busy = int(st.get("pid") or 0)
-    if busy and busy != os.getpid() and _pid_alive(busy) \
-            and int(st.get("port") or 0) == int(args.port):
+    if busy and busy != os.getpid() and _pid_alive(busy):
         print(f"[!] 端口 {args.port} 上已有守护在跑（PID {busy}）——不重复启动")
-        print(f"    查看：python tools/run_daemon.py --status")
+        print(f"    查看：python tools/run_daemon.py --status --port {args.port}")
         return 2
     if _healthy(args.port):
         print(f"[!] {args.port} 端口已有服务在响应 ——不重复启动")
         return 2
 
     RUN_DIR.mkdir(parents=True, exist_ok=True)
-    _write_state(pid=os.getpid(), port=args.port, childPid=None,
+    _write_state(args.port, pid=os.getpid(), childPid=None,
                  restarts=0, startedAt=datetime.now().isoformat(timespec="seconds"),
                  watchOnly=bool(args.watch_only))
 
@@ -344,7 +438,7 @@ def run(args: argparse.Namespace) -> int:
             except OSError as exc:
                 print(f"[✗] 子进程启动失败：{exc}")
                 return 2
-            _write_state(childPid=child.pid, restarts=restarts)
+            _write_state(args.port, childPid=child.pid, restarts=restarts)
 
         # 等待子进程结束，同时定期刷健康状态
         while child.poll() is None and not stopping["flag"]:
@@ -360,7 +454,8 @@ def run(args: argparse.Namespace) -> int:
                 except subprocess.TimeoutExpired:
                     child.kill()
             print("\n[√] 守护已停止")
-            _write_state(childPid=None, stoppedAt=datetime.now().isoformat(timespec="seconds"))
+            _write_state(args.port, childPid=None,
+                         stoppedAt=datetime.now().isoformat(timespec="seconds"))
             return 0
 
         # 子进程自己退了
@@ -368,7 +463,7 @@ def run(args: argparse.Namespace) -> int:
             log.write(f"[daemon] 子进程退出 rc={rc} 存活 {lived:.0f}s\n".encode())
         if args.no_restart:
             print(f"[!] 子进程退出 rc={rc}（--no-restart 不重启）")
-            _write_state(childPid=None, lastExit=rc)
+            _write_state(args.port, childPid=None, lastExit=rc)
             return 0 if rc == 0 else 3
         if lived >= STABLE_SECONDS:
             restarts = 0                      # 活得够久，退避归零
@@ -376,16 +471,17 @@ def run(args: argparse.Namespace) -> int:
         if args.max_restarts and restarts > args.max_restarts:
             print(f"[✗] 子进程已连续重启 {restarts - 1} 次仍失败 —— 停止，请查日志")
             print(f"    {LOG_FILE}")
-            _write_state(childPid=None, lastExit=rc, restarts=restarts)
+            _write_state(args.port, childPid=None, lastExit=rc, restarts=restarts)
             return 3
         delay = BACKOFF[min(restarts - 1, len(BACKOFF) - 1)]
         print(f"[!] 子进程退出 rc={rc}，{delay}s 后重启（第 {restarts} 次）")
-        _write_state(restarts=restarts, lastExit=rc)
+        _write_state(args.port, restarts=restarts, lastExit=rc)
         end = time.time() + delay
         while time.time() < end and not stopping["flag"]:
             time.sleep(0.2)
 
-    _write_state(childPid=None, stoppedAt=datetime.now().isoformat(timespec="seconds"))
+    _write_state(args.port, childPid=None,
+                 stoppedAt=datetime.now().isoformat(timespec="seconds"))
     return 0
 
 
@@ -405,6 +501,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--status", action="store_true", help="打印守护状态后退出")
     p.add_argument("--detach", action="store_true",
                    help="脱离当前终端启动（关掉窗口也不会停；推荐）")
+    p.add_argument("--replay", action="store_true",
+                   help="回放预览模式：休市时也能看到短线精灵滚动（合成行情）")
+    p.add_argument("--stocks", type=int, default=30, help="（--replay）合成股票数")
+    p.add_argument("--seed", type=int, default=42, help="（--replay）随机种子")
+    p.add_argument("--minutes", type=float, default=None,
+                   help="（--replay）只跑前 N 分钟")
+    p.add_argument("--speed", type=float, default=0.0,
+                   help="（--replay）倍速；0=尽快跑完")
     return p
 
 
