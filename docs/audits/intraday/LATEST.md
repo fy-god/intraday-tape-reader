@@ -1,8 +1,9 @@
 # 最新审计
 
 **最新本地 Agent 产品轮**：[`2026-09-21_21-00-00_JST.md`](./2026-09-21_21-00-00_JST.md)  
-**最新云端独立审计**：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)  
-**上一份云端独立审计**：[`2026-09-21_20-10-37_JST.md`](./2026-09-21_20-10-37_JST.md)  
+**最新云端独立审计**：[`2026-09-21_21-56-56_JST.md`](./2026-09-21_21-56-56_JST.md)  
+**上一份云端独立审计**：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)  
+**更早云端独立审计**：[`2026-09-21_20-10-37_JST.md`](./2026-09-21_20-10-37_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-21_20-10-37_JST_AGENT_TASK.md`](./2026-09-21_20-10-37_JST_AGENT_TASK.md)  
 **上一份本地 Agent 独立审计**：[`2026-09-21_17-40-00_JST.md`](./2026-09-21_17-40-00_JST.md)  
 **上一份本地 Agent 产品轮**：[`2026-09-21_17-00-00_JST.md`](./2026-09-21_17-00-00_JST.md)  
@@ -11,6 +12,92 @@
 **仓库执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)
 
 > 历史审计文件均保留在本目录；本索引只移动当前接续指针，不删除任何历史报告。以下保留最近关键接续点；更早轮次继续按本目录时间戳文件追溯。
+
+## 2026-09-21 21:56 JST 云端审计（续）：假绿**已确认**在判决层 + **已证明可行**的补丁
+
+- 审计对象 HEAD：`90c54c5701e483b2401f365e99914e4bc25e0bd0`（未变；`origin/main` 与 `ls-remote` 三者相等）
+- 报告：[`2026-09-21_21-56-56_JST.md`](./2026-09-21_21-56-56_JST.md)　（前身：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)）
+- 前身把本条判为 `待验证风险`；本报告**升级为 `已确认错误`**并给出已验证的修复
+
+### 1. 决定性实验（升级版）：**绿色**判决在坏账本下依然绿色
+
+前身的弱点：两个基线都是 `exit=2`（无数据）。本报告改用仓库**自带**的"应当判健康" helper（`tests/test_live_session_observation.py` 的 `_healthy_metrics`、`tests/test_live_session_tool.py` 的 `healthy_metrics()`）：
+
+```text
+BASELINE (good ledger)   healthy=True  exit=0
+BROKEN LEDGER            healthy=True  exit=0
+IDENTICAL_VERDICT = True      checks that changed: NONE
+```
+
+坏账本 = `accounting_status="inconsistent"`、`accounting_errors=7`、`signed_ratio=None`、`committed_alerts_total=0` 而 `committed_with_signal_id=66`、`inconsistent_rounds=[1,2,3]`。**绿色判决 `exit 0` 在灾难性账本下逐字节不变**，判决文本里连 "accounting" 都不出现。
+
+### 2. 机制：不是"没有机制"，而是**接线漏了**
+
+`tools/live_session.py` 逐函数计数（NEW = 新交付账本词元，OLD = 旧 evaluability 词元）：
+
+```text
+evaluate_health              985   NEW=0  OLD=4   VERDICT    <== 读旧不读新
+_fmt_observation_summary    1741   NEW=0  OLD=6   PRINTER    <== 打印旧不打印新
+_print_summary              2209   NEW=0  OLD=0
+build_report                1342   NEW=0  OLD=0
+make_round_sample            204   NEW=2  OLD=3   PRODUCER
+summarize_rounds             359   NEW=19 OLD=13  PRODUCER
+empty_metrics                872   NEW=12 OLD=7   PRODUCER
+```
+
+判决层**已经**有一段完整的旧账本消费逻辑（`:1179` `signal_evaluability`、`:1200-1202`、`:1209` `cap_level="fail"`、`:1243` `add("capability", cap_level != "fail", ...)`）。**它知道怎么把账本变成 fail，只是从未被接到新账本上** —— 加账本那次提交只更新了生产者，没有更新任何消费者。
+
+### 3. 补丁已验证：**新测试今天失败、补丁后通过、全量零回归**
+
+29 行补丁（在 `add("alerts", ...)` 前插一项 `delivery_accounting` 检查；`not_measured` 判 `ok`，因为仓库**四个**绿色 helper 全都产出 `not_measured`，判红会让所有既有绿测转红）：
+
+```text
+STEP 1  新测试 @ 已打补丁        exit=0    5 passed in 0.23s
+STEP 2  新测试 @ 原始 fd51674    exit=1    2 failed, 3 passed in 0.25s
+STEP 3  全量既有套件 @ 已打补丁  exit=0    1681 passed in 122.97s
+         （1681 = 1676 既有 + 5 新增，与上一轮独立测得的 1676 吻合）
+```
+
+⇒ 具备**可复现的判决级证据 + 精确机制 + 已验证可用的修复**。补丁与测试全程在 `%TEMP%` 副本内，仓库工作树未被触碰。
+
+### 4. 为什么现有测试网抓不到：两个文件**不相交**，且**根本没有 CI**
+
+```text
+tests/test_delivery_false_green.py      引用 evaluate_health   = 0 次
+tests/test_live_session_observation.py  引用 accounting_status = 0 次
+                                        引用 delivery_accounting = 0 次
+```
+
+"账本对了"和"判决对了"被分别证明，**"账本错了判决会红吗"从未被问过**。
+
+```text
+.github / .gitlab-ci.yml / azure-pipelines.yml / Jenkinsfile / .circleci
+.travis.yml / appveyor.yml / .drone.yml / Makefile / noxfile.py / tox.ini
+=> 全部 exists=False；tracked .github files = (none)
+```
+
+仓库**没有任何 CI**；`tools/check_*.py` 8 个也都不看账本（逐个实测 `accounting=False delivery=False verdict=False`）。
+
+### 5. 我尝试的证伪，全部失败
+
+`/api/health`、`/api/status`、`check_delivery_accounting()`、`delivery_accounting_status()`、8 个 check 脚本、conftest、pyproject、以及"加检查项会撞测试"——逐项实测**均未能推翻**。见报告 §5 完整表。
+
+### 6. 分类
+
+- **`IT-H20-DELIVERY-ACCOUNTING-GATE-MISSING`：`已确认错误`**（前身标 `待验证风险`，本报告升级）
+- 同一模式作用于**人看的打印层**：**`已确认错误`**（soak 摘要永远不显示 `delivery_committed_total`）
+- 无 CI / 无流水线告警、测试网不相交：`待验证风险`
+- **`已经修复`**（契约层，前身判定保持）：`IT-P1-DELIVERY-FALSE-GREEN-001` 等 6 项
+- **`仍然开放` 15 项**（本轮未碰）：同前身
+- **`修复后回归`：0**（实测全量 1681 通过）。**`未复现`：无新增。**
+
+### 7. 建议修复顺序
+
+接线判决层（补丁已给出）→ 接线打印层 → **加 CI**（当前一条都没有）→ 把账本与判决放进同一个测试文件。
+
+### 未改动
+
+源码 / 权重 / 配置 / Actions / PR / `SCHEDULE.md`。**未创建、修改或删除任何定时任务或排程。** 未 commit/push 任何代码。补丁与测试只存在于 `%TEMP%` 副本。
 
 ## 2026-09-21 21:43 JST 云端审计（假绿被**转移**：判决层不读新账本）
 
