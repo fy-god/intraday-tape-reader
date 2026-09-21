@@ -38,19 +38,39 @@
 
 `git grep -n check_delivery_invariants` → **只有它自己的定义**（`capabilities.py:711`）+ 2 行散文。**连新测试都没调用**（新测试只测 `SignalDeliveryStats.check_invariants()` 的**单实例**版）。故 `NEXT_STEPS.md:11` 的"**逐轮交付不变量违规 0**"是**测试口径**，**不是生产保证**。
 
-### ⚠ `IT-P1-SOAK-LEDGER-BLIND-001`（**新增 · P1 · 我独立复现**）soak 长跑对交付账本**完全盲**
+### ⚠ `IT-P1-SOAK-LEDGER-BLIND-001`（**新增 · P1 · 我独立复现**）soak 长跑对交付账本**完全盲**，且**打印的正是修复前的数字**
 
 用 `tools/live_session.py` **自己的常量**做端到端复现：`_OBSERVATION_MARKER_KEYS`（15 键）/ `_OBSERVATION_VALUE_FIELDS`（14 键）**都以旧账本 `signal_evaluability` 结尾**，真实 `as_dict()` 里的 `signal_delivery` 与 `delivery_accounting` **两个白名单都不含**。故 soak 的采样产物与阈值判定**永远看不到新门禁**。
 
-**汇总**：新门禁的执法者**只有单元测试** —— `tools/check_*.py` **8/8 零覆盖**（§2.5）、`check_delivery_invariants()` **零生产调用**（上条）、soak **白名单不含**（本条）、`dashboard.html` 零渲染。**"算得出、进 JSON、没人看"。**
+**更严重（`IT-P1-SOAK-REPORTS-PREFIX-NUMBER-001`）**：`:658-660` 的注释把 `evaluability_committed_total` 指定为"**真正交付**"，而它**只从旧账本填充**（`:429`/`:542`/`:638` 均源于 `signal_evaluability`）。实测 **该数字 = 6，而真实 committed = 66** —— **soak 报告今天展示的仍是 `9.1%` 时代的分母。** `NEXT_STEPS.md:8-11` 声称的验收证据（`signed_ratio 1.0 / 违规 0 / 66/66`）**不可能来自 soak/health 路径**，那路径给的是 **6/66**。
+
+### 🔴 `IT-P1-ACCEPTANCE-GATE-RINGBUFFER-001`（**新增 · P1 · 最严重的程序性发现 · 我照抄该断言算法复现**）验收断言的分母被 300 条环形缓冲截断
+
+`tests/test_replay_capability_ledger.py:138` 把**跨轮累计**的 `delivery_total`（`:100-108`）与 `len(store.recent_alerts(1000))`（`:126`）相比 —— 后者读 `store.py:55` 的 **`deque(maxlen=300)`**。
+
+| 规模（`seed=42`） | 累计 committed | `len(rows)` | 真实告警数 | `:138` |
+|---|---|---|---|---|
+| 30 只 × 90 min | 66 | 66 | 66 | **PASS** |
+| 200 只 × 240 min | 448 | **300** | 448 | **FAIL** |
+| 400 只 × 240 min | 923 | **300** | 923 | **FAIL** |
+
+**`100%` 部分依赖"这次回放恰好只产 66 条告警"。** 真实全市场单日很可能 >300 条，届时该断言会因**环形缓冲**而失败、与修复无关（**假红**）。且 `web.max_alerts: 300`（`settings.yaml:327`）**未接线** —— `engine.py:713-715` 只传 `series_len`，上限硬编码。**修法**：分母改用已存在的 `store.alerts_total`（`store.py:349-351`）。
 
 ### ❌ 推翻子 agent C 的一处推理：`global_ignored` **不是** vestigial
 
-C 据 `engine.py:1144` 排除 ignore 码推断 `:1295` 分支"近似不可达"。**该推理漏看了 `:1148-1159` 的 watchlist 回填**：规则实际看到的 `snap.quotes = watch_cur ∪ eligible`，而 `watch_cur` **只按 `self.watchlist` 过滤、不做 ignore 判定**。故只要某代码**同时在 `watchlist` 与 `ignore`**，规则仍能为它产出 `Alert`，`:1298` 即被执行。**我记为"可达性与真实触发频率均未复现"，只推翻其过强表述**（不指控死、不声称活）。
+C 据 `engine.py:1144` 排除 ignore 码推断 `:1295` 分支"近似不可达"。**该推理漏看了 `:1148-1159` 的 watchlist 回填**：规则实际看到的 `snap.quotes = watch_cur ∪ eligible`，而 `watch_cur` **只按 `self.watchlist` 过滤、不做 ignore 判定**。故只要某代码**同时在 `watchlist` 与 `ignore`**，规则仍能为它产出 `Alert`，`:1298` 即被执行。**记为"可达性与真实触发频率均未复现"，只推翻其过强表述**（不指控死、不声称活）。
 
 ### ⚠ 不采信 C 的 D3 计数（定性成立、数字未复现）
 
-C 称"28 个 `signal_id` 仅 1 个可直接索引 `SIGNALS`"。**定性我确认**（账本键是 `模块.形态`，`SIGNALS` 用裸名，需自行 `rpartition('.')`）。但**"28"我没能复现** —— 静态可确定的 `signal_id` 字面量只有 **9** 个（其余是 f-string，需展开运行时注册表；`SIGNALS` 自身 30 条）。**故只采信定性，不引用该计数及其"无对应 signal_id 的展示名"清单**（在不完整枚举下该清单必然偏大，属枚举不全，非缺陷证据）。
+C 称"28 个 `signal_id` 仅 1 个可直接索引 `SIGNALS`"。**定性我确认**（账本键是 `模块.形态`，`SIGNALS` 用裸名，需自行 `rpartition('.')`）。但**"28"我没能复现** —— 静态可确定的 `signal_id` 字面量只有 **9** 个（其余是 f-string）。**故只采信定性，不引用该计数及其派生清单**（不完整枚举下该清单必然偏大，属枚举不全，非缺陷证据）。
+
+### ✅ 子 agent A 的 Q1–Q4 我采信（AST 枚举 + 执行 git 取出的真实 baseline 代码）
+
+其 Q2 与我"`R-17` 收窄"独立一致，并用**变异实验**证明 `limit_board.py:368` 改名后账本键与 `metrics["pattern"]` 分离且**无测试捕获**（强于我的静态分析）。其 **N4**（`signed_ratio` 结构性恒 `{None: 305, 1.0: 56}`）与我 §2.3/§2.4 一致。其 N2/N6/N7 分别等于我的 §3.6/§6/§5，**不重复计入**。
+
+### 📌 我对自己读法的第二次更正（实证了"末轮"语义之危险）
+
+复现 N1 的**第一版**脚本里，我又一次直接读 `store.observation["delivery_accounting"]` 得到 `0`，把三个规模全判成 FAIL。**这正是我已记录过的"末轮 vs 累计"陷阱，我又踩了一次** —— 该字段只描述**最后一轮**。照抄被测断言的跨轮累加后才得到 66/448/923。**连已知该陷阱的人都会再犯，本身就是该字段必须拆分为 `_last_round` 与 `_session` 的最有力实证。**
 
 ### ⚠ `IT-P1-DELIVERY-GATE-PERROUND-001`（**本轮新增 · P1 · 已确认**）新门禁是"逐轮"的，运营面读到的是**最后一轮**
 
