@@ -710,8 +710,16 @@ class Engine:
         # 这个配置键被静默忽略 —— 改了配置没有任何效果，也没有任何报错。
         # ``or 240`` 是为了让 YAML 里的 ``series_len:``（空值 -> None）回落到默认，
         # 注意 0 会被 ``or`` 吃掉，但 0 不是合法值（``max(0, 2)`` 也不合理）。
+        #
+        # IT-P1-ACCEPTANCE-GATE-RINGBUFFER-001：``web.max_alerts`` 同样是配置接线
+        # 残留 —— YAML 里有 ``web.max_alerts: 300``，但这里从没传给 AlertStore，
+        # 于是它永远用 ``__init__`` 里的硬编码默认 300。改配置没有任何效果。
+        # 这条**不只是洁癖**：``recent_alerts(n)`` 被测试当累计分母用过，
+        # 而它是 deque(maxlen=max_alerts) —— 分母被 ring buffer 悄悄截断，
+        # 告警 >300 时断言会**假红**。累积真值必须用 ``alerts_total()``。
         self.store = store if store is not None else AlertStore(
             self.settings, calendar=self.calendar,
+            max_alerts=int(self.settings.get("web.max_alerts", 300) or 300),
             series_len=int(self.settings.get("storage.series_len", 240) or 240))
         self.store.attach(self)
         self.log = logger or log
@@ -1319,10 +1327,42 @@ class Engine:
         # 必须由 Engine 独立数，不能拿账本 committed 之和充当分母 ——
         # 那样分子分母同源，delivery_accounting_coverage 会恒等于 1.0，
         # 这正是本缺陷能长期隐藏的原因。
+        #
+        # IT-P1-DELIVERY-FALSE-GREEN-001：吞异常本身**可以**保留
+        # （可观测性不能反过来打断告警主链路），但**必须留下痕迹**。
+        # 旧代码是裸 `except Exception: pass` —— 分母静默不涨，而门禁
+        # `max(total - named, 0)` 把负差夹成 0，于是"账本坏了"被读成 PASS
+        # （实测 total=0/named=66 -> 门禁 0）。现在把失败计入
+        # `accounting_errors`，使 `accounting_status` 变成 inconsistent。
         try:
             observation.committed_alerts_total += len(fresh)
         except Exception:  # noqa: BLE001
-            pass
+            try:
+                observation.accounting_errors += 1
+            except Exception:  # noqa: BLE001
+                # 连错误计数都记不上：只能放弃，但绝不能影响告警主链路。
+                pass
+        # IT-P1-DELIVERY-INVARIANTS-UNCALLED-001：把自洽性检查从**读时**
+        # 前移到**写时**。
+        #
+        # 为什么必须做：``check_delivery_invariants()`` 此前在**生产里零调用**
+        # （全仓只有它自己的 def）。也就是说"逐轮交付不变量违规 0"是
+        # **测试口径**，不是生产保证 —— 数是真的（361 轮独立重跑确实 0），
+        # 但**生产里没有任何东西在检查它**。
+        #
+        # 与上面的纪律一致：检查失败**只记账 + 记日志，绝不抛** ——
+        # 可观测性不能反过来打断告警主链路。
+        try:
+            bad = observation.check_delivery_invariants()
+            if bad:
+                observation.accounting_errors += len(bad)
+                self.log.warning("交付账本不变量违规 %d 条: %s",
+                                 len(bad), "; ".join(str(x) for x in bad[:3]))
+        except Exception:  # noqa: BLE001
+            try:
+                observation.accounting_errors += 1
+            except Exception:  # noqa: BLE001
+                pass
         # 本轮所有告警一次性交给通知器；由通知器自己决定逐条还是聚合
         self._dispatch_many(fresh)
 

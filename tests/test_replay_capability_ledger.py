@@ -133,11 +133,15 @@ def test_replay_alerts_carry_signal_id_matching_real_counts():
         else:
             untagged += 1
 
-    # IT-P1-DELIVERY-LEDGER-002 的**核心验收**：交付账本必须覆盖**每一条**
-    # 真实告警，而不只是那两条碰巧维护了可评估性账本的规则。
-    assert sum(tagged.values()) == delivery_total == len(rows), (
-        f"交付账本 committed={delivery_total} 与真实告警 {len(rows)} 不符"
-        f"（tagged={tagged}）")
+    # IT-P1-ACCEPTANCE-GATE-RINGBUFFER-001：**不能用 len(recent_alerts()) 当
+    # 累计分母** —— Store 是 ``deque(maxlen=300)``，告警超过 300 条时
+    # recent_alerts 最多只能返回 300，这个断言会**假红**。
+    # 正确分母是 ``store.alerts_total()``（真正的独立累计值）。
+    total_committed = store.alerts_total()
+    assert sum(tagged.values()) == delivery_total == total_committed, (
+        f"交付账本 committed={delivery_total} 与真实累计告警 {total_committed} 不符"
+        f"（tagged={tagged}；ring buffer 只回了 {len(rows)} 条，"
+        f"maxlen=300 时不代表累计）")
     # 全局门禁：第一方告警不许有缺 signal_id 的 committed 条目。
     # （本轮之前这里是 `untagged > 0`，即把"60/66 不可对账"当**预期行为** —
     #  那正是 IT-P1-DELIVERY-LEDGER-002 描述的 9.1% 覆盖率缺口，已修。）
@@ -145,6 +149,14 @@ def test_replay_alerts_carry_signal_id_matching_real_counts():
         f"仍有 {untagged} 条告警缺 signal_id，交付无法对账（门禁要求 0）")
     assert all(r.get("signal_id") is not None for r in rows), (
         "signal_id 字段必须存在（空串表示不参与账本），不能缺键")
+    # 本轮新增：账本自洽性（IT-P1-DELIVERY-FALSE-GREEN-001）。
+    # 光看 gate==0 不够 —— 分母被吞时它也会是 0。
+    last_acct = None
+    for obs in captured:
+        last_acct = obs.get("delivery_accounting") or last_acct
+    assert last_acct is not None, "必须导出 delivery_accounting"
+    assert last_acct.get("accounting_status") in ("ok", "not_measured"), (
+        f"账本记账不自洽：{last_acct.get('accounting_problems')}")
     # 覆盖必须真的比可评估性账本宽 —— 否则说明两者没有解耦
     dl_signals = {s for obs in captured for s in (obs.get("signal_delivery") or {})}
     ev_signals = {s for obs in captured

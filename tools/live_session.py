@@ -135,6 +135,10 @@ _OBSERVATION_MARKER_KEYS: tuple[str, ...] = (
     "unknown_missing", "rejected_quality", "unavailable_capability",
     "observation_fields", "capabilities", "unavailable_by_reason",
     "signal_evaluability",
+    # IT-P1-SOAK-LEDGER-BLIND-001：新交付账本必须也在这里，否则 soak 对它
+    # 完全盲 —— 白名单只到 signal_evaluability 时，汇总仍从旧的 eval 账本
+    # 累加 ev_committed，而那个数只覆盖 2/7 规则（9.1% 覆盖率）。
+    "signal_delivery", "delivery_accounting",
 )
 
 #: 可观测性字段在轮样本里的"采集标记"：只有真的可测的字段才写进去。
@@ -145,6 +149,9 @@ _OBSERVATION_VALUE_FIELDS: tuple[str, ...] = (
     "future_rejected", "stale_rejected", "out_of_order_rejected",
     "unknown_missing", "rejected_quality", "unavailable_capability",
     "capabilities", "unavailable_by_reason", "signal_evaluability",
+    # IT-P1-SOAK-LEDGER-BLIND-001：同上，交付账本必须进入 value 白名单，
+    # 否则 ``make_round_sample`` 的 slim 视图会把它整段丢掉。
+    "signal_delivery", "delivery_accounting",
 )
 #: 股票池规模允许的膨胀倍数（首末对比）。留足余量：新股上市、股票池 TTL 到期后
 #: 从"自选股降级"恢复到全市场，都会让这个数字变大，那不是内存泄漏。
@@ -291,6 +298,29 @@ def make_round_sample(
                         row[k] = _safe_int(cell.get(k))
                 slim[str(sig)] = row
             out["signal_evaluability"] = slim
+        # --- IT-P1-SOAK-LEDGER-BLIND-001：新交付账本必须进 slim -------------
+        # 旧白名单只到 signal_evaluability，于是 soak 汇总仍从 eval 账本累加
+        # ev_committed —— 那个数只覆盖 2/7 规则（9.1% 覆盖率），
+        # 新交付账本（8/8）反而看不见。这里如实带出来。
+        sig_dl = obs.get("signal_delivery")
+        if isinstance(sig_dl, dict) and sig_dl:
+            dlslim: dict[str, dict] = {}
+            for sig, cell in sig_dl.items():
+                if not isinstance(cell, dict):
+                    continue
+                dlslim[str(sig)] = {
+                    "rule_selected": _safe_int(cell.get("rule_selected")),
+                    "global_ignored": _safe_int(cell.get("global_ignored")),
+                    "bus_accepted": _safe_int(cell.get("bus_accepted")),
+                    "committed": _safe_int(cell.get("committed")),
+                    "dropped_by_bus": _safe_int(cell.get("dropped_by_bus")),
+                }
+            out["signal_delivery"] = dlslim
+        # delivery_accounting 是**逐轮**口径（含 _scope），整体带出。
+        # 只带标量/列表，避免无界载荷。
+        acct = obs.get("delivery_accounting")
+        if isinstance(acct, dict) and acct:
+            out["delivery_accounting"] = dict(acct)
         caps = obs.get("capabilities")
         out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
         # IT-P1-OBS-007：把"哪只票缺什么"带出 Store
@@ -430,6 +460,26 @@ def summarize_rounds(rounds: Sequence[dict], *,
     ev_blocked_by_reason: dict[str, int] = {}    # reason -> 次数（跨 signal 汇总）
     ev_rounds = 0                                # 真的带了 signal_evaluability 的轮数
 
+    # --- IT-P1-SOAK-LEDGER-BLIND-001：**新**交付账本的会话累计 -------------
+    # 为什么必须有这一层：``signal_evaluability`` 只覆盖 2/7 规则（9.1%），
+    # 而新的 ``signal_delivery`` sidecar 覆盖全部带 signal_id 的告警。
+    # 若 soak 只累加旧账本，会得出"系统只交付了 6 条"的**错误**结论 ——
+    # 实际交付 66 条。两个账本都要留，且必须**分别命名**，不能混成一个数。
+    dl_selected: dict[str, int] = {}             # signal -> rule_selected
+    dl_ignored: dict[str, int] = {}              # signal -> global_ignored
+    dl_bus: dict[str, int] = {}                  # signal -> bus_accepted
+    dl_committed: dict[str, int] = {}            # signal -> committed
+    dl_rounds = 0                                # 带了 signal_delivery 的轮数
+    # 全局门禁的会话累计：真实 committed 总数 vs 带 signal_id 的数。
+    # 用**求和**而不是"取最后一轮"：逐轮口径在末轮无告警时会自然归零
+    # （IT-P1-DELIVERY-GATE-PEROUND-001），会话级必须独立累加。
+    dl_acct_total = 0                            # Σ committed_alerts_total
+    dl_acct_named = 0                            # Σ committed_with_signal_id
+    dl_acct_errors = 0                            # Σ accounting_errors
+    acct_status_bad_rounds: list[int] = []       # accounting_status 不自洽的轮号
+    acct_status_seen: dict[str, int] = {}        # status -> 出现轮数
+    delivery_present_rounds = 0                  # delivery_accounting 出现的轮数
+
     for pos, r in enumerate(rows):
         present = _round_observation_fields(r)
         if not present:
@@ -551,6 +601,48 @@ def summarize_rounds(rounds: Sequence[dict], *,
                         ev_blocked_by_reason[k] = (
                             ev_blocked_by_reason.get(k, 0) + _safe_int(rv))
 
+        # ---- IT-P1-SOAK-LEDGER-BLIND-001：新交付账本累计 -------------------
+        # 与上面 eval 账本**分开**累加，绝不合并成一个"committed" ——
+        # 两者覆盖的规则集合不同（eval 2/7，delivery 8/8），合并会让
+        # "交付了多少"这个数既不是这个也不是那个。
+        dl = r.get("signal_delivery")
+        if isinstance(dl, dict) and dl:
+            dl_rounds += 1
+            for sig, cell in dl.items():
+                if not isinstance(cell, dict):
+                    continue
+                s_key = str(sig)
+                sel = _safe_int(cell.get("rule_selected"))
+                ign = _safe_int(cell.get("global_ignored"))
+                bus = _safe_int(cell.get("bus_accepted"))
+                cmt = _safe_int(cell.get("committed"))
+                # 只接受自洽单元：bus <= sel - ign 且 cmt <= bus。
+                # 不自洽说明写入方坏了 —— 宁可丢弃也不把坏数带进判定。
+                if sel < 0 or ign < 0 or bus < 0 or cmt < 0:
+                    continue
+                if bus > sel - ign or cmt > bus:
+                    continue
+                dl_selected[s_key] = dl_selected.get(s_key, 0) + sel
+                dl_ignored[s_key] = dl_ignored.get(s_key, 0) + ign
+                dl_bus[s_key] = dl_bus.get(s_key, 0) + bus
+                dl_committed[s_key] = dl_committed.get(s_key, 0) + cmt
+
+        # ---- IT-P1-DELIVERY-FALSE-GREEN-001：记账自洽性跨轮检查 -----------
+        # 门禁 ``first_party_committed_without_signal_id == 0`` **不足以**
+        # 证明账本健康（分母被吞时它也是 0）。这里把 status 单独统计，
+        # 只要有一轮 inconsistent，soak 就必须报出来，不能只看门禁。
+        acct = r.get("delivery_accounting")
+        if isinstance(acct, dict) and acct:
+            delivery_present_rounds += 1
+            dl_acct_total += _safe_int(acct.get("committed_alerts_total"))
+            dl_acct_named += _safe_int(acct.get("committed_with_signal_id"))
+            dl_acct_errors += _safe_int(acct.get("accounting_errors"))
+            status = str(acct.get("accounting_status") or "")
+            if status:
+                acct_status_seen[status] = acct_status_seen.get(status, 0) + 1
+            if status == "inconsistent":
+                acct_status_bad_rounds.append(_row_index(r, pos))
+
     # ---- 最差 N 轮：按 coverage 升序（同分保持轮号稳定），只收有效 coverage --
     ranked.sort(key=lambda t: (t[0], t[1]))
     worst: list[dict] = []
@@ -665,6 +757,59 @@ def summarize_rounds(rounds: Sequence[dict], *,
             max(ev_selected.get(s, 0) - ev_bus.get(s, 0), 0)
             for s in ev_selected),
         "evaluability_blocked_by_reason": ev_blocked_by_reason,
+        # --- IT-P1-SOAK-LEDGER-BLIND-001：**新交付账本**的会话累计 ---------
+        # 与上面的 evaluability 分开命名、分开统计。为什么不能合并：
+        # eval 账本只覆盖 2/7 规则（9.1%），delivery 覆盖 8/8（100%）。
+        # 合并会让"交付了多少"既不是 6 也不是 66，而是一个无意义的中间数。
+        #
+        # ⚠ 命名纪律（IT-P1-DELIVERY-GATE-PEROUND-001）：
+        # ``delivery_accounting`` 是**逐轮**口径；这里是**会话累计**。
+        # 消费方必须看清后缀，不要拿逐轮值当累计值。
+        "signal_delivery": {
+            sig: {
+                "rule_selected": dl_selected.get(sig, 0),
+                "global_ignored": dl_ignored.get(sig, 0),
+                "bus_accepted": dl_bus.get(sig, 0),
+                "committed": dl_committed.get(sig, 0),
+                "dropped_by_bus": max(
+                    dl_selected.get(sig, 0) - dl_ignored.get(sig, 0)
+                    - dl_bus.get(sig, 0), 0),
+                "committed_ratio": (
+                    round(dl_committed.get(sig, 0) / dl_selected[sig], 6)
+                    if dl_selected.get(sig, 0) > 0 else None),
+            }
+            for sig in sorted(dl_selected)
+        },
+        "signal_delivery_rounds": dl_rounds,
+        "delivery_rule_selected_total": sum(dl_selected.values()),
+        "delivery_global_ignored_total": sum(dl_ignored.values()),
+        "delivery_bus_accepted_total": sum(dl_bus.values()),
+        # 会话级**真实**交付总数（新账本口径）。这是回答"用户收到多少条"的
+        # 正确分母，也是 T+5/T+30 标签该引用的集合。
+        "delivery_committed_total": sum(dl_committed.values()),
+        "delivery_committed_signals": sum(1 for v in dl_committed.values() if v > 0),
+        "delivery_dropped_by_bus_total": sum(
+            max(dl_selected.get(s, 0) - dl_ignored.get(s, 0) - dl_bus.get(s, 0), 0)
+            for s in dl_selected),
+        # 全局门禁的会话累计（独立于上面 sidecar 之和 —— 分母由 Engine 数）。
+        "delivery_accounting_session": {
+            "committed_alerts_total": dl_acct_total,
+            "committed_with_signal_id": dl_acct_named,
+            "signed_ratio": (
+                round(dl_acct_named / dl_acct_total, 6)
+                if dl_acct_total > 0 else None),
+            "unsigned_total": max(dl_acct_total - dl_acct_named, 0),
+            # IT-P1-DELIVERY-FALSE-GREEN-001：门禁为 0 **不足以**证明健康。
+            "accounting_errors": dl_acct_errors,
+            "accounting_status_seen": acct_status_seen,
+            "inconsistent_rounds": acct_status_bad_rounds,
+            "delivery_accounting_rounds": delivery_present_rounds,
+            # 只要有一轮不自洽（或吞过异常），整体就不是 ok。
+            "accounting_status": (
+                "inconsistent"
+                if (acct_status_bad_rounds or dl_acct_errors > 0)
+                else ("ok" if dl_acct_total > 0 else "not_measured")),
+        },
         "worst_rounds": worst,
     }
 
@@ -773,7 +918,33 @@ def empty_metrics() -> dict:
         "evaluability_advisory_total": 0,
         "evaluability_hit_candidates_total": 0,
         "evaluability_published_total": 0,
+        # IT-P1-EVAL-PUBLISH-001：交付三级总量也必须在这里出现，
+        # 否则"空视图"与"正常视图"的 schema 不一致，消费方要写两套取值逻辑。
+        "evaluability_rule_selected_total": 0,
+        "evaluability_bus_accepted_total": 0,
+        "evaluability_committed_total": 0,
+        "evaluability_dropped_by_bus_total": 0,
         "evaluability_blocked_by_reason": {},
+        # IT-P1-SOAK-LEDGER-BLIND-001：新交付账本的空视图（与正常视图同 schema）。
+        "signal_delivery": {},
+        "signal_delivery_rounds": 0,
+        "delivery_rule_selected_total": 0,
+        "delivery_global_ignored_total": 0,
+        "delivery_bus_accepted_total": 0,
+        "delivery_committed_total": 0,
+        "delivery_committed_signals": 0,
+        "delivery_dropped_by_bus_total": 0,
+        "delivery_accounting_session": {
+            "committed_alerts_total": 0,
+            "committed_with_signal_id": 0,
+            "signed_ratio": None,
+            "unsigned_total": 0,
+            "accounting_errors": 0,
+            "accounting_status_seen": {},
+            "inconsistent_rounds": [],
+            "delivery_accounting_rounds": 0,
+            "accounting_status": "not_measured",
+        },
         "worst_rounds": [],
         "memory": {"bounded": True, "reason": "（未采样）"},
         "api": {"requests": 0, "non_200": 0, "malformed": 0, "unreachable": 0, "by_route": {}},

@@ -281,6 +281,13 @@ def feed_item_of(raw: Any) -> dict | None:
             detail=str(raw.get("detail") or ""),
             severity=coerce_int(raw.get("severity"), 2),
             metrics=raw.get("metrics") if isinstance(raw.get("metrics"), dict) else {},
+            # IT-P1-WEB-SIGNAL-ID-LOSS-001：**必须**把 signal_id 带过去。
+            # ``Alert.to_dict()`` 会导出它，这里重建时若丢掉，
+            # 则任何走"落盘 -> 重建 -> 再导出"的路径（SSE 重放、快照恢复、
+            # 前端二次处理）都会把交付账本的身份抹掉 —— 表现为这些告警
+            # 在账本里"缺 signal_id"，从而被全局门禁判为不合规。
+            # 这是**信息在往返中丢失**，不是规则没填。
+            signal_id=str(raw.get("signal_id") or ""),
         )
         return spirit_mod.to_feed_item(alert)
     except Exception as exc:                         # noqa: BLE001 —— 单条坏数据只丢它自己

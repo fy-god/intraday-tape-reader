@@ -57,6 +57,24 @@ _BLOCKED_SAMPLE_CAP = 20
 #: 所以它必须是 0，而不是"越低越好"。
 FIRST_PARTY_UNSIGNED_GATE_REASON = "first_party_committed_without_signal_id"
 
+#: 交付账本自身的**记账自洽性**状态（IT-P1-DELIVERY-FALSE-GREEN-001）。
+#:
+#: 为什么需要它：只看 ``first_party_committed_without_signal_id == 0``
+#: **不足以**证明账本健康 —— 该门禁用 ``max(total - named, 0)`` 算，
+#: 会把**负差夹成 0**。于是下面两种"账本已经坏了"的情形都会显示 PASS：
+#:
+#: * 分母自增被异常吞掉：``total=0`` 而 ``named=66`` -> 门禁 0（假绿）
+#: * 分母少算：``total=1`` 而 ``named=3`` -> ``ratio=3.0``（逻辑不可能）仍 PASS
+#:
+#: 正确合同是**显式检查**而不是继续 clamp::
+#:
+#:     0 <= named <= total   且   accounting_errors == 0
+#:
+#: 违反即 ``accounting_status = inconsistent``（**不是** PASS）。
+ACCOUNTING_OK = "ok"
+ACCOUNTING_NOT_MEASURED = "not_measured"
+ACCOUNTING_INCONSISTENT = "inconsistent"
+
 # 参与 capability 判定的字段名。顺序即展示顺序。
 CAPABILITY_KEYS: tuple[str, ...] = (
     "turnover",
@@ -564,6 +582,15 @@ class RoundObservationSet:
     #: 账本只统计带 ``signal_id`` 的告警。用账本之和当分母会让覆盖率
     #: 恒等于 1.0（分子分母同源），那正是本缺陷能藏这么久的原因。
     committed_alerts_total: int = 0
+    #: 交付账本更新过程中被吞掉的异常次数（IT-P1-DELIVERY-FALSE-GREEN-001）。
+    #:
+    #: 为什么必须单独计数：旧代码里分母自增包在
+    #: ``try: ... except Exception: pass`` 中 —— 一旦抛异常，分母**静默不涨**，
+    #: 而门禁 ``max(total - named, 0)`` 会把负差夹成 0，
+    #: 于是"账本已经坏了"被读成 PASS（实测 total=0/named=66 -> 门禁 0）。
+    #: 吞异常本身**可以**保留（可观测性不能打断告警主链路），
+    #: 但**必须留下痕迹**，否则就是假绿。
+    accounting_errors: int = 0
 
     # ------------------------------------------------------------------
     # WP01 记账 API（有界：只存计数 + 少量样本）
@@ -715,17 +742,92 @@ class RoundObservationSet:
             out.extend(st.check_invariants())
         return out
 
+    def _delivery_accounting_dict(self) -> dict[str, Any]:
+        """交付账本的对外视图（含自洽性判定）。
+
+        ``first_party_committed_without_signal_id`` 仍保留（消费方已在用），
+        但它**单独不足以判定健康** —— 必须同时看 ``accounting_status``。
+        门禁值用 ``max(..., 0)`` 是历史兼容行为；负差的情形由
+        ``accounting_status=inconsistent`` 明确报出，不再被悄悄夹掉。
+        """
+        named = sum(st.committed for st in self.delivery_stats.values())
+        total = self.committed_alerts_total
+        cov = self.delivery_accounting_coverage()
+        return {
+            # ⚠ IT-P1-DELIVERY-GATE-PEROUND-001：下面这些数是**本轮**（逐轮）
+            # 口径，因为 RoundObservationSet 是逐轮对象，Store 每轮用新的
+            # as_dict() 覆盖最近 observation。会话末尾若末轮无告警，
+            # /api/status 上会看到 committed_alerts_total=0 / signed_ratio=None
+            # —— 那是**正确的 not_measured**，不是"账本坏了"。
+            # 读取方必须用 `_scope` 判断口径，不要把它当会话累计值。
+            "_scope": "last_round",
+            "_scope_note": (
+                "逐轮口径。会话累计请读 delivery_session（由 live_session/"
+                "Store 维护），或对逐轮值跨轮求和。"),
+            "committed_alerts_total": total,
+            "committed_with_signal_id": named,
+            "signed_ratio": None if cov is None else round(cov, 4),
+            FIRST_PARTY_UNSIGNED_GATE_REASON: max(total - named, 0),
+            # --- IT-P1-DELIVERY-FALSE-GREEN-001 ---------------------------
+            "accounting_status": self.delivery_accounting_status(),
+            "accounting_errors": self.accounting_errors,
+            "accounting_problems": self.check_delivery_accounting(),
+        }
+
     def delivery_accounting_coverage(self) -> float | None:
         """``带 signal_id 的真实 committed / 全部 committed``（**全局门禁**）。
 
         见 :data:`FIRST_PARTY_UNSIGNED_GATE_REASON`。没有 committed 时返回
         ``None``（not_measured），**不是** 1.0 —— 空集合不该被读成"100% 合规"。
+
+        ⚠ **不要**只用这个值判定账本健康：当分母被少算时它会 > 1.0
+        （逻辑不可能），必须配合 :meth:`delivery_accounting_status`。
         """
         named = sum(st.committed for st in self.delivery_stats.values())
         total = self.committed_alerts_total
         if total <= 0:
             return None
         return named / total
+
+    def delivery_accounting_status(self) -> str:
+        """交付账本的自洽性判定（IT-P1-DELIVERY-FALSE-GREEN-001）。
+
+        返回 :data:`ACCOUNTING_OK` / :data:`ACCOUNTING_NOT_MEASURED` /
+        :data:`ACCOUNTING_INCONSISTENT` 之一。
+
+        判据（**显式检查，不 clamp**）::
+
+            accounting_errors == 0
+            0 <= named <= total（total 为 0 时要求 named 也为 0）
+
+        为什么不能只看"门禁为 0"：门禁用 ``max(total - named, 0)``，
+        负差被夹成 0，于是"分母被吞掉"（total=0/named=66）会显示 PASS。
+        这是**假绿**，比假红危险得多 —— 假红会有人来查，假绿不会。
+        """
+        named = sum(st.committed for st in self.delivery_stats.values())
+        total = self.committed_alerts_total
+        if self.accounting_errors > 0:
+            return ACCOUNTING_INCONSISTENT
+        if total == 0 and named == 0:
+            return ACCOUNTING_NOT_MEASURED
+        if named > total:
+            # 分母比分子还小 —— 只能是分母少算或被吞，逻辑上不可能。
+            return ACCOUNTING_INCONSISTENT
+        return ACCOUNTING_OK
+
+    def check_delivery_accounting(self) -> list[str]:
+        """返回记账不自洽的具体原因（空 = 自洽）。"""
+        bad: list[str] = []
+        named = sum(st.committed for st in self.delivery_stats.values())
+        total = self.committed_alerts_total
+        if self.accounting_errors > 0:
+            bad.append(
+                f"账本更新吞掉 {self.accounting_errors} 次异常 —— 分母可能少算")
+        if named > total:
+            bad.append(
+                f"named_committed({named}) > committed_alerts_total({total}) —— "
+                f"分母被少算或自增被吞（ratio 会 >1.0，逻辑不可能）")
+        return bad
 
     def check_signal_invariants(self) -> list[str]:
         """全部 signal 的机械不变量自检，返回违规列表（空 = 全成立）。"""
@@ -821,17 +923,11 @@ class RoundObservationSet:
             # 全局门禁：真实 committed 总数、带 signal_id 的数、以及覆盖率。
             # ⚠ 分母 ``committed_alerts_total`` 由 Engine 独立数，**不是**
             # 账本 committed 之和 —— 否则分子分母同源，覆盖率恒 1.0。
-            "delivery_accounting": {
-                "committed_alerts_total": self.committed_alerts_total,
-                "committed_with_signal_id": sum(
-                    v.committed for v in self.delivery_stats.values()),
-                "signed_ratio": (
-                    None if self.delivery_accounting_coverage() is None
-                    else round(self.delivery_accounting_coverage(), 4)),
-                FIRST_PARTY_UNSIGNED_GATE_REASON: max(
-                    self.committed_alerts_total
-                    - sum(v.committed for v in self.delivery_stats.values()), 0),
-            },
+            #
+            # IT-P1-DELIVERY-FALSE-GREEN-001：光有 gate=0 **证明不了**账本健康。
+            # 这里额外给出 ``accounting_status`` 与 ``accounting_problems``，
+            # 让"账本坏了但门禁仍是 0"（分母被吞 / 少算）无法再冒充 PASS。
+            "delivery_accounting": self._delivery_accounting_dict(),
             "_deprecated": {
                 "unavailable_capability":
                     "IT-P1-CAPABILITY-003：这是所有规则写入的 code 并集大小，"
