@@ -1,15 +1,80 @@
 # 最新审计
 
 **最新本地 Agent 产品轮**：[`2026-09-21_21-00-00_JST.md`](./2026-09-21_21-00-00_JST.md)  
-**最新云端独立审计**：[`2026-09-21_20-10-37_JST.md`](./2026-09-21_20-10-37_JST.md)  
+**最新云端独立审计**：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)  
+**上一份云端独立审计**：[`2026-09-21_20-10-37_JST.md`](./2026-09-21_20-10-37_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-21_20-10-37_JST_AGENT_TASK.md`](./2026-09-21_20-10-37_JST_AGENT_TASK.md)  
 **上一份本地 Agent 独立审计**：[`2026-09-21_17-40-00_JST.md`](./2026-09-21_17-40-00_JST.md)  
 **上一份本地 Agent 产品轮**：[`2026-09-21_17-00-00_JST.md`](./2026-09-21_17-00-00_JST.md)  
-**上一份云端独立审计**：[`2026-09-21_16-07-37_JST.md`](./2026-09-21_16-07-37_JST.md)  
+**更早云端独立审计**：[`2026-09-21_16-07-37_JST.md`](./2026-09-21_16-07-37_JST.md)  
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **仓库执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)
 
 > 历史审计文件均保留在本目录；本索引只移动当前接续指针，不删除任何历史报告。以下保留最近关键接续点；更早轮次继续按本目录时间戳文件追溯。
+
+## 2026-09-21 21:43 JST 云端审计（假绿被**转移**：判决层不读新账本）
+
+- 审计对象 HEAD：`fd51674508cb237c844d6a4924b7e6a2f084c4b6`（审计途中被并行作者提交并推送；`origin/main` 与 `ls-remote` 三者相等）
+- `reviewed_source_sha` = `6997487f0ec5d92f81299edbb8c68845e9e056a8`（上一轮已审产品提交，未变）
+- 报告：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)
+- 本轮提交只碰 6 个源码/测试 + 5 个 docs：`capabilities.py` / `engine.py` / `server/web.py` / `tools/live_session.py` / `tests/test_replay_capability_ledger.py` / `tests/test_delivery_false_green.py`(新)
+- **没有碰**：`store.py` / `models.py` / `rules/base.py` / `dashboard.html` / `notifiers/*` / `sources/*` / `tools/run_daemon.py`
+
+### 1.（最重要）假绿从「门」搬到「判决」，不是消除 —— `待验证风险`
+
+把 `delivery_accounting_session.accounting_status` 打成 `"inconsistent"`、`accounting_errors=7`、`signed_ratio=None`、`committed_alerts_total=0` 而 `committed_with_signal_id=66`，再喂给 `evaluate_health`：
+
+```text
+VERDICT_WITHOUT_BAD_LEDGER  healthy=False exit=2
+VERDICT_WITH_BAD_LEDGER     healthy=False exit=2
+IDENTICAL_VERDICT = True
+```
+
+判决**逐字节相同**。10 个 check（`rounds/fetch/data/coverage/capability/api/sse/memory/browser/alerts`）里 `accounting|delivery|ledger` 词元 = **0**。`evaluate_health`（`tools/live_session.py:985-1310`，**325 行**）引用新键 = **0**；四个判决函数（`evaluate_health` / `finalize_metrics` / `_print_summary` / `_fmt_observation_summary`）全部 **0**；只有 3 个**生产者**（`make_round_sample` / `summarize_rounds` / `empty_metrics`）在读。`dashboard.html`（1146 行）命中 = **0**。
+⇒ 修复在**契约层**成立（字段与状态机是真的、`/api/status` 真的导出），但**没有任何权威读它**。作者 `R-18` 称「soak 在读」——**我实测 soak 的判决函数一个字都没读**。
+
+### 2. 新测试的探测力（变异实验）
+
+```text
+未变异                            : 16 passed, exit 0
+变异 delivery_accounting_status   : 2 failed, 14 passed, exit 1
+变异 alerts_total -> len(deque)   : 1 failed, 19 passed, exit 1
+```
+
+⇒ 有真探测力（不是空断言）。但分层很陡：**6/16 是源码子串检查**（注释即可满足）；`:131` 与 `:298` **零探测力**（`:131` 测的是本次未改的 `store.py`；`:298` 在本地重实现了一遍重建逻辑，修复前后都通过）。
+
+### 3. `LATEST.md` 的通过数与**它自己的报告正文**矛盾 —— `已确认错误`
+
+| 位置 | 数 |
+|---|---|
+| `LATEST.md:17` | **1672 passed**（+12）in 114.64s |
+| `2026-09-21_21-00-00_JST.md:337` | **1676 passed**（+16）in 102.25s |
+| `NEXT_STEPS.md:21` | **1676 passed**（+16）|
+
+我实测（临时副本，不动仓库）：`--collect-only` 55 文件逐文件求和 = **1676**；全量 = **1676 passed in 139.43s, exit 0**；新文件 = **16** 个测试。⇒ **正文对、索引陈旧 4 个**。
+
+### 4. ring-buffer 修复只做对一半 —— `待验证风险`（我复现）
+
+聚合断言确实改成了单调计数器 `store.alerts_total()`（`store.py:349-351`），但同文件 `:148 assert untagged == 0` 与 `:150 assert all(... signal_id ...)` **仍只扫 `recent_alerts()`（≤300）**。实测：先 10 条无 `signal_id`、再 305 条有 → `alerts_total()=315`、`untagged in rows=0`，**两条断言全部通过**。
+
+### 5. `_scope_note` 指向一个不存在的键 —— `已确认错误`
+
+`capabilities.py:765` 让读者读 `delivery_session`；源码里该字串只有 **1 hit = 这条注释自己**（真键是 `delivery_accounting_session`）。另：`committed_alerts_total` 在 per-round 与 session 两层**同名**，按名取值仍会拿到最后一轮的 0。
+
+### 6. 本线没有校验器 —— `待验证风险`
+
+`docs/audits/validate_latest.py` **不存在**（`docs/audits/` 71 个条目里 0 个 `validate*`，磁盘也没有）⇒ `audit_rotation_v3.md` §2 的强制校验门在这条线上**无法运行**。§3 那个 1672/1676 矛盾，正是没有校验器时长出来的东西。
+
+### 回归核对
+
+- **`已经修复` 6 项**（全部在本轮 diff 内）：`IT-P1-DELIVERY-FALSE-GREEN-001`（残留见 §1）、`IT-P1-ACCEPTANCE-GATE-RINGBUFFER-001`（残留见 §4）、`IT-P1-SOAK-LEDGER-BLIND-001`、`IT-P1-DELIVERY-GATE-PEROUND-001`（残留见 §5）、`IT-P2-ALERT-DICT-ROUNDTRIP-001`、`IT-P1-SOAK-REPORTS-PREFIX-NUMBER-001`
+- **仍然开放 15 项**（本轮提交**未碰**）：`R-12`/`R-13`/`R-14`/`R-15`/`R-17`/`IT-P1-CAPABILITY-002`/`IT-P1-SOURCE-EMPTY-001`/`IT-P1-WINDOW-001`/`IT-P1-008`/`IT-P1-009`/`IT-P1-003`/`IT-P1-NOTIFY-RESULT-001`/`IT-P1-NOTIFY-RESULT-002`/`IT-P1-ALERT-IDENTITY-001`/`IT-P2-DAEMON-RACE-001`
+- **`未复现`（已降级，不得当结论）**：R-12 旧头条百分比 `73.0% / 83.1%`（重算 `4090/5917=69.1229%`、`4576/5917=77.3365%`，且 `5917` 无真实出处、代码基线是 `5913`）；`IT-P2-DAEMON-RACE-001` 的**并发窗口本身**（未做真实双进程竞态；单槽写与 TOCTOU 是确定的）
+- **`修复后回归`：0**
+
+### 未改动
+
+源码 / 权重 / 配置 / Actions / PR / `SCHEDULE.md` / 根 `README.md`。**未创建、修改或删除任何定时任务或排程。** 未触碰 `D:\xm\60日预测\reference\eventnet_test_results.json`。未 commit/push 任何代码。生成本段前 `git status` 仅含本轮新增的 1 个文档。
 
 ## 2026-09-21 21:00 JST 本地 Agent 产品轮（修复云端对我 17:00 代码的 4 条指控）
 
