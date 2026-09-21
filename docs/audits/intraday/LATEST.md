@@ -1,11 +1,59 @@
 # 最新审计
 
+**最新云端独立审计**：[`2026-09-22_00-43-31_JST.md`](./2026-09-22_00-43-31_JST.md)  
 **最新本地 Agent 产品轮**：[`2026-09-22_01-00-00_JST.md`](./2026-09-22_01-00-00_JST.md)  
-**最新云端独立审计**：[`2026-09-22_00-08-36_JST.md`](./2026-09-22_00-08-36_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_00-08-36_JST_AGENT_TASK.md`](./2026-09-22_00-08-36_JST_AGENT_TASK.md)  
+**上一份云端独立审计**：[`2026-09-22_00-08-36_JST.md`](./2026-09-22_00-08-36_JST.md)  
 **上一份本地 Agent 产品轮**：[`2026-09-21_21-00-00_JST.md`](./2026-09-21_21-00-00_JST.md)  
-**上一份云端独立审计**：[`2026-09-21_21-56-56_JST.md`](./2026-09-21_21-56-56_JST.md)  
+**更早云端独立审计**：[`2026-09-21_21-56-56_JST.md`](./2026-09-21_21-56-56_JST.md)  
 **更早云端独立审计**：[`2026-09-21_21-43-27_JST.md`](./2026-09-21_21-43-27_JST.md)  
+## 2026-09-22 00:43:31 JST 云端独立审计：`e57bb3b` 三条修复全部成立，但同一 bug 类仍有存活实例
+
+- `reviewed_source_sha` = `e57bb3b87baacefd4e8abd908a5bc17877179ebf`（= 当时 HEAD，实际 `git rev-parse` 读出）；父提交 `eca980ec6f1c8c01d6857842f9b6f084ffb12e7d`
+- 待审范围 `fd516745..origin/main` 共 4 提交，**唯一含产品源码的是 `e57bb3b`**
+- 本轮真实命令：全量 `1694 passed in 109.69s`；新测试 18 passed；**新测试跑在父提交未打补丁源码上 = 7 failed / 11 passed（全 AssertionError，0 结构性，无 ImportError）**；`check_*.py` 8/8；`node dash_render_check.js` exit 0；`selftest 68/6 类型/8-8`
+
+### 三条修复独立复现（**[`2026-09-22_00-43-31_JST.md`](./2026-09-22_00-43-31_JST.md)** §2）
+
+| ID | 结论 | 关键实测 |
+|---|---|---|
+| `IT-H20-DELIVERY-ACCOUNTING-GATE-MISSING` | **已经修复**（真修，非空转） | 父提交注入坏账本 → 10 项**逐字节不变** `healthy=True/exit 0`；HEAD → 11 项、`healthy=False/exit 1/fail=['delivery_accounting']`。新测试在未打补丁源码上 **7 failed** ⇒ 检测力成立 |
+| `IT-P1-UNIVERSE-WATCHLIST-PIN-001` | **已经修复** | 降级后 `_codes_pinned` `True→False`；源恢复 + TTL 过期后 `refresh_universe` 调用 **0 → 1**，`_codes` 回到 3000。正当 pin（`--watch-only`/replay）未被破坏 |
+| `IT-P1-ALERT-TOTAL-KIND-TRUNCATION-001` | **核心已修 + 退化分支回归** | 450 条 `limit_up`：真值 450 / 旧口径 300 → 修复后 450。但 `status()` 抛异常时 NEW=**100** 而 OLD=300（§2.3） |
+
+### 🔴 本轮最高价值：同一 bug 类**仍有存活实例**（产品轮只修到第 2 个）
+
+| 位置 | 机制 | 影响 |
+|---|---|---|
+| `tools/live_session.py:1971` | `quotes=len(state.quotes)` —— `state.quotes` 是**从不裁剪**的累计缓存（唯一写入 `engine.py:302`；`prune() :417-446` **不清它**） | 实测 5 轮全断供后 `sample['quotes']` **恒为 5913**、`no_data_rounds=0`、`data` 项仍报"最多拿到 5913 只" ⇒ **两个断供探测器同时失效** |
+| `src/arad/store.py:359` | `set(list(self._acked)[-2000:])` —— `list(set)` 是**哈希序**，保留**任意** 2000 而非**最新** 2000 | 用户刚 ack 的告警仍留在 ring buffer 内却报 `acked=False`（看板 `dashboard.html:474` 变暗并隐藏 ack 按钮）。5 个哈希种子下全部失败；全仓**无测试**覆盖该阈值 |
+| `src/arad/store.py:304` | `"universe": len(quotes)` 同样用累计缓存 | 看板"股票池"芯片在扫描范围缩 30% 时**高报 1813** |
+
+### `R-21`（universe 无判决项）→ **已确认错误**，根因比原报告更精确，且**生产可达**
+
+- 根因不是"缺判决项"，而是 **`run()` 已在 `:2056-2058/:2064` 采到 `universe_size`/`fell_back`，并在 `:2174-2179` 装进 `setup` 传给 `finalize_metrics` —— 但 `evaluate_health` 从不读 `setup`**。即"**缺一个消费者，不缺生产者**"，无需新增采集/改引擎/联网。
+- **可达性（用真实 `Engine.refresh_universe`，未 monkeypatch 逻辑）**：`engine.py:968-969` 的守卫 `prev = len(self._codes_raw); if prev and n < prev` 在**会话首次刷新 `prev==0`** 时为假 ⇒ 冷启动 + `complete=False` 的 4100/5913 部分池**被采纳**（`_universe_meta` 如实记 `shortfall=1813` 却**零生产读者**）；热池 5913 时同一输入**被正确拒绝**。
+- **可落地补丁（scratch 验证，未写入仓库）**：加一个 `universe` 判决项，基准用**本会话自身观测上限** `quotes.max`（`DEFAULT_TOLERANCES` 里**没有** `min_universe`，故不发明绝对阈值）。5900→4100 判失败；边界 `0.70 x 5913 = 4139.1` 精确（4139 失败 / 4140 通过）；`universe_size=0` 视为未测得而跳过；无 `setup`/`setup` 非 dict 容错。**补丁后 34 passed（18+16）零回归。**
+- 阈值只能经 `evaluate_health(metrics, tolerances={...})` **参数**注入；写成 `metrics["tolerance"]` 会被**静默忽略**。
+
+### 新加判决块自身的两处残留缺陷（§2.4）
+
+- **D2（`修复后回归`，P2）**：`:1323 _dl_bad = _dl.get("inconsistent_rounds") or []` → `:1329 list(_dl_bad)[:5]`。走到失败分支且该值为真值标量（`int`/`float`/`bool`）时 `list()` 抛 `TypeError`。实测 **4 个用例 HEAD 崩溃而父提交 `healthy=True/exit 0`** ⇒ **对父提交的回归**，且违反该块自己 `:1310-1311` 写下的"不崩"契约。仓库自带脏输入用例只覆盖 `{}`/`None`/`str`，**独缺标量** ⇒ 18 条仍全绿。shipped producer 恒发 `list`，故仅手写/外部 metrics 触发。
+- **D1（`待验证风险`，P2，纵深防御）**：`:1326` 判据仅 `status=="inconsistent" or errors>0`；`:1324-1325` 的 `_dl_total`/`_dl_named` **只用于 detail 文案**，**从不复算 `named <= total`**。实测 `total=66/named=1000` 且 `status="ok"` ⇒ `healthy=True`。当前不可达（生产者 `capabilities.py:813-815` 确实显式判 `named > total`），但这是 §2.1 那条认识没有贯彻到底 —— 生产者 label 一旦退化，判决层会同时失效。
+
+### 其余复核
+
+- `R-22` `_scope_note` 死键：**成立**（唯一定义 `capabilities.py:764`，唯一读者是一个测试；且它指向的 `delivery_session` **全仓不存在**）。
+- `R-23` 无任何 CI：**成立**（228 tracked 文件；`.github/`、任何 CI yml、Jenkinsfile/Makefile/tox 均无）。`docs/audits/validate_latest.py` **不存在** ⇒ 手册步骤 5 为条件动作，本轮**不伪造 PASS**。
+- `R-12` `_universe_meta` 零出口：**成立**（写入 `engine.py:961/:980`，读取仅同模块 `:877` + 一个测试）。
+
+### 口径
+
+真实实股结果：**本轮没有新增实股结果**。全部证据为软件样本（合成夹具 + 真实代码路径）；`5913/4100` 是机制夹具，**不是**真实市场覆盖率测量。
+`程序修复` 与 `任务定义变更` 分开写在报告 §8；`真实模型增益：无`。
+
+---
+
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **仓库执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)
 
