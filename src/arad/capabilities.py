@@ -49,6 +49,14 @@ NOT_REQUIRED = "not_required"
 #: ``as_dict()`` 里每个 signal 最多导出多少条 blocked 样本（防止全市场载荷无界）。
 _BLOCKED_SAMPLE_CAP = 20
 
+#: 全局门禁：第一方告警里**不许有**缺 ``signal_id`` 的 committed 条目。
+#:
+#: IT-P1-DELIVERY-LEDGER-002 的验收条件。为什么它是"门禁"而不是"指标"：
+#: 缺 ``signal_id`` 的告警进不了交付账本 -> 无法回答"它到底有没有交付" ->
+#: T+5/T+30 标签无法引用它 -> **无法定量回答"报得准不准"**（用户的核心诉求）。
+#: 所以它必须是 0，而不是"越低越好"。
+FIRST_PARTY_UNSIGNED_GATE_REASON = "first_party_committed_without_signal_id"
+
 # 参与 capability 判定的字段名。顺序即展示顺序。
 CAPABILITY_KEYS: tuple[str, ...] = (
     "turnover",
@@ -360,6 +368,93 @@ class SignalEvalStats:
 
 
 @dataclass(slots=True)
+class SignalDeliveryStats:
+    """单条 signal 的**交付**账本 —— 与可评估性账本**彻底分家**。
+
+    IT-P1-DELIVERY-LEDGER-002（云端 2026-09-21 16:07 轮指认，我已独立复现）。
+
+    **为什么必须分家**：``SignalEvalStats`` 回答的是"这条 signal 的判据
+    有没有被逐 code 完整评估过"（``considered/evaluable/blocked/...``），
+    只有**真正实现了逐 code evaluability instrumentation** 的规则才写得出。
+    而交付账本回答的是完全不同的问题："规则选中的告警，有几条真的
+    过了 AlertBus、真的写进了 Store"。**后者对任何会发 Alert 的规则都成立**，
+    根本不需要该规则先做逐 code 统计。
+
+    此前两者被错误地绑在同一个 registry 上：``Engine._mark_stage`` 的门禁是
+    ``sig not in observation.signal_evals`` 就 return，于是**只有 2/7 个规则
+    模块**（``volume_burst`` / ``spirit_order``）能记交付，
+    真实回放 66 条 committed 告警里只有 6 条可对账 —— **覆盖率 9.1%**。
+    其余 60 条并非"被 AlertBus 丢弃"，而是"进了 Store 却从未被计数"。
+
+    **为什么不能靠给另外 5 条规则补 ``signal_id`` 解决**（已用真实代码证伪）：
+    补 ``signal_id`` 只是**必要**条件，那条 ``sig not in signal_evals`` 门禁
+    依然会拦下它们 —— ``signal_id`` 填了也照样 return，交付覆盖率纹丝不动。
+
+    **为什么也不能让 Engine 在交付阶段自动建 ``SignalEvalStats`` 行**：
+    那会造出 ``considered=0/evaluable=0/hit_candidates=0/rule_selected=0``
+    却 ``bus_accepted=1/committed=1`` 的幽灵行，直接违反可评估性不变量，
+    并把"没做逐 code 统计"**伪装成"0% 可评估"**。
+
+    所以这里给出独立 sidecar：Engine 对所有带稳定 ``signal_id`` 的告警
+    统一记账，**不再需要规则先维护 eval 行**。
+
+    机械不变量::
+
+        bus_accepted <= rule_selected - global_ignored
+        committed    <= bus_accepted
+    """
+
+    signal: str = ""
+    #: 规则返回的有效 Alert 条数。由 **Engine** 统一记，不靠每条规则自己写 ——
+    #: 规则自己写就会再次出现"某条规则忘了维护交付账本"。
+    rule_selected: int = 0
+    #: 被全局 ignore 规则（如 filters/黑白名单）拦下的条数。
+    global_ignored: int = 0
+    #: 通过 ``AlertBus.accept``（key 去重 + cooldown）的条数。
+    bus_accepted: int = 0
+    #: 真正写进 Store、会被看板/通知器看到的条数。
+    committed: int = 0
+
+    @property
+    def dropped_by_bus(self) -> int:
+        """规则选中了、却没过 AlertBus（去重/冷却）的条数。"""
+        return max(self.rule_selected - self.global_ignored
+                   - self.bus_accepted, 0)
+
+    @property
+    def committed_ratio(self) -> float | None:
+        """``committed / rule_selected``；没有选中时返回 ``None``（不返回 0）。"""
+        if self.rule_selected <= 0:
+            return None
+        return self.committed / self.rule_selected
+
+    def check_invariants(self) -> list[str]:
+        bad: list[str] = []
+        if self.bus_accepted > self.rule_selected - self.global_ignored:
+            bad.append(
+                f"{self.signal}: bus_accepted({self.bus_accepted}) > "
+                f"rule_selected({self.rule_selected}) - "
+                f"global_ignored({self.global_ignored})")
+        if self.committed > self.bus_accepted:
+            bad.append(
+                f"{self.signal}: committed({self.committed}) > "
+                f"bus_accepted({self.bus_accepted})")
+        return bad
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "signal": self.signal,
+            "rule_selected": self.rule_selected,
+            "global_ignored": self.global_ignored,
+            "bus_accepted": self.bus_accepted,
+            "committed": self.committed,
+            "dropped_by_bus": self.dropped_by_bus,
+            "committed_ratio": (None if self.committed_ratio is None
+                                else round(self.committed_ratio, 4)),
+        }
+
+
+@dataclass(slots=True)
 class RoundObservationSet:
     """一轮观测的完整账本（requested / returned / admitted / 各拒绝原因）。
 
@@ -435,6 +530,18 @@ class RoundObservationSet:
     #: ``spirit_order:institution_buy``），不是 rule 名也不是轮号 ——
     #: 只有到 signal 粒度才可能回答"这条规则到底有没有被验证过"。
     signal_evals: dict[str, SignalEvalStats] = field(default_factory=dict)
+    #: IT-P1-DELIVERY-LEDGER-002：逐 signal 的**交付**账本（独立 registry）。
+    #:
+    #: 与 ``signal_evals`` **必须分开**：
+    #: * ``signal_evals`` = 规则所有，回答"逐 code 判据是否被完整评估"，
+    #:   只有实现了 instrumentation 的规则才写；
+    #: * ``delivery_stats`` = **Engine 所有**，回答"选中的告警有没有真交付"，
+    #:   对任何会发 Alert 的规则都成立。
+    #:
+    #: 绑在一起时只有 2/7 规则能对账（覆盖率 9.1%）；分开后 7/7 闭合，
+    #: 且不会在 ``signal_evals`` 里造出会污染 ``evaluable_coverage`` 分母的
+    #: 幽灵行。
+    delivery_stats: dict[str, SignalDeliveryStats] = field(default_factory=dict)
     #: 逐 signal 的"已考虑" code 集合，用于**去重** counting。
     #:
     #: 为什么需要：``evaluate()`` 可能对同一 code 在一轮里被调用多次（多份
@@ -450,6 +557,13 @@ class RoundObservationSet:
     #: 该票就永远进不了 evaluable —— ``considered`` 与
     #: ``evaluable+blocked`` 的不变量随即破裂。
     _final_codes: dict[str, set[str]] = field(default_factory=dict)
+    #: 本 Engine 本轮**真正写进 Store 的第一方告警总数**（分母）。
+    #:
+    #: 为什么要 Engine 自己数：``delivery_accounting_coverage`` 的分母必须是
+    #: "真实 committed 总数"，而它**不等于**任何账本里的 committed 之和 ——
+    #: 账本只统计带 ``signal_id`` 的告警。用账本之和当分母会让覆盖率
+    #: 恒等于 1.0（分子分母同源），那正是本缺陷能藏这么久的原因。
+    committed_alerts_total: int = 0
 
     # ------------------------------------------------------------------
     # WP01 记账 API（有界：只存计数 + 少量样本）
@@ -560,6 +674,59 @@ class RoundObservationSet:
         st = self.eval_stats(signal)
         st.committed += 1
 
+    # ------------------------------------------------------------------
+    # IT-P1-DELIVERY-LEDGER-002：独立交付账本（Engine 所有）
+    # ------------------------------------------------------------------
+    def delivery_stats_for(self, signal: str) -> SignalDeliveryStats:
+        """取（必要时新建）某 signal 的**交付**账本。
+
+        与 :meth:`eval_stats` 的关键差别：这里新建条目**不会**污染
+        ``signal_evals``，因此 ``evaluable_coverage`` 的分母不受影响 ——
+        一个没做逐 code 统计的规则照样能记交付，而它的可评估性如实保持
+        ``not_measured``（``None``），不会被伪造成 "0% 可评估"。
+        """
+        key = str(signal or "")
+        st = self.delivery_stats.get(key)
+        if st is None:
+            st = SignalDeliveryStats(signal=key)
+            self.delivery_stats[key] = st
+        return st
+
+    def mark_delivery_selected(self, signal: str, code: str, n: int = 1) -> None:
+        """规则返回了一条有效 Alert（**Engine** 统一记，不靠规则自己写）。"""
+        self.delivery_stats_for(signal).rule_selected += int(n)
+
+    def mark_delivery_ignored(self, signal: str, code: str, n: int = 1) -> None:
+        """该告警被全局 ignore 规则拦下（没进 AlertBus）。"""
+        self.delivery_stats_for(signal).global_ignored += int(n)
+
+    def mark_delivery_bus_accepted(self, signal: str, code: str) -> None:
+        """该告警通过了 ``AlertBus.accept``。"""
+        self.delivery_stats_for(signal).bus_accepted += 1
+
+    def mark_delivery_committed(self, signal: str, code: str) -> None:
+        """该告警真正写进了 Store。"""
+        self.delivery_stats_for(signal).committed += 1
+
+    def check_delivery_invariants(self) -> list[str]:
+        """全部 signal 的交付不变量自检，返回违规列表（空 = 全成立）。"""
+        out: list[str] = []
+        for st in self.delivery_stats.values():
+            out.extend(st.check_invariants())
+        return out
+
+    def delivery_accounting_coverage(self) -> float | None:
+        """``带 signal_id 的真实 committed / 全部 committed``（**全局门禁**）。
+
+        见 :data:`FIRST_PARTY_UNSIGNED_GATE_REASON`。没有 committed 时返回
+        ``None``（not_measured），**不是** 1.0 —— 空集合不该被读成"100% 合规"。
+        """
+        named = sum(st.committed for st in self.delivery_stats.values())
+        total = self.committed_alerts_total
+        if total <= 0:
+            return None
+        return named / total
+
     def check_signal_invariants(self) -> list[str]:
         """全部 signal 的机械不变量自检，返回违规列表（空 = 全成立）。"""
         out: list[str] = []
@@ -643,6 +810,27 @@ class RoundObservationSet:
             # "这条 signal 到底被验证过没有"。这里给出真正的分母与分子。
             "signal_evaluability": {
                 k: v.as_dict() for k, v in sorted(self.signal_evals.items())
+            },
+            # --- IT-P1-DELIVERY-LEDGER-002：独立的交付账本 ----------------------
+            # 与 signal_evaluability **分开导出**，消费方不得再把两者混为一谈。
+            # 前者回答"判据有没有被逐 code 评估"，后者回答"选中的告警有没有
+            # 真交付"；只有 2/7 规则能做前者，但 7/7 都能做后者。
+            "signal_delivery": {
+                k: v.as_dict() for k, v in sorted(self.delivery_stats.items())
+            },
+            # 全局门禁：真实 committed 总数、带 signal_id 的数、以及覆盖率。
+            # ⚠ 分母 ``committed_alerts_total`` 由 Engine 独立数，**不是**
+            # 账本 committed 之和 —— 否则分子分母同源，覆盖率恒 1.0。
+            "delivery_accounting": {
+                "committed_alerts_total": self.committed_alerts_total,
+                "committed_with_signal_id": sum(
+                    v.committed for v in self.delivery_stats.values()),
+                "signed_ratio": (
+                    None if self.delivery_accounting_coverage() is None
+                    else round(self.delivery_accounting_coverage(), 4)),
+                FIRST_PARTY_UNSIGNED_GATE_REASON: max(
+                    self.committed_alerts_total
+                    - sum(v.committed for v in self.delivery_stats.values()), 0),
             },
             "_deprecated": {
                 "unavailable_capability":

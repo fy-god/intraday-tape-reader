@@ -1,31 +1,38 @@
-# NEXT_STEPS — 2026-09-21 13:00 JST
+# NEXT_STEPS — 2026-09-21 17:00 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> **✅ 13:00 轮：P0-A 与 A2 均已完成 —— P0-0 不再被阻塞。**
+> **✅ 17:00 轮：`IT-P1-DELIVERY-LEDGER-002` 已修复 —— 交付覆盖率 9.1% → 100%。**
+> 采纳云端 16:07 轮 v3 设计（evaluability 与 delivery **分账**）并端到端验证：
+> 真实 Engine + Replay + Store，361 轮 → 真实告警 **66/66 全部带 `signal_id`**
+> （此前 6/66），交付账本覆盖 **8 个 signal**（可评估性账本仍只有 1 个，
+> **未被污染**），门禁 `first_party_committed_without_signal_id` = **0**，
+> 逐轮交付不变量违规 **0**，`signed_ratio` = **1.0**。
+> 全量 **1660 passed**（+18）/ 8 gate 全绿 / selftest 68-6-8-8。
+> 回退验牙 **12 条行为级 RED / 0 结构性**。
+>
+> **⚠ 这只是"能开始测量"，不是"已经测出结果"** ——
+> 真实 Precision / Recall / 漏报率 / 收益仍为 `unavailable`。
+>
+> **✅ 13:00 轮：P0-A 与 A2 均已完成。**
 > * **P0-A**：`published` 已拆成 `rule_selected / bus_accepted / committed`。
->   机制反例端到端复现 **24× overcount**（真实 Engine + 真实 AlertBus），
->   验收断言 `rule_selected=24 / bus_accepted=1 / committed=1` **已达成**。
->   真实看板同链路对账：`Σhit=66 / Σsel=66 / Σbus=6 / Σcm=6`，
->   与真实带 `signal_id` 告警 **6 == 6 精确对账**，逐轮链违规 **0**。
+>   机制反例端到端复现 **24× overcount**（真实 Engine + 真实 AlertBus）。
 > * **A2**：ST 新规已推到回放链路（`IT-P1-ST-REPLAY-BYPASS-001` 修复），
 >   回放 2025-03-10 主板 ST 的 `limit_up_price` 由 **11.00 → 10.50**。
->   剩余差异见下方 A2。
-> * 本轮还连带修掉三处由**真实看板对账**暴露的既有缺陷
+> * 连带修掉三处由**真实看板对账**暴露的既有缺陷
 >   （`-R1` blocked 未跳过、`-R2` 换手率门槛漏记、`-R3` replay 能力缺失
 >   导致演练模式放量功能整类静默）。全量 **1642 passed** / 8 gate 全绿。
 >
-> **02:24 轮新增 P0（最高优先，因为它是"用户真正要的东西"）**：
-> 见下方第 0 条 —— 用**事后收益**给告警打标签，量化"报得准不准"。
-> 在此之前，所有修复都只回答"会不会报错"。
+> **用户真正要的东西（P0-0）**：用**事后收益**给告警打标签，
+> 量化"报得准不准"。在此之前，所有修复都只回答"会不会报错"。
 >
-> ⚠ **03:38 轮提出的阻塞（`IT-P1-EVAL-PUBLISH-001`）已在 13:00 轮解除**：
-> `published` 现在**语义正确**（= `rule_selected`），且真交付数
-> `committed` 独立记录。P0-0 的标签分母现在可以只用 `committed`，
-> 不会再系统性偏乐观。**但 `event_id` 仍未做**，见 P0-B。
+> ⚠ **两道阻塞均已解除**：`IT-P1-EVAL-PUBLISH-001`（13:00 修）与
+> `IT-P1-DELIVERY-LEDGER-002`（17:00 修）都已关闭。
+> P0-0 的标签分母现在既有**正确语义**（`committed`）又有 **100% 覆盖**。
+> **剩下的唯一结构卡点是 P0-B（股票池覆盖率），然后才是 P0-C（`event_id`）。**
 
-## P0-A — 告警交付阶段账本 ✅ **已完成（2026-09-21 13:00 JST）**
+## P0-A — 告警交付阶段账本 ✅ **已完成（13:00 + 17:00 两轮）**
 
 ### A. 把 `published` 拆成 `rule_selected / bus_accepted / committed` ✅
 - **完成情况**：
@@ -35,42 +42,62 @@
     `check_invariants()` 增加两条链式断言。
   * `engine.py`：新增 `_mark_stage(observation, alert, stage)`，
     在 `bus.accept()` **之后**记 `bus_accepted`、`store.add_alert()` **之后**记
-    `committed`；只为**本轮账本里已存在的 signal** 记账（不凭空建幽灵行）。
+    `committed`。
   * `models.py`：`Alert.signal_id`（**由规则填**，不靠 title 猜）。
   * `tools/live_session.py`：逐 signal slim + 全场三级总量；
     旧轮样本缺新键时**退回 `published`**，不退回 0。
-- **验收（已达成）**：`tests/test_alert_delivery_stages.py` 20 条，
-  其中 `test_cooldown_overcount_is_now_visible_as_three_stages` 断言
-  `rule_selected=24 / bus_accepted=1 / committed=1` **且**
-  `eng.store.alerts_total() == 1`（账本与 Store 独立核对）。
+- **验收（已达成）**：`tests/test_alert_delivery_stages.py` 20 条。
 - **回退验牙**：29 条行为级 RED / 0 结构性（见轮报 §4）。
-- **证据文件**：`alert_stage_red.log / green.log / rollback.log`、
-  `alert_delivery_reconcile.json`（`Σcommitted 6 == 6`）。
 
-### B. （新增）`event_id` —— 让标签能引用到**具体某一条**告警
-- **现状**：`signal_id` 已能回答"这条属于哪类信号"，但**不能**唯一标识
-  "某一条告警事件"。`Alert.key` 里含时间桶（`now_ep // cooldown`），
-  跨桶会变，**不适合当稳定事件 ID**。
-- **为什么必须先做**：云端 `Alert Truth Contract v2` 冻结原则明确要求
-  「T+5/T+30 标签只能引用 `committed event_id`」。没有稳定 id，
-  P0-0 的标签表无法与告警一一对应，也无法去重。
-- **做法**：给每条 `committed` 告警分配单调递增（或在 store 落库时分配）
-  的稳定 id，并写进 `to_dict()`。**不要**复用含时间桶的 `key`。
-- **验收**：连续两轮同类告警拿到**不同** `event_id`；同一条告警在
-  SSE 重放 / 看板刷新 / 落盘后 `event_id` **不变**。
-- **证据文件**：`signal_event_identity.json`。
+### B. 把交付账本从可评估性账本**解耦** ✅（17:00，`IT-P1-DELIVERY-LEDGER-002`）
+- **完成情况**：
+  * `capabilities.py`：新增独立 sidecar `SignalDeliveryStats`
+    （`rule_selected / global_ignored / bus_accepted / committed`）+
+    `RoundObservationSet.delivery_stats` registry +
+    `mark_delivery_selected/ignored/bus_accepted/committed` +
+    `check_delivery_invariants()` + `delivery_accounting_coverage()`；
+    新增 `committed_alerts_total`（Engine 独立数的**真实**分母）。
+  * `engine.py`：`rule_selected` 由 **Engine 统一记**（规则返回的 Alert
+    即 rule-selected output，避免"某条规则忘了维护账本"）；
+    `_mark_stage` 拆成"交付账本（只要有 signal_id 就记）"与
+    "可评估性账本（只有已 instrument 的 signal 才记）"两条路径。
+  * 5 条规则补稳定 `signal_id`：`limit_board.*`（4 pattern）、
+    `tick_surge.surge/plunge`、`unusual.<pattern>`、
+    `spirit_index.<pattern>`、`spirit_price.<pattern>`。
+  * 全局门禁 `first_party_committed_without_signal_id == 0`。
+- **验收（已达成）**：`tests/test_delivery_ledger_decoupled.py` 18 条；
+  真实回放 66/66 带 signal_id、`signed_ratio` 1.0、违规 0。
+- **回退验牙**：12 条行为级 RED / 0 结构性。
 
-## P0-B — 股票池覆盖率门禁（**13:00 轮新增，本轮最严重的未修风险**）
+### C. 堵住两个**已被真实代码证伪**的修法（防止下一轮走回头路）✅
+- **只补 `signal_id` 不够**：`sig not in signal_evals` 门禁照样 return。
+  测试 `test_signal_id_alone_is_not_enough` 钉住。
+- **Engine 自动建 eval 行不行**：会造幽灵行、破坏可评估性不变量、
+  把"没做逐 code 统计"伪装成"0% 可评估"。
+  测试 `test_auto_creating_eval_rows_would_break_invariants` 钉住。
+
+### D. （新增 `R-17`）`signal_id` × `metrics["pattern"]` 一致性门禁
+- **现状**：8 处 `signal_id` 是我**手工**按 `pattern` 语义命名的，
+  而 `metrics["pattern"]` 在同处另写一次 —— **同一事实的两份拷贝**。
+- **为什么现在做**：将来某规则 `pattern` 集合变化而 `signal_id` 忘记同步，
+  两者会**静默漂移**：交付账本仍工作，但名字与新 pattern 不符，
+  而"名字说谎"比"账本为空"更难发现。
+- **做法**：加门禁"每条 Alert 的 `signal_id` 必须等于
+  `<模块>.<metrics['pattern']>`（或显式豁免）"。
+- **可证伪**：若真实运行中两者恒相等，门禁永不触发，说明过虑了。
+
+## P0-B — 股票池覆盖率门禁（**仍是最严重的未修风险**）
 
 ### C. 覆盖率过低时必须拒绝出结论
 - **现状/证据**：13:00 轮两次真实全市场扫描，覆盖率分别只有
   **73.0%**（`4090/5917`，东财"第 2 页起失败"）与
   **83.1%**（`4576/5917`，"第 24 页起失败"）；`sina` 一次
   `HTTP Error 456`、一次 `2800 只（第 29 页起失败）`。
-  `once` 输出里 `universe` 甚至是 `0`。
+  `once` 输出里 `universe` 甚至是 `0`。**17:00 轮未重测**。
 - **危害**：覆盖率 73% 时，**任何"没报警"都可能是"没扫到"**。
   用户会把"扫描器瞎了一半"读成"市场很平静"。这是**唯一一个会让用户
   系统性误读结果**的结构性因素，比统计噪声严重。
+- **为什么优先级最高**：交付分母已在 17:00 轮补齐，**卡点就是它**。
 - **做法**：`once` / `soak` / 看板在覆盖率低于阈值（建议 90%）时，
   把本轮标记为 `degraded` 并在结果顶部显著提示实际覆盖率。
 - **为什么现在做**：它挡在所有"命中质量"结论前面 —— 分母都不全，

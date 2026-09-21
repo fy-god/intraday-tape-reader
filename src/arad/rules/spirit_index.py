@@ -288,6 +288,9 @@ class SpiritIndexRule:
             price=q.price,
             pct=(q.price / q.prev_close - 1.0) * 100.0 if q.prev_close else 0.0,
             title=title, detail=detail, severity=severity,
+            # IT-P1-DELIVERY-LEDGER-002：稳定 signal 身份。指数异动的 pattern
+            # 已是机器语义（如 index_pull），直接用作身份，不猜文案。
+            signal_id=f"spirit_index.{pattern}",
             cooldown_key=f"{q.code}:{kind.value}:{pattern}",
             cooldown_seconds=self.cooldown,
             metrics={

@@ -96,8 +96,22 @@ def test_replay_alerts_carry_signal_id_matching_real_counts():
 
     assert captured, "必须捕获到逐轮账本"
 
-    # 逐轮交付阶段链
-    chain_bad, committed_total = [], 0
+    # 逐轮交付阶段链（**独立交付账本**，IT-P1-DELIVERY-LEDGER-002）
+    chain_bad, delivery_total = [], 0
+    for obs in captured:
+        for sig, c in (obs.get("signal_delivery") or {}).items():
+            c = c or {}
+            sel = int(c.get("rule_selected") or 0)
+            ign = int(c.get("global_ignored") or 0)
+            bus = int(c.get("bus_accepted") or 0)
+            cmt = int(c.get("committed") or 0)
+            delivery_total += cmt
+            if bus > sel - ign or cmt > bus:
+                chain_bad.append((sig, sel, ign, bus, cmt))
+    assert chain_bad == [], f"交付阶段链被打破：{chain_bad[:5]}"
+
+    # 可评估性账本（规则所有，只有 instrumented 规则才写）仍须自洽
+    eval_bad = []
     for obs in captured:
         for sig, c in (obs.get("signal_evaluability") or {}).items():
             c = c or {}
@@ -105,10 +119,9 @@ def test_replay_alerts_carry_signal_id_matching_real_counts():
             sel = int(c.get("rule_selected") or 0)
             bus = int(c.get("bus_accepted") or 0)
             cmt = int(c.get("committed") or 0)
-            committed_total += cmt
             if not (hit >= sel >= bus >= cmt):
-                chain_bad.append((sig, hit, sel, bus, cmt))
-    assert chain_bad == [], f"交付阶段链被打破：{chain_bad[:5]}"
+                eval_bad.append((sig, hit, sel, bus, cmt))
+    assert eval_bad == [], f"可评估性阶段链被打破：{eval_bad[:5]}"
 
     rows = list(store.recent_alerts(1000))
     tagged = {}
@@ -120,13 +133,25 @@ def test_replay_alerts_carry_signal_id_matching_real_counts():
         else:
             untagged += 1
 
-    assert sum(tagged.values()) == committed_total, (
-        f"账本 committed={committed_total} 与真实带 signal_id 告警"
-        f"{sum(tagged.values())} 不符（tagged={tagged}）")
-    # 不维护账本的规则必须如实为空，不得伪造 signal_id
-    assert untagged > 0, "limit_board/tick_surge 等不维护账本，应为空 signal_id"
+    # IT-P1-DELIVERY-LEDGER-002 的**核心验收**：交付账本必须覆盖**每一条**
+    # 真实告警，而不只是那两条碰巧维护了可评估性账本的规则。
+    assert sum(tagged.values()) == delivery_total == len(rows), (
+        f"交付账本 committed={delivery_total} 与真实告警 {len(rows)} 不符"
+        f"（tagged={tagged}）")
+    # 全局门禁：第一方告警不许有缺 signal_id 的 committed 条目。
+    # （本轮之前这里是 `untagged > 0`，即把"60/66 不可对账"当**预期行为** —
+    #  那正是 IT-P1-DELIVERY-LEDGER-002 描述的 9.1% 覆盖率缺口，已修。）
+    assert untagged == 0, (
+        f"仍有 {untagged} 条告警缺 signal_id，交付无法对账（门禁要求 0）")
     assert all(r.get("signal_id") is not None for r in rows), (
         "signal_id 字段必须存在（空串表示不参与账本），不能缺键")
+    # 覆盖必须真的比可评估性账本宽 —— 否则说明两者没有解耦
+    dl_signals = {s for obs in captured for s in (obs.get("signal_delivery") or {})}
+    ev_signals = {s for obs in captured
+                  for s in (obs.get("signal_evaluability") or {})}
+    assert dl_signals > ev_signals, (
+        f"交付账本 {sorted(dl_signals)} 应严格宽于可评估性账本 "
+        f"{sorted(ev_signals)}（未解耦则覆盖率无法闭合）")
 
 
 def test_alert_signal_id_is_empty_by_default_not_fabricated():

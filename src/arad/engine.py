@@ -1287,7 +1287,15 @@ class Engine:
             for a in alerts:
                 if not isinstance(a, Alert):
                     continue
+                # IT-P1-DELIVERY-LEDGER-002：对 Engine 而言有一个**统一且不用猜**
+                # 的边界 —— 规则真正返回的 Alert 就是 rule-selected output。
+                # 由 Engine 统一记，避免每条规则自己重复写同一阶段、又再次
+                # 出现"某条规则忘了维护交付账本"（这正是 9.1% 覆盖率的成因）。
+                self._mark_delivery_selected(observation, a, now_ep)
                 if self.ignore and a.code in self.ignore:
+                    # 被全局 ignore 拦下：如实记进 global_ignored，这样交付链
+                    # 的不变量仍是 bus_accepted <= rule_selected - global_ignored。
+                    self._mark_delivery_ignored(observation, a, now_ep)
                     continue
                 if not self.bus.accept(a, now_ep):
                     continue
@@ -1307,6 +1315,14 @@ class Engine:
             self.store.add_alert(a)
             # 真正写进 Store 才叫 committed —— 这是"用户看得到"的那一级。
             self._mark_stage(observation, a, "committed")
+        # 全局门禁的分母：**真实**写进 Store 的第一方告警总数。
+        # 必须由 Engine 独立数，不能拿账本 committed 之和充当分母 ——
+        # 那样分子分母同源，delivery_accounting_coverage 会恒等于 1.0，
+        # 这正是本缺陷能长期隐藏的原因。
+        try:
+            observation.committed_alerts_total += len(fresh)
+        except Exception:  # noqa: BLE001
+            pass
         # 本轮所有告警一次性交给通知器；由通知器自己决定逐条还是聚合
         self._dispatch_many(fresh)
 
@@ -1331,17 +1347,63 @@ class Engine:
         return fresh
 
     @staticmethod
+    def _mark_delivery_selected(observation: object, alert: Alert,
+                                now_ep: float) -> None:
+        """记一条"规则选中"进**独立交付账本**（IT-P1-DELIVERY-LEDGER-002）。
+
+        ⚠ 没有 ``signal_id`` 的告警**无法归属**，这里不记 —— 它会体现在
+        全局门禁 ``first_party_committed_without_signal_id`` 上，
+        而不是被悄悄算进某个 signal 的 ``rule_selected``。
+
+        **绝不抛异常**：可观测性不能打断告警主链路。
+        """
+        try:
+            sig = str(getattr(alert, "signal_id", "") or "")
+            if not sig:
+                return
+            fn = getattr(observation, "mark_delivery_selected", None)
+            if callable(fn):
+                fn(sig, str(getattr(alert, "code", "") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
+    def _mark_delivery_ignored(observation: object, alert: Alert,
+                               now_ep: float) -> None:
+        """记一条"被全局 ignore 拦下"进交付账本。**绝不抛异常**。"""
+        try:
+            sig = str(getattr(alert, "signal_id", "") or "")
+            if not sig:
+                return
+            fn = getattr(observation, "mark_delivery_ignored", None)
+            if callable(fn):
+                fn(sig, str(getattr(alert, "code", "") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+
+    @staticmethod
     def _mark_stage(observation: object, alert: Alert, stage: str) -> None:
-        """把一条告警记进该轮账本的交付阶段（IT-P1-EVAL-PUBLISH-001）。
+        """把一条告警记进该轮账本的交付阶段。
 
-        只为真正**维护过账本**的 signal 记账 —— 判据是告警自己带的
-        ``signal_id`` 且该 signal 已在本轮账本里存在。这样做的原因：
+        两条路径（IT-P1-EVAL-PUBLISH-001 + IT-P1-DELIVERY-LEDGER-002）：
 
-        * 不靠 ``title``/``cooldown_key`` 猜 signal（8 个 spirit pattern
-          共用一个 AlertKind，猜错就把 A 的交付数记到 B 头上）；
-        * 规则没维护账本（如 ``limit_board``）时**不凭空建条目** ——
-          否则账本会冒出一堆 considered=0 的幽灵行，把
-          ``evaluable_coverage`` 的分母语义搞脏。
+        1. **可评估性账本**（``SignalEvalStats``，规则所有）：只在该 signal
+           已被**规则自己**创建了 eval 行时才记。``mark_bus_accepted`` /
+           ``mark_committed`` 会经 ``eval_stats()`` **新建**条目，所以这里
+           必须先用 ``sig not in evals`` 把没有 instrumentation 的规则挡在
+           外面 —— 否则会冒出 ``considered=0/evaluable=0/hit=0/sel=0`` 却
+           ``bus_accepted=1/committed=1`` 的幽灵行，既违反可评估性不变量，
+           又把"没做逐 code 统计"伪装成"0% 可评估"。
+        2. **交付账本**（``SignalDeliveryStats``，**Engine 所有**）：只要告警
+           带稳定 ``signal_id`` 就记，**不看**该 signal 有没有 eval 行。
+
+        为什么必须有第 2 条（云端 16:07 轮的 IT-P1-DELIVERY-LEDGER-002，
+        我已用真实代码复现）：7 个能发 Alert 的规则里只有 2 个维护 eval 账本，
+        于是真实回放 66 条 committed 告警只有 6 条可对账 —— **覆盖率 9.1%**。
+        修法**不能**只是"给另外 5 条规则补 ``signal_id``"：那条
+        ``sig not in signal_evals`` 门禁会照样拦下它们（已实测证伪）。
+        也不能让 Engine 自动补 eval 行（见上，会破坏不变量）。
+        把交付账本独立出来，7/7 规则才全部闭合。
 
         **绝不抛异常**：可观测性不能反过来打断告警主链路（本仓既有纪律）。
         注意 ``getattr`` 本身也必须包在 ``try`` 里 —— 账本对象可能是被替换
@@ -1352,18 +1414,29 @@ class Engine:
             "bus_accepted": "mark_bus_accepted",
             "committed": "mark_committed",
         }.get(stage)
-        if method is None:
+        delivery_method = {
+            "bus_accepted": "mark_delivery_bus_accepted",
+            "committed": "mark_delivery_committed",
+        }.get(stage)
+        if method is None and delivery_method is None:
             return
         try:
             sig = str(getattr(alert, "signal_id", "") or "")
             if not sig:
                 return
-            evals = getattr(observation, "signal_evals", None)
-            if not isinstance(evals, dict) or sig not in evals:
-                return
-            fn = getattr(observation, method, None)
-            if callable(fn):
-                fn(sig, str(getattr(alert, "code", "") or ""))
+            code = str(getattr(alert, "code", "") or "")
+            # --- 路径 2：独立交付账本（只要有 signal_id 就记）----------------
+            if delivery_method:
+                dfn = getattr(observation, delivery_method, None)
+                if callable(dfn):
+                    dfn(sig, code)
+            # --- 路径 1：可评估性账本（只有已 instrument 的 signal 才记）------
+            if method:
+                evals = getattr(observation, "signal_evals", None)
+                if isinstance(evals, dict) and sig in evals:
+                    fn = getattr(observation, method, None)
+                    if callable(fn):
+                        fn(sig, code)
         except Exception:  # noqa: BLE001
             pass
 

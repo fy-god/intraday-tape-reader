@@ -348,6 +348,11 @@ class LimitBoardRule:
             key=f"{q.code}:{kind.value}:seal:{bucket}",
             kind=kind, code=q.code, name=q.name, ts=now, price=q.price, pct=q.pct,
             title=f"{noun} {seal_txt}", detail=detail, severity=3,
+            # IT-P1-DELIVERY-LEDGER-002：稳定 signal 身份，**由规则显式赋值**。
+            # 不得从 title 反推 —— 文案会改，且同一 AlertKind 下多种 pattern。
+            # 本规则不维护逐 code 可评估性账本，但交付账本对它同样适用。
+            signal_id=("limit_board.limit_up_seal" if rising
+                       else "limit_board.limit_down_seal"),
             metrics={
                 "price": round(q.price, 3), "pct": round(q.pct, 3),
                 "limit_up": round(self._limit_up_price(q), 3),
@@ -379,6 +384,11 @@ class LimitBoardRule:
             key=f"{q.code}:{kind.value}:touch:{bucket}",
             kind=kind, code=q.code, name=q.name, ts=now, price=q.price, pct=q.pct,
             title=f"{noun} {fmt_pct(q.pct)}", detail=detail, severity=self.severity,
+            # IT-P1-DELIVERY-LEDGER-002：触板是**独立 signal**（1 级预警），
+            # 与"封板/炸板"（2/3 级）分开记账，否则交付率会把两种预测力
+            # 完全不同的状态混在一起。
+            signal_id=("limit_board.limit_up_touch" if rising
+                       else "limit_board.limit_down_touch"),
             metrics={
                 "price": round(q.price, 3), "pct": round(q.pct, 3),
                 "limit_up": round(self._limit_up_price(q), 3),
@@ -481,6 +491,10 @@ class LimitBoardRule:
             key=f"{q.code}:{kind.value}:break:{bucket}",
             kind=kind, code=q.code, name=q.name, ts=now, price=q.price, pct=q.pct,
             title=title, detail=detail, severity=3,
+            # IT-P1-DELIVERY-LEDGER-002：炸板/撬板是与封板**相反方向**的事件，
+            # 必须独立 signal —— 合并会让"封板准确率"被炸板样本污染。
+            signal_id=("limit_board.open_limit_up" if rising
+                       else "limit_board.open_limit_down"),
             metrics={
                 "price": round(q.price, 3), "pct": round(q.pct, 3),
                 "limit_up": round(self._limit_up_price(q), 3),

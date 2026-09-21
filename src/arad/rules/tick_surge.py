@@ -281,6 +281,11 @@ class TickSurgeRule:
             kind=kind, code=q.code, name=q.name, ts=now,
             price=q.price, pct=q.pct, title=title, detail=detail,
             severity=severity,
+            # IT-P1-DELIVERY-LEDGER-002：稳定 signal 身份。急拉/急跌是本系统的
+            # 核心诉求，必须分开记账 —— 二者预测力不同，混在一起算交付率
+            # 与命中率都没有意义。kind 已是精确枚举，直接映射，不猜文案。
+            signal_id=("tick_surge.surge" if kind is AlertKind.SURGE
+                       else "tick_surge.plunge"),
             # 不只靠 key 里的时间桶：桶边界在固定墙上时钟网格上，跨桶只差 1 秒，
             # 实测会出现两条急拉只隔 11 秒。带上冷却键+秒数才是真的"隔 N 秒"。
             cooldown_key=f"{q.code}:{kind.value}",

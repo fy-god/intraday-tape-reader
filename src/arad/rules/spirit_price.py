@@ -419,6 +419,9 @@ class SpiritPriceRule:
             kind=kind, code=q.code, name=q.name, ts=now,
             price=q.price, pct=q.pct,
             title=f"{cn} {fmt_pct(strength)}", detail=detail, severity=severity,
+            # IT-P1-DELIVERY-LEDGER-002：稳定 signal 身份。pattern 是机器语义
+            # （rocket / dive 等），直接用作身份，不猜 title 文案。
+            signal_id=f"spirit_price.{pattern}",
             cooldown_key=f"{q.code}:{kind.value}:{pattern}",
             cooldown_seconds=self.cooldown,
             metrics={

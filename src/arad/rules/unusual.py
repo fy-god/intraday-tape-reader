@@ -392,6 +392,10 @@ class UnusualRule:
             title=title,
             detail=detail,
             severity=severity,
+            # IT-P1-DELIVERY-LEDGER-002：稳定 signal 身份。用**机器语义**的
+            # pattern（宽幅震荡/尾盘异动/回封…）而不是 title 文案 ——
+            # 文案会改，pattern 是判断依据本身。
+            signal_id=f"unusual.{pattern}",
             metrics=m,
             # 尾盘异动/回封这类仍可能连续触发的形态，靠时间距离兜底；
             # 前面三种状态型形态已由 _edge 边沿检测保证只报一次。
