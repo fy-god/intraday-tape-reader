@@ -1,297 +1,63 @@
 # 最新审计
 
+**最新云端独立审计**：[`2026-09-21_16-07-37_JST.md`](./2026-09-21_16-07-37_JST.md)  
+**最新云端 Agent 任务书**：[`2026-09-21_16-07-37_JST_AGENT_TASK.md`](./2026-09-21_16-07-37_JST_AGENT_TASK.md)  
 **最新本地 Agent 轮**：[`2026-09-21_13-37-29_JST.md`](./2026-09-21_13-37-29_JST.md)  
-**最新云端独立审计**：[`2026-09-21_12-02-53_JST.md`](./2026-09-21_12-02-53_JST.md)  
-**最新云端 Agent 任务书**：[`2026-09-21_12-02-53_JST_AGENT_TASK.md`](./2026-09-21_12-02-53_JST_AGENT_TASK.md)  
-**上一份本地 Agent 轮**：[`2026-09-21_13-00-00_JST.md`](./2026-09-21_13-00-00_JST.md)  
-**上上份本地 Agent 轮**：[`2026-09-21_11-31-34_JST.md`](./2026-09-21_11-31-34_JST.md)  
-**上一份云端独立审计**：[`2026-09-21_08-04-12_JST.md`](./2026-09-21_08-04-12_JST.md)  
-**上一份云端 Agent 任务书**：[`2026-09-21_08-04-12_JST_AGENT_TASK.md`](./2026-09-21_08-04-12_JST_AGENT_TASK.md)  
-**更早本地 Agent 轮**：`2026-09-21_03-38-00_JST.md`（**文件名少算 1 小时**，见下方口径更正）  
+**上一份云端独立审计**：[`2026-09-21_12-02-53_JST.md`](./2026-09-21_12-02-53_JST.md)  
+**上一份云端 Agent 任务书**：[`2026-09-21_12-02-53_JST_AGENT_TASK.md`](./2026-09-21_12-02-53_JST_AGENT_TASK.md)  
+**上一份本地 Agent 产品轮**：[`2026-09-21_13-00-00_JST.md`](./2026-09-21_13-00-00_JST.md)  
+**更早本地 Agent 轮**：[`2026-09-21_11-31-34_JST.md`](./2026-09-21_11-31-34_JST.md)  
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **仓库执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)
 
-> 历史审计文件均保留在本目录；本索引只移动“最新/上一份”指针，不删除历史报告。
->
-> **⚠ 与云端 `12-02-53_JST` 轮的关系（如实说明）**：该云端轮写于
-> `reviewed_source_sha = 4e73ded`（即**早于**我这一轮 `13-00-00` 的产品提交）。
-> 我的 `13-00-00` 轮已独立复现并修复了它指认的两条 P1
-> （`IT-P1-UNKNOWN-DATE-FAILOPEN-001`、`IT-P1-ST-REPLAY-BYPASS-001`）
-> 与死代码项 `IT-P2-RULE-VERSION-DEADCODE-001`。
-> 因此**以 `13-00-00` 轮为最新产品状态**；`12-02-53` 轮的结论请对照下方
-> `13-00-00` 摘要阅读（其中已被修复的条目不应再视为开放）。
-> 合并时仅指针冲突，云端新增的两份文件已完整保留。
+> 历史审计文件均保留在本目录；本索引只移动当前接续指针，不删除历史报告。
 
-> **命名口径更正（记录在案）**：本仓约定 **JST = 本地 + 1 小时**。
-> 上一份本地轮命名为 `03-38-00_JST`，但其提交发生在本地 **03:43**，
-> 正确应为 **04:38 JST** —— **那个文件名少算了 1 小时**。
-> 本轮起改用正确口径（本地 12:00 → `13-00-00_JST`）。
+## 2026-09-21 16:07:37 JST 云端审计接续
 
-> **⚠ 与本地 `13-00-00_JST` 轮的关系（如实说明）**：该轮它是**写产品代码的一方**
-> （提交 `eba8c4a`，12 个非文档文件）。我这一轮（`13-37-29`）是**审计方**，
-> 审计对象正是 `eba8c4a`，起点 `70af044`。
-> **结论**：它声称的三条修复（三级账本、ST 日期感知、`_as_date` 接受 str/int）
-> **我独立复现，全部成立**；但它报告里的**一个关键数字我推翻**
-> （R3 的"修复前 0 条"在父提交上不可复现，实测 5 条），
-> 并**量化了它未给强度的一处结构缺口**（账本可对账覆盖率仅 **9.1%**，6/66）。
-> 两轮的结论不冲突，但**以 `13-37-29` 轮为最新审计状态**。
+- 发布前 HEAD：`948e0d2aaa29f8b7246225f6e45fdba6496f8551`。
+- 被审最新产品：`eba8c4af5ed943a023ab09ab9c30000c1ac58f65`；其后到发布前 HEAD 只有审计文档，无产品源码变化。
+- 开放 PR：0。
+- 最新本地 Agent 对 `eba8c4a` 的归档机器证据：`1642 passed in 108.85s`，另一次独立复跑 `1642 passed in 118.34s`；本云端轮未重复执行完整 pytest。
 
-## 最新本地 Agent 轮结论（2026-09-21 13:37 JST，审计对象 `eba8c4a`）
+### 本轮最大更正：`signal_id-only` 不能修 9.1% delivery coverage
 
-### 本轮三件有分量的事（不是小修小补）
+最新本地轮正确量化：replay 66 条 committed Alert，只有 6 条 tagged，60 条无 `signal_id`；只有 `volume_burst/spirit_order` 两条规则进入账本。
 
-1. **推翻 `IT-P1-EVAL-PUBLISH-001-R3` 的"修复前 0 条"。**
-   该轮报告 §1.4（`2026-09-21_13-00-00_JST.md:148-149`）写
-   `selftest` 的 `volume_burst` **6 条 → 0 条（修复前）→ 恢复 5 条**。
-   我在**父提交 `70af044` 上实跑 `selftest`，得 `volume_burst = 5`，不是 0**；
-   两个提交的"按类型"整行**逐字完全相同**
-   （`limit_down 3，limit_up 13，plunge 13，surge 18，unusual 16，volume_burst 5`）。
-   我还扫了 `--minutes 40/90/200/None` 四种配置 → `volume_burst = 4/6/6/5`，
-   **没有任何配置得 0**。
-   **机制的真身是 R1 掩蔽 R3**：`70af044` 的 `volume_burst.py:237-241`
-   在 `not ctx.provides("turnover")` 时**只记 blocked、没有 `continue`**，
-   执行继续落到数值门槛并**照发告警**——"能力全 False"因此在输出上不可见。
-   **硬证据**（同一脚本跨版本）：`70af044` 上
-   `blocked_capability=23325` 与 `volume_burst=5` **同时成立**；
-   `eba8c4a` 上 `blocked_capability=0`，账本链
-   `hit=84 → sel=84 → bus=5 → cmt=5` 逐级子集成立。
-   **R3 的机制本身是真的**：在修复后代码上把 `replay` 键删掉 → `volume_burst = 0`（总数 61）。
-   即 R3 需要 R1 先修好才会显现，**父提交无用户可见影响**。
-
-2. **量化交付账本的真实覆盖率：9.1%（6 / 66）。**
-   真实回放端到端（30 只 / 361 轮）：
-   ```
-   真实告警 66 = 带 signal_id 6（只有 volume_burst） + 无 signal_id 60
-   不可对账的五类：limit_up 13 / surge 19 / unusual 12 / plunge 13 / limit_down 3
-   ```
-   规则级读码核对：**7 条会发 Alert 的规则里只有 2 条**（`volume_burst`、`spirit_order`）
-   写 `signal_id` 且碰账本；另外 5 条（`limit_board`/`spirit_index`/`spirit_price`/
-   `tick_surge`/`unusual`）**账本零交互**。
-   该轮报告的验收判据 `Σcommitted == Σ带 signal_id 告警`
-   **实测成立，但与此同时 60/66 条不可见**——无标签告警被**等式两边同时排除**，
-   是"内部自洽"而非"覆盖"。
-
-3. **全量真实测试 + 真实自检**：`1642 passed in 108.85s`（exit 0，我自己跑的；
-   子代理独立再跑得 `1642 passed in 118.34s`）；
-   新增三个测试文件 `58 passed in 3.20s`；
-   `selftest` 两个提交均 `exit 0`、68 条告警、8-8 剧本命中。
-
-### 该轮声称的三条修复 —— 我的独立复现结论
-
-| 声称 | 我的结论 | 依据 |
-|---|---|---|
-| 三级账本 `hit/rule_selected/bus_accepted/committed` + `published` 变别名 | **成立** | 四字段实存；`published` 是 `@property` 返回 `rule_selected`；真实 `AlertBus` 24 轮实测 `24/24/1/1`、`dropped_by_bus=23`、**overcount 24.0×** 与报告吻合 |
-| `_as_date` 接受 `str`/`int` | **成立** | `date/datetime/"2025-03-10"/20250310` 四种形式 `st_limit_rate_on` 均为 **0.05**；`None` → 0.10（现行制度，语义正确） |
-| 回放链路传真实交易日 → ST 10.50 | **成立** | `replay.py:262-263` 传 `trade_day`；ST `600001` 在 2025-03-10 `limit_up_price` **10.50**（修复前 11.00） |
-
-### 保留意见 / 更正
-
-* `IT-P2-RULE-VERSION-DEAD-001` 已不再是死代码（`models.py:613` 是唯一真实调用点），
-  **但导出的 `rule_version` 键在生产代码里零读者**——只有测试读它。
-  不应被宣传为"看板已可追溯"。
-* `IT-P1-ALERT-IDENTITY-001` **只修了三分之一**：`signal_id` 已落地，
-  但 `to_dict()` **仍无 `cooldown_key`**（实测键 13 个）、`event_id` 全仓 **0** 命中、
-  `key` 仍含 wall-clock bucket。
-* **行号漂移更正（供下一轮直接用）**：`NOTIFY-RESULT-001` → `engine.py:1370/1385/1388`；
-  `RULE-VERSION-DEAD` → `models.py:64/27`（消费点 `:613`）；
-  `_as_date` → `models.py:72-131`；`ST-REPLAY-BYPASS` → `replay.py:152/251`；
-  `_sse_event` → `web.py:846-853`。
-  另：上一轮把 `maxsize=200` + `except Exception: pass` 归给告警环形缓冲，
-  实际属 **SSE 订阅者队列**（`store.py:210-224`）；告警环形缓冲是
-  `store.py:55 deque(maxlen=300)`。
-* **未复现项（不下结论）**：`CAPABILITY-002`、`SOURCE-EMPTY-001`、`WINDOW-001`、
-  `IT-P1-009`、`DAEMON-RACE-001`。
-
-### 我自己的两次错误（如实记录）
-
-1. 第一次用 `blocked` 字段名读账本——该字段**不存在**（真实名 `blocked_capability`），
-   聚合得 0 而误判"掩蔽不成立"；改用正确字段名后掩蔽被证实。
-2. 删表反事实得 0 条后，一度推断"父提交也该是 0"——**错**。
-   父提交缺 `continue`，两个缺陷在同一路径上**互相抵消**。
-
-### 计数
-
-`已确认错误 2`（R3 的"修复前 0"数字、账本覆盖率缺口 9.1%）/
-`已经修复 7`（三级账本 `EVAL-PUBLISH-001` 本体、`-R1`、`-R2`、`-R3`、
-`UNKNOWN-DATE-FAILOPEN-001`、`ST-REPLAY-BYPASS-001`、`RULE-VERSION-DEAD-001`）/
-`待验证风险 6` / `未复现 5` / `程序修复 0` / `任务定义变更 0` / `真实模型增益 0`。
-
----
-
-## 上一份本地 Agent 轮结论（2026-09-21 13:00 JST，起点 `70af044`）
-
-### 最重要的一条：`IT-P1-EVAL-PUBLISH-001` **已修复**（这是云端两轮都点名的高优先级项）
-
-云端 `Alert Truth Contract v2` 要的阶段链，前四级**本轮已落地并有真实对账**：
+但它提出“给另 5 条规则各补一行 signal_id 就能让 committed 对账生效”。当前 Engine `_mark_stage()` 还要求：
 
 ```text
-hit_candidate → rule_selected → bus_accepted → committed
-                └────────── 本轮实现 ──────────┘
-delivery_attempted / sent / skipped / failed   ← 仍开放（IT-P1-NOTIFY-RESULT-001/002）
+signal_id 已存在
+AND
+signal_id 已经在 observation.signal_evals
 ```
 
-1. **`IT-P1-EVAL-PUBLISH-001` 已修复。** 旧账本只有一个 `published`，且它在
-   **规则内部**、`max_per_round` 截断后立刻写，那时告警**还没**过
-   `AlertBus.accept()` 与 `store.add_alert()`。
-   **机制反例（真实代码端到端，非推演）**：同一票每 5 秒持续放量、
-   `cooldown=600s`、24 轮 → `rule_selected=24 / bus_accepted=1 / committed=1`，
-   **overcount 24×**。危害：拿旧 `published` 当"已发布事件"分母做 T+5/T+30
-   标签，23 条从未交付的候选会被当成真实事件，**标签集从源头错**。
-   修复：`capabilities.py` 拆三字段 + `dropped_by_bus`/`committed_ratio`，
-   `published` 降为兼容别名；`engine.py` 新增 `_mark_stage()` 在 bus/store
-   **之后**记账；`Alert` 新增 `signal_id`（由规则填，不靠 title 猜 ——
-   8 个 spirit pattern 共用同一 `AlertKind`）。
-   **验收**：`tests/test_alert_delivery_stages.py` 20 条 +
-   `test_live_session_observation.py` 聚合 3 条。
+五条未覆盖规则没有 SignalEvalStats 行，因此只补 signal_id 仍会被 Engine 直接 return。
 
-2. **`IT-P1-ALERT-IDENTITY-001` 部分修复。** `Alert.signal_id` 已落地并进入
-   `to_dict()`，rule→bus→store→client 的 **signal 级**对账已可做。
-   **`event_id` 仍未做** —— 该条只算部分完成，不下调为"已修"。
-
-3. **新确认三处既有缺陷（全部由"真实看板端到端对账"暴露，无一是单元测试或离线 selftest 发现的）**：
-   * **`-R1`**：`volume_burst` 在 `not provides("turnover")` 时**只记 blocked、没有 `continue`**，
-     于是同一票**既被记成"判不了"又真的发出告警** →
-     `considered=1 blocked=1 hit=0 sel=1`，机械不变量当场被打破。
-     修复：记 blocked 即整只跳过（真实 Sina 送 `turnover=0.0` 占位，
-     告警集合逐字不变）。
-   * **`-R2`**：`min_turnover` 是**唯一**被拦下时不记 `_no_hit` 的门槛，
-     导致"换手率不够"这一整类票**从账本彻底消失**（`considered` 都不涨）。
-     修复：补 `_no_hit`，与其余门槛同口径。
-   * **`-R3`（用户可见）**：`CAPABILITY_TABLE` 缺 `replay` 条目 →
-     `capabilities_for("replay")` 落到"全 False 未知源" →
-     `volume_burst` 把 turnover 当硬依赖 → **演练模式下放量告警一条都不出**
-     （实测 selftest `volume_burst` 6 条 → **0 条**）。
-     而看板 `serve --replay` 正是用户确认"功能到底有没有做"的地方。
-     修复后恢复 **5 条**（与基线一致）。同类于 `IT-P1-CAPABILITY-001`：
-     **把"来源未知"当成"能力缺失"**。
-
-4. **独立复现并修复云端 11:31 轮针对我上一轮 ST 修复的两条 P1**（均**确认成立**）：
-   * **`IT-P1-UNKNOWN-DATE-FAILOPEN-001`**：`_as_date` 只认 `date`/`datetime`，
-     字符串/整数一律 `None`，而调用方把 `None` 当"按现行制度" →
-     **静默 fail-open**。实测修复前 `st_limit_rate_on("2025-03-10") == 0.10`
-     （应为 **0.05**）。可触达性已逐处核对（sina/eastmoney/tencent 的
-     `_ts_of`、`web.coerce_ts` 确实产出字符串或 `None`）。
-     **附带自我加严**：`strptime("2025031","%Y%m%d")` 会宽松解析成
-     `2025-03-01`，故改用正则**显式钉住位数**。
-   * **`IT-P1-ST-REPLAY-BYPASS-001`**：`ScriptedStock.limit_rate()` 不传日期 →
-     回放任何历史日均按现行 10% 算；`build_script` 把它塞进 `Quote.limit_up`，
-     而 `Quote.limit_up_price` 提前返回 → **整条回放链路结构性绕过 ST 修复**。
-     实测回放 2025-03-10 主板 ST：`limit_up_price=11.00`（应 **10.50**），
-     **真实 5% 封板不被识别**。修复后 10.50，非 ST/创业板/科创板未误伤。
-
-5. **`IT-P2-RULE-VERSION-DEADCODE-001` 已修复（采纳云端建议的"接上，不要两不沾"）。**
-   我独立复核确认 `market_rule_version` **零调用、零测试**（全仓仅
-   `__all__` 与定义两处），即"制度版本可追溯"上一轮只是**声明**。
-   已接进 `Alert.to_dict()["rule_version"]`（alert 是唯一会被落盘/推流的载体，
-   正是"事后追溯"场景）；`ts=2025-03-10` → `"cn-2026-07-05"`，
-   `ts=2026-09-21` → `"cn-2026-07-06"`。测试用 `inspect.getsource`
-   断言存在真实调用点，**防止再退回死代码**。
-   ⚠ 诚实限定：看板/soak **尚未读取**该字段，端到端可观测性仍未验证（列入 `R-14`）。
-
-6. **真实盘中验证（2026-09-21 10:43 CST 早盘交易中，`python -m arad.cli once`）**：
-   **35 条真实告警**，板块限制正确区分 —— 北交所 `920478 +29.91%`（30% 板）、
-   创业板 `300110 +20.07%`、主板 `002589 +10.09%`、
-   科创板 `688137 +19.38% 炸板`。
-   逐 signal 账本：`volume_burst` **considered=5247 / evaluable=5247 / blocked=0**
-   （修复前此处会是 5247 条全 blocked），`source=tencent`，不变量违规**无**。
-
-7. **真实看板端到端对账（本轮最关键的一步，`serve --replay` 同链路）**：
-   逐轮进程内捕获 **361/361 轮**，按 `signal_id` 精确分组：
-   `Σhit=66 / Σselected=66 / Σbus_accepted=6 / Σcommitted=6`，
-   与真实带 `signal_id` 告警 **6 == 6 精确对账**，逐轮交付阶段链**违规 0**；
-   被 AlertBus 去重/冷却丢掉 **60 条** —— 这正是旧口径会算成"已发布"的量。
-   看板 `/api/status` 每个 signal 都含三级键。
-
-8. **回退验牙（证明测试真的会红）**：批次 A **29 条行为级 RED / 0 结构性**；
-   批次 B（ST 日期感知）**13 条行为级 RED / 0 结构性**；两次 `stash pop` 后
-   均核对 `git diff --stat HEAD` 非空。
-   **诚实限定**：`-R1/-R2/-R3` 与批次 A 同文件，整体回退时一起变红 ——
-   能证明"修复前确实错"，但**不能单独归因**到某一处修复；
-   单独证据是各自的机制探针与 selftest 的 6→0→5 条曲线。
-
-9. **测试与门禁**：全量 pytest **1642 passed**（上轮 1579 → **+63**）；
-   `tools/check_*.py` **8/8**；`node tools/dash_render_check.js` **通过**；
-   `python -m arad.cli selftest` **68 条 / 6 类型 / 8-8 剧本命中**（与基线一致）。
-
-10. **上轮结论下调（明确）**：上一轮把 `IT-P1-MARKET-RULE-20260706-001` 标为
-    "已修复"。**该结论不完整** —— `Quote` 路径确实修好，但**回放链路结构性绕过**
-    （见第 4 条），故下调为 **"部分修复"**。
-
-11. **本轮未做（不含糊）**：未修 eastmoney/sina 股票池截断（`R-12`，两次实测覆盖率
-    仅 **73.0% / 83.1%**，源端不稳定，无法区分限流与我方 `max_pages`）；
-    **未启用 `spirit_*`**（不擅自改产品默认行为）→ 故 schedule-5 期望的
-    "盘中成交类 pattern 出现"**未被验证**，如实标注（`R-13`）；
-    未把 `rule_version` 接进看板（`R-14`）；
-    未改 `Alert.to_dict()` 对 `ts=None` 崩溃（`R-15`，既有契约，避免扩大变更面）。
-
-## 当前版本与发布
-
-- 本轮起点 HEAD：`70af044d7a9df9e122d8b8490e68fe667db85548`（local == remote）。
-- 本轮产品改动：`capabilities.py` / `engine.py` / `models.py` / `replay.py` /
-  `rules/volume_burst.py` / `rules/spirit_order.py` / `tools/live_session.py`
-  + 3 个新测试文件。
-- 归档机器证据：**1642 passed / 0 failed**（本轮本地真实执行，非继承）。
-- 当前开放 PR：0。
-
-## 本轮最高优先级结论
-
-1. **`IT-P1-EVAL-PUBLISH-001` 已修**（见第 1 条），阶段链前四级落地并有真实对账。
-2. **`IT-P1-NOTIFY-RESULT-001/002` 仍开放**（继续采纳云端结论）：
-   `_dispatch_many()` 丢弃 bool；且 bool 本身不够（disabled / severity-skip
-   可返回 True 但并未物理发送）。下一步需要 typed
-   `sent / skipped_* / failed`，**不能把 True 等价为 sent**。
-   → 这是 Alert Truth Contract v2 剩余的第五、六级。
-3. **`IT-P1-ALERT-IDENTITY-001` 部分修复**：`signal_id` 已落地；**`event_id` 仍缺**。
-4. **`R-12` 股票池覆盖率是本轮最严重的未修风险**：73%~83% 覆盖率下，
-   任何"没报警"都可能是"没扫到"。**建议下一轮优先**。
-5. `IT-P1-CAPABILITY-002`、`IT-P1-SOURCE-EMPTY-001`、`IT-P1-WINDOW-001`、
-   `IT-P1-008/009/003`、`IT-P1-NEWLIST-002-R1`、`IT-P1-006-R1` 继续开放。
-
-## 主改造方向：Alert Truth Contract v2（进度）
+本轮机制反事实：
 
 ```text
-hit_candidate      ← 已有 (hit_candidates)
-rule_selected      ← ✅ 本轮实现
-bus_accepted       ← ✅ 本轮实现
-committed(event_id)← ✅ committed 已实现；event_id 未做
-delivery_attempted(channel)                                    ← 未做
-delivery_sent / delivery_skipped / delivery_failed             ← 未做
-client_received / client_applied                               ← 未做
-future_label_known                                             ← 未做
+当前：2/7 可记 delivery
+只补 signal_id：仍 2/7
+Engine 自动造 SignalEvalStats：5/5 新行破坏 bus<=rule_selected 不变量
+独立 SignalDeliveryStats：7/7 机制闭合
+120,000 软件事件 property stress：0 delivery invariant violation
 ```
 
-冻结原则（**前三条本轮已由 `check_invariants()` 机械断言**）：
+因此新增稳定问题：`IT-P1-DELIVERY-LEDGER-002`（P1）。
 
-- `rule_selected <= hit_candidate` ✅
-- `bus_accepted <= rule_selected` ✅
-- `committed <= bus_accepted` ✅
-- 每个 `committed event × channel` 必须恰有 `sent / skipped / failed` 之一 ⬜
-- T+5/T+30 标签只能引用 `committed event_id` ⬜（`committed` 已有，`event_id` 未做）
+### 下一步顺序
 
-本轮全部是**软件合同与账本修复**，不是市场策略指标。
-本轮没有重新训练模型，真实 Precision / Recall / 漏事件率 / 交易收益
-仍为 **`unavailable`** —— 不编造任何命中率或收益率。
+1. **Delivery Ledger v2 与 evaluability registry 分离**；Engine 统一记录所有第一方 Alert 的 `rule_selected/bus_accepted/committed`。
+2. 5 条未覆盖规则补稳定 `signal_id`，并建立 100% first-party committed coverage 门禁。
+3. 并行建立 Universe Coverage Gate（历史实测曾只有 73.0%/83.1%，本轮未重测）。
+4. 再做 stable `event_id`、typed NotificationResult、committed-event T+5/T+30。
+5. 然后才推进 per-code provenance → targeted fallback → ObservationInterval → SSE durable cursor/gap。
+6. 真实多日语料与上述分母闭合前，不恢复模型大搜索。
 
-## 下一轮必须检查的实物
+### 当前主要开放项
 
-```text
-alert_stage_red.log / green.log / rollback.log          ← 本轮已产出（见报告 §4）
-st_date_red.log / rollback.log                          ← 本轮已产出（见报告 §4）
-alert_delivery_reconcile.json                           ← 已产出（Σcommitted 6 == 6）
-delivery_stages_e2e.log                                 ← 已产出（361/361 轮）
-live_intraday_ledger.json                               ← 已产出（5247/5247/blocked 0）
-notification_result_red.log / green.log / rollback.log  ← 仍未做
-notification_delivery_reconcile.json                    ← 仍未做
-signal_event_identity.json                              ← signal_id 已有；event_id 未做
-post_alert_label_manifest.json                          ← 仍未做
-per_code_provenance.json                                ← 仍未做
-soft_partial_reconcile.json                             ← 仍未做
-universe_coverage_reconcile.json                        ← 新增待做（R-12）
-full pytest log
-all check_*.py logs
-dash_render_check log
-RUN_MANIFEST.json
-NEXT_STEPS.md
-```
+`IT-P1-DELIVERY-LEDGER-002` / `IT-P1-DELIVERY-COVERAGE-001` / `IT-P1-NOTIFY-RESULT-001/002` / `IT-P1-ALERT-IDENTITY-001` / universe coverage gate / `IT-P1-CAPABILITY-002` / `IT-P1-SOURCE-EMPTY-001` / `IT-P1-WINDOW-001` / SSE `IT-P1-008/009/003`。
 
-更早审计、产品修复及本地执行记录继续保留在本目录和 Git 历史中；本索引只保留当前接续所需的关键状态。
+### 研究边界
+
+本轮模型训练次数 0；真实 Precision / Recall / 漏事件率 / 交易收益仍 `unavailable`。本轮实验只证明 delivery/evaluability 账本的机械合同，不代表市场预测收益。
