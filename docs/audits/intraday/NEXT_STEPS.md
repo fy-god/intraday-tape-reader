@@ -1,64 +1,106 @@
-# NEXT_STEPS — 2026-09-21 03:38 JST
+# NEXT_STEPS — 2026-09-21 13:00 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> **03:38 轮进展**：`IT-P1-MARKET-RULE-20260706-001`（主板 ST 涨跌幅
-> 5%→10% 日期感知）与 `IT-P2-DAEMON-HEALTH-001`（`--detach` 归属缺陷，
-> 是我自己上一提交的问题）已完成（`22a51a2`）；
-> `serve --replay`（休市也能看到短线精灵）为 `a415965`；
-> `--detach` 真正脱离终端为 `9c4e08d`。全量 1570 passed / 8 gate。
+> **✅ 13:00 轮：P0-A 与 A2 均已完成 —— P0-0 不再被阻塞。**
+> * **P0-A**：`published` 已拆成 `rule_selected / bus_accepted / committed`。
+>   机制反例端到端复现 **24× overcount**（真实 Engine + 真实 AlertBus），
+>   验收断言 `rule_selected=24 / bus_accepted=1 / committed=1` **已达成**。
+>   真实看板同链路对账：`Σhit=66 / Σsel=66 / Σbus=6 / Σcm=6`，
+>   与真实带 `signal_id` 告警 **6 == 6 精确对账**，逐轮链违规 **0**。
+> * **A2**：ST 新规已推到回放链路（`IT-P1-ST-REPLAY-BYPASS-001` 修复），
+>   回放 2025-03-10 主板 ST 的 `limit_up_price` 由 **11.00 → 10.50**。
+>   剩余差异见下方 A2。
+> * 本轮还连带修掉三处由**真实看板对账**暴露的既有缺陷
+>   （`-R1` blocked 未跳过、`-R2` 换手率门槛漏记、`-R3` replay 能力缺失
+>   导致演练模式放量功能整类静默）。全量 **1642 passed** / 8 gate 全绿。
 >
 > **02:24 轮新增 P0（最高优先，因为它是"用户真正要的东西"）**：
 > 见下方第 0 条 —— 用**事后收益**给告警打标签，量化"报得准不准"。
 > 在此之前，所有修复都只回答"会不会报错"。
 >
-> ⚠ **03:38 轮补充：P0-0 现在被 `IT-P1-EVAL-PUBLISH-001` 卡住了。**
-> `published` 字段在 Rule 返回时就写入，早于 `AlertBus.accept` 的
-> key 去重 / cooldown —— 机制反例 overcount **24×**
-> （24 轮连续命中，label 会记 24 条，Store 实际只 committed 1 条）。
-> 若拿它当标签分母，会把从未交付的候选算成"已发布事件"，
-> **P0-0 的代理指标会系统性偏乐观**。所以顺序必须是：
-> 先修 P0-A（下），再做 P0-0。
+> ⚠ **03:38 轮提出的阻塞（`IT-P1-EVAL-PUBLISH-001`）已在 13:00 轮解除**：
+> `published` 现在**语义正确**（= `rule_selected`），且真交付数
+> `committed` 独立记录。P0-0 的标签分母现在可以只用 `committed`，
+> 不会再系统性偏乐观。**但 `event_id` 仍未做**，见 P0-B。
 
-## P0-A — 告警交付阶段账本（**03:38 轮新增，P0-0 的前置阻塞**）
+## P0-A — 告警交付阶段账本 ✅ **已完成（2026-09-21 13:00 JST）**
 
-### A. 把 `published` 拆成 `rule_selected / bus_accepted / committed`
-- **现状**：`volume_burst` / `spirit_order` 在规则内部 `max_per_round`
-  截断后立即 `mark_published(signal, code)`；而 Engine 拿到返回值后还要走
-  `AlertBus.accept`（key 去重 + cooldown）→ `store.add_alert` → notifier。
-  所以当前账本把 **`rule_selected` 错命名成 `published`**。
-- **云端 04:10 机制反例**：同一只票每 5 秒都满足 `volume_burst`，
-  cooldown=600 秒，共 24 轮 →
-  `rule-level published = 24`，`AlertBus 真正接受 = 1`，
-  `实际可 commit = 1`。**overcount 24×**。
-  （这是刻意机制反例，不是线上重复率，但足以证明字段语义不成立。）
-- **正确分层**：
-  ```text
-  hit_candidate -> rule_selected -> bus_accepted -> committed
-                -> notify_attempted -> notify_sent -> client_received
-  ```
-- **做法**：兼容期把 `published` 改名/语义定为 `rule_selected`；
-  真正的 `committed` 只在 Engine `bus.accept` + `store.add_alert` 之后记录。
-  `Alert` 应带稳定 `signal_id`，不要让 Engine 靠 title 文案猜所属 signal。
-- **验收**：构造"连续命中但 cooldown 只允许一次"，
-  断言 `rule_selected=24 / bus_accepted=1 / committed=1`；
-  回退验证须为真 AssertionError（只用既有 API）。
+### A. 把 `published` 拆成 `rule_selected / bus_accepted / committed` ✅
+- **完成情况**：
+  * `capabilities.py`：`SignalEvalStats` 新增 `rule_selected` / `bus_accepted` /
+    `committed` 三字段，`dropped_by_bus` / `committed_ratio` 两属性；
+    `published` 降级为 `rule_selected` 的**兼容别名**；
+    `check_invariants()` 增加两条链式断言。
+  * `engine.py`：新增 `_mark_stage(observation, alert, stage)`，
+    在 `bus.accept()` **之后**记 `bus_accepted`、`store.add_alert()` **之后**记
+    `committed`；只为**本轮账本里已存在的 signal** 记账（不凭空建幽灵行）。
+  * `models.py`：`Alert.signal_id`（**由规则填**，不靠 title 猜）。
+  * `tools/live_session.py`：逐 signal slim + 全场三级总量；
+    旧轮样本缺新键时**退回 `published`**，不退回 0。
+- **验收（已达成）**：`tests/test_alert_delivery_stages.py` 20 条，
+  其中 `test_cooldown_overcount_is_now_visible_as_three_stages` 断言
+  `rule_selected=24 / bus_accepted=1 / committed=1` **且**
+  `eng.store.alerts_total() == 1`（账本与 Store 独立核对）。
+- **回退验牙**：29 条行为级 RED / 0 结构性（见轮报 §4）。
 - **证据文件**：`alert_stage_red.log / green.log / rollback.log`、
-  `alert_delivery_reconcile.json`。
+  `alert_delivery_reconcile.json`（`Σcommitted 6 == 6`）。
 
-### A2. 把 ST 新规从"单元"推到"回放链路"（补本轮 R-07）
-- **现状**：日期感知板率只在单元测试层验证（7/7 真牙）。
-  `replay` 剧本股票名不含 ST，因此**回放端到端不触发该分支**。
-- **做法**：在 `default_universe` 或剧本里加入一只主板 ST，
-  用 `day=2026-07-03` 与 `day=2026-07-06` 各跑一次，
-  断言 `limit_up_price` 与 `limit_board` 告警的差异。
-- **为什么**：这是把本轮修复从"函数对了"推到"链路对了"的最短路径，
-  也是唯一能证明历史回放不被新规污染的证据。
-- **验收**：产出 `market_rule_replay_0705_vs_0706.json`，
-  两天的限价与告警数**不同**且各自符合当日制度。
+### B. （新增）`event_id` —— 让标签能引用到**具体某一条**告警
+- **现状**：`signal_id` 已能回答"这条属于哪类信号"，但**不能**唯一标识
+  "某一条告警事件"。`Alert.key` 里含时间桶（`now_ep // cooldown`），
+  跨桶会变，**不适合当稳定事件 ID**。
+- **为什么必须先做**：云端 `Alert Truth Contract v2` 冻结原则明确要求
+  「T+5/T+30 标签只能引用 `committed event_id`」。没有稳定 id，
+  P0-0 的标签表无法与告警一一对应，也无法去重。
+- **做法**：给每条 `committed` 告警分配单调递增（或在 store 落库时分配）
+  的稳定 id，并写进 `to_dict()`。**不要**复用含时间桶的 `key`。
+- **验收**：连续两轮同类告警拿到**不同** `event_id`；同一条告警在
+  SSE 重放 / 看板刷新 / 落盘后 `event_id` **不变**。
+- **证据文件**：`signal_event_identity.json`。
 
-## P0-0 — 从"会不会报错"转向"报得准不准"（最高优先，依赖 P0-A）
+## P0-B — 股票池覆盖率门禁（**13:00 轮新增，本轮最严重的未修风险**）
+
+### C. 覆盖率过低时必须拒绝出结论
+- **现状/证据**：13:00 轮两次真实全市场扫描，覆盖率分别只有
+  **73.0%**（`4090/5917`，东财"第 2 页起失败"）与
+  **83.1%**（`4576/5917`，"第 24 页起失败"）；`sina` 一次
+  `HTTP Error 456`、一次 `2800 只（第 29 页起失败）`。
+  `once` 输出里 `universe` 甚至是 `0`。
+- **危害**：覆盖率 73% 时，**任何"没报警"都可能是"没扫到"**。
+  用户会把"扫描器瞎了一半"读成"市场很平静"。这是**唯一一个会让用户
+  系统性误读结果**的结构性因素，比统计噪声严重。
+- **做法**：`once` / `soak` / 看板在覆盖率低于阈值（建议 90%）时，
+  把本轮标记为 `degraded` 并在结果顶部显著提示实际覆盖率。
+- **为什么现在做**：它挡在所有"命中质量"结论前面 —— 分母都不全，
+  Precision/Recall 无从谈起。
+- **可证伪**：若真实运行覆盖率恒 ≥ 95%，本门禁永不触发，
+  说明源端其实稳定、这个担心不成立。
+- **证据文件**：`universe_coverage_reconcile.json`。
+
+### A2. 把 ST 新规从"单元"推到"回放链路" ✅ **主体已完成**
+- **完成情况**：`IT-P1-ST-REPLAY-BYPASS-001` 已修 ——
+  `ScriptedStock.limit_rate(when=None)` 接受交易日，
+  `build_script()` 传 `timeline[0].date()`。
+  实测回放 2025-03-10 主板 ST：`limit_up_price` **11.00 → 10.50**、
+  `limit_down_price` **9.00 → 9.50**；同一日期非 ST 仍 11.00、
+  创业板/科创板仍 20%（未误伤）。
+- **同时修正根因**：`IT-P1-UNKNOWN-DATE-FAILOPEN-001` ——
+  `_as_date` 现在认得 ISO/紧凑/斜杠串与等价位整数
+  （修复前 `"2025-03-10"` 给 **0.10**，应 0.05），
+  并用正则**钉住位数**拒绝宽松形态（`"2025031"` 曾被
+  `strptime` 解析成 2025-03-01）。
+- **A2 剩余**：`default_universe` 里**仍没有 ST 股票**（云端
+  `IT-P2-REPLAY-DOC-COVERAGE-001` 指出的问题）。所以上面的验证
+  是用自定义 `ScriptedStock` 完成的，**默认参数下 CI 仍不会覆盖**。
+  建议加一只主板 ST + 一只 `*ST` 并加自检断言 ——
+  不改业务语义，却能把一个 P1 从"无人知晓"变成"CI 红灯"。
+- **证据文件**：`market_rule_replay_0705_vs_0706.json`（**仍未产出**，
+  现有证据是 `tests/test_st_date_awareness_end_to_end.py` 33 条 +
+  `st_date_red.log`）。
+
+## P0-0 — 从"会不会报错"转向"报得准不准"（**阻塞已解除，可开始**）
 
 ### 0. 用事后收益自动标注告警，产出 Precision 代理指标
 - **现状**：本项目所有验证都只证明"链路通、不报错"。

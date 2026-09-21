@@ -342,6 +342,77 @@ class TestObservationAggregation:
         assert got["rounds"] == 50
 
 
+class TestAlertDeliveryStageAggregation:
+    """IT-P1-EVAL-PUBLISH-001：soak 聚合必须把交付三级分开带出去。
+
+    只带 ``published`` 的旧聚合会把"规则选中"当成"用户收到"，
+    于是 24× 的 overcount 从轮样本一路传到 soak 报告，无人可见。
+    """
+
+    def test_three_stages_are_aggregated_separately(self):
+        rows = [_obs_round(
+            i + 1, coverage=1.0,
+            signal_evaluability={
+                "volume_burst": {
+                    "considered": 1, "evaluable": 1, "blocked_capability": 0,
+                    "advisory_missing": 0, "hit_candidates": 1,
+                    "rule_selected": 1, "bus_accepted": 0, "committed": 0,
+                    "dropped_by_bus": 1, "published": 1,
+                    "blocked_reasons": {},
+                }}) for i in range(24)]
+        got = ls.summarize_rounds(rows)
+        assert got["evaluability_rule_selected_total"] == 24
+        assert got["evaluability_committed_total"] == 0, (
+            "24 轮全被去重/冷却吞掉 -> 交付数必须是 0，不是 24")
+        assert got["evaluability_published_total"] == 24, "兼容别名仍是 24"
+        assert got["evaluability_dropped_by_bus_total"] == 24
+
+    def test_legacy_round_without_new_keys_does_not_read_as_zero(self):
+        """旧轮样本只有 ``published``：三级必须**退回**它，不能退成 0。
+
+        否则升级当天，历史 soak 报告会被读成"一条告警都没交付"——把一个
+        缺失字段误报成灾难，比不报更糟。
+        """
+        rows = [_obs_round(
+            i + 1, coverage=1.0,
+            signal_evaluability={
+                "volume_burst": {
+                    "considered": 1, "evaluable": 1, "blocked_capability": 0,
+                    "advisory_missing": 0, "hit_candidates": 1,
+                    "published": 5,
+                    "blocked_reasons": {},
+                }}) for i in range(3)]
+        got = ls.summarize_rounds(rows)
+        assert got["evaluability_published_total"] == 15
+        assert got["evaluability_rule_selected_total"] == 15, "退回 published"
+        assert got["evaluability_committed_total"] == 15, "退回 published"
+        per_sig = got["signal_evaluability"]["volume_burst"]
+        assert per_sig["rule_selected"] == 15
+        assert per_sig["committed"] == 15
+        assert per_sig["dropped_by_bus"] == 0
+
+    def test_new_round_takes_precedence_over_alias(self):
+        """同一轮里新旧键都在时，新键优先 —— 别名不得覆盖真值。"""
+        rows = [_obs_round(
+            i + 1, coverage=1.0,
+            signal_evaluability={
+                "volume_burst": {
+                    "considered": 1, "evaluable": 1, "blocked_capability": 0,
+                    "advisory_missing": 0, "hit_candidates": 1,
+                    "rule_selected": 7, "bus_accepted": 2, "committed": 1,
+                    "dropped_by_bus": 5, "published": 7,
+                    "blocked_reasons": {},
+                }}) for i in range(2)]
+        got = ls.summarize_rounds(rows)
+        assert got["evaluability_rule_selected_total"] == 14
+        assert got["evaluability_bus_accepted_total"] == 4
+        assert got["evaluability_committed_total"] == 2
+        assert got["evaluability_dropped_by_bus_total"] == 10
+        per_sig = got["signal_evaluability"]["volume_burst"]
+        assert per_sig["committed"] == 2
+        assert per_sig["published"] == 14, "别名仍等于 rule_selected"
+
+
 class TestObservationHealth:
     """要求 2：可配置阈值；93% soft-partial 与整类不可评估必须显式变黄/红。"""
 

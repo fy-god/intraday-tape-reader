@@ -1291,6 +1291,11 @@ class Engine:
                     continue
                 if not self.bus.accept(a, now_ep):
                     continue
+                # IT-P1-EVAL-PUBLISH-001：规则返回后**才**知道它真的过了
+                # bus 去重/冷却。这里按 signal 记 bus_accepted —— 旧账本
+                # 在规则内部就把这步算成 "published"，导致被冷却丢掉的
+                # 候选也被当成已发布（机制反例 overcount 24×）。
+                self._mark_stage(observation, a, "bus_accepted")
                 if a.code in self.focus and a.severity < 3:
                     a.severity += 1
                 fresh.append(a)
@@ -1300,6 +1305,8 @@ class Engine:
 
         for a in fresh:
             self.store.add_alert(a)
+            # 真正写进 Store 才叫 committed —— 这是"用户看得到"的那一级。
+            self._mark_stage(observation, a, "committed")
         # 本轮所有告警一次性交给通知器；由通知器自己决定逐条还是聚合
         self._dispatch_many(fresh)
 
@@ -1322,6 +1329,43 @@ class Engine:
             poll_ms=int((time.perf_counter() - t0) * 1000), count=self._poll_count,
             health=self.sources.health(), now=now, observation=observation)
         return fresh
+
+    @staticmethod
+    def _mark_stage(observation: object, alert: Alert, stage: str) -> None:
+        """把一条告警记进该轮账本的交付阶段（IT-P1-EVAL-PUBLISH-001）。
+
+        只为真正**维护过账本**的 signal 记账 —— 判据是告警自己带的
+        ``signal_id`` 且该 signal 已在本轮账本里存在。这样做的原因：
+
+        * 不靠 ``title``/``cooldown_key`` 猜 signal（8 个 spirit pattern
+          共用一个 AlertKind，猜错就把 A 的交付数记到 B 头上）；
+        * 规则没维护账本（如 ``limit_board``）时**不凭空建条目** ——
+          否则账本会冒出一堆 considered=0 的幽灵行，把
+          ``evaluable_coverage`` 的分母语义搞脏。
+
+        **绝不抛异常**：可观测性不能反过来打断告警主链路（本仓既有纪律）。
+        注意 ``getattr`` 本身也必须包在 ``try`` 里 —— 账本对象可能是被替换
+        的坏桩，属性访问（property）随时可能抛；放在 ``try`` 外面就等于
+        让"记账"能炸掉告警。
+        """
+        method = {
+            "bus_accepted": "mark_bus_accepted",
+            "committed": "mark_committed",
+        }.get(stage)
+        if method is None:
+            return
+        try:
+            sig = str(getattr(alert, "signal_id", "") or "")
+            if not sig:
+                return
+            evals = getattr(observation, "signal_evals", None)
+            if not isinstance(evals, dict) or sig not in evals:
+                return
+            fn = getattr(observation, method, None)
+            if callable(fn):
+                fn(sig, str(getattr(alert, "code", "") or ""))
+        except Exception:  # noqa: BLE001
+            pass
 
     def _dispatch_many(self, alerts: list[Alert]) -> None:
         """把本轮全部告警交给每个通知器。

@@ -231,16 +231,43 @@ class VolumeBurstRule:
             # 认为调用成功、health 也正常，用户却只看到放量告警整类消失。
             #
             # 第一阶段只**记账**，不擅自改成"缺字段就跳过门槛"——那会改变误报率
-            # （见本轮审计报告 §3.4）。所以下面仍保留原门槛判定，行为与改动前
-            # 逐字一致；新增的只是把这种情况记成 **blocking** 缺失，使
-            # "Sina 期间放量规则不可评估"从静默变为可见。降级口径等真实数据。
+            # （见本轮审计报告 §3.4）。所以下面的门槛判定与改动前逐字一致；
+            # 新增的只是把这种情况记成 **blocking** 缺失，使"Sina 期间放量规则
+            # 不可评估"从静默变为可见。降级口径等真实数据。
+            #
+            # IT-P1-EVAL-PUBLISH-001-R1：**记 blocked 就必须真的跳过该票**。
+            # 旧代码在这里只记账、**没有 continue**，于是同一票可以既被记成
+            # "判不了"(blocked) 又继续往下判并真的发出告警：
+            #     considered=1 blocked=1 evaluated_no_hit=0 hit_candidates=0
+            #     rule_selected=1            <-- 机械不变量当场被打破
+            # 这在**本轮改动前的 HEAD 上同样复现**（既有缺陷，非本次拆分引入），
+            # 由真实看板端到端对账暴露：volume_burst 出现 hit=0 而 sel=1 的轮次。
+            #
+            # 语义上正确的是"跳过"而不是"记账后照报"：turnover 是本规则的
+            # **硬依赖**（`BLOCKING_DEPS`），且 Sina 的非零换手率同样是**不可信
+            # 占位值**（见 tests/test_capabilities.py::test_capability_is_source_
+            # level_not_value_level：同源下改数值不改变可评估性判定）。既然判据
+            # 不可信，该票就该整只跳过 —— 这正是 blocked 的含义。
+            #
+            # 兼容性：真实 Sina 场景本来就送 turnover=0.0 占位，旧代码也会在下面
+            # 的数值门槛处 `continue`，所以**告警集合逐字不变**；变的只是
+            # "不再出现 blocked 却又发了告警"这种自相矛盾的记账。
             if min_turnover > 0.0 and not ctx.provides("turnover"):
                 self._mark_unavailable(ctx, code, "turnover")
-                # 缺 turnover 且 min_turnover>0 -> 该票**真的不能判**
+                # 缺 turnover 且 min_turnover>0 -> 该票**真的不能判**，整只跳过
                 _mark(obs, "mark_blocked", signal, code,
                       "turnover_not_provided", "turnover")
+                continue
             if min_turnover > 0.0 and float(q.turnover) < min_turnover:
-                continue                    # 已记 blocked，或被真实换手率拦下
+                # IT-P1-EVAL-PUBLISH-001-R2：真实的业务门槛不达标，该票是
+                # **判据完整、评估过但没到门槛** —— 必须与上面 `min_abs_pct` /
+                # 下面的 `min_amount`、量比、速度**同口径**记 `_no_hit`。
+                # 旧代码在这里直接 `continue`，于是"换手率不够"这一类的票
+                # 从账本里**彻底消失**：considered 都不涨（实测 Tencent 真实零
+                # 换手率下 considered=0），谁也无法从账本看出它们存在。
+                # 其它门槛都记、唯独这一条不记，是单纯的漏记而非设计。
+                _no_hit(code)
+                continue
             if min_amount > 0.0 and float(q.amount) < min_amount:
                 _no_hit(code)
                 continue
@@ -327,6 +354,9 @@ class VolumeBurstRule:
                 # key 里的时间桶跨桶只差 1 秒，必须另加"距上次至少 N 秒"的约束
                 cooldown_key=f"{code}:{_KIND.value}",
                 cooldown_seconds=cooldown,
+                # 稳定 signal 身份：Engine 在 bus.accept / store 之后按它记账
+                # （IT-P1-EVAL-PUBLISH-001）。不填则 Engine 只能猜，会污染账本。
+                signal_id=signal,
             )
             picked.append((ratio, alert))
             # 到门槛了 = 候选命中。注意这时还**没有**发出去 ——

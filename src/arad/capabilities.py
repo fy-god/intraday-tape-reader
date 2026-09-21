@@ -118,6 +118,28 @@ CAPABILITY_TABLE: dict[str, SourceCapabilities] = {
         depth_l1=False, depth_l5=False, outer_inner=False,
         float_cap=True, provider_time=False,
     ),
+    # ``replay``：**合成**行情源（`ReplayQuoteSource`）。它由 build_script()
+    # 直接构造 Quote，turnover / volume_ratio / 五档 / 内外盘 / 流通盘**全都有
+    # 真实数值**（实测样本 600519 turnover=0.0401）。
+    #
+    # IT-P1-EVAL-PUBLISH-001-R3：**此前这里没有 replay 条目**，于是
+    # ``capabilities_for("replay")`` 落到 ``UNKNOWN_CAPABILITIES``（全 False）。
+    # 后果不是"少报一个字段"，而是**规则整类静默**：
+    #   * volume_burst 把 turnover 当硬依赖 -> 每只票都 blocked -> 放量告警
+    #     一条都不出（实测本仓 selftest/演练模式下 volume_burst 从 6 条变 0 条）；
+    #   * spirit_order 的成交类 pattern 同样被 BLOCKING_DEPS 拦掉。
+    # 也就是说：**看板"演练模式"下演示的功能比真实源还少**，而用户看它正是
+    # 为了确认功能存在。这与 IT-P1-CAPABILITY-001（Sina 占位零）是同一类
+    # 错误——把"来源未知"当成"能力缺失"。
+    #
+    # 这张表的纪律是"以解析器/构造器实际赋了什么为准"：ReplayQuoteSource 喂的
+    # Quote 字段齐全，故如实声明全 True。注意这只是**声明**，真实值仍由数据决定
+    # （合成数据里 turnover 可能很小，那是数值不达标，走业务门槛而非能力缺失）。
+    "replay": SourceCapabilities(
+        source="replay", turnover=True, volume_ratio=True,
+        depth_l1=True, depth_l5=True, outer_inner=True,
+        float_cap=True, provider_time=False,
+    ),
 }
 
 # 能力未知的来源：全部按"不提供"处理，宁可判 unavailable 也不误判不达标。
@@ -208,14 +230,54 @@ class SignalEvalStats:
     evaluated_no_hit: int = 0
     #: 评估了、到门槛了（候选命中）。
     hit_candidates: int = 0
-    #: 其中真的发出去的告警数。``hit_candidates - published`` 就是被
-    #: ``max_per_round`` / AlertBus 冷却截掉的量 —— 必须与
-    #: ``evaluated_no_hit`` 区分，否则"被截断"会被读成"没命中"。
-    published: int = 0
+    #: 规则**选中**了多少条（= 规则内部 ``max_per_round`` 截断**之后**剩下的）。
+    #:
+    #: ⚠ 这个字段原名 ``published``，语义改了（IT-P1-EVAL-PUBLISH-001）。
+    #: 旧名叫 "published" 是**名实不符**：它是在 Rule 返回**之前**写的，
+    #: 而规则返回值之后还要经过 :meth:`AlertBus.accept` 的 key 去重与
+    #: cooldown，再经 ``store.add_alert``。被 cooldown 丢掉的那些从未
+    #: 交付给任何人，却已经计进 "published"。
+    #:
+    #: 云端 04:10 的机制反例：同一只票每 5 秒都满足 ``volume_burst``、
+    #: cooldown=600 秒、跑 24 轮 ->
+    #: ``rule_selected=24`` 而 ``AlertBus 真正接受 = 1``，**overcount 24×**。
+    #: 若拿它当"事后收益标签"的分母，会把从未交付的候选算成已发布事件。
+    rule_selected: int = 0
+    #: 通过 ``AlertBus.accept``（key 去重 + cooldown）的条数。
+    bus_accepted: int = 0
+    #: 真正写进 Store、会被看板/通知器看到的条数。
+    committed: int = 0
     #: {原因: 次数}，例如 ``{"turnover_not_provided": 3}``。
     blocked_reasons: dict[str, int] = field(default_factory=dict)
     #: 有界样本（最多 :data:`_BLOCKED_SAMPLE_CAP` 条）。
     blocked_sample: list[dict] = field(default_factory=list)
+
+    @property
+    def published(self) -> int:
+        """**兼容别名** —— 等价于 :attr:`rule_selected`。
+
+        保留它只为不打断既有调用方（``live_session`` 的 ``published`` 键、
+        旧测试）。**新代码请用 ``rule_selected`` / ``committed``**，
+        并清楚二者差在哪里。真正的"交付成功"看 :attr:`committed`。
+        """
+        return self.rule_selected
+
+    @property
+    def dropped_by_bus(self) -> int:
+        """规则选中了、却被 AlertBus 去重/冷却丢掉的条数。"""
+        return max(self.rule_selected - self.bus_accepted, 0)
+
+    @property
+    def committed_ratio(self) -> float | None:
+        """``committed / hit_candidates``；没有命中时返回 ``None``。
+
+        这是"选中的告警里到底有多少真的交付了"的交付率。用 ``None``
+        而不是 ``1.0``/``0.0`` 表示 not_measured —— 与
+        :attr:`evaluable_coverage` 同一纪律。
+        """
+        if self.hit_candidates <= 0:
+            return None
+        return self.committed / self.hit_candidates
 
     @property
     def evaluable_coverage(self) -> float | None:
@@ -229,7 +291,16 @@ class SignalEvalStats:
         return self.evaluable / self.considered
 
     def check_invariants(self) -> list[str]:
-        """返回违反的机械不变量列表（空 = 全部成立）。"""
+        """返回违反的机械不变量列表（空 = 全部成立）。
+
+        交付阶段链（IT-P1-EVAL-PUBLISH-001）::
+
+            hit_candidates >= rule_selected >= bus_accepted >= committed
+
+        每一级都是上一级的**子集**：截断砍掉一部分、去重/冷却再砍一部分。
+        这条链若被破坏，说明有人在错误的阶段记账 —— 正是旧 ``published``
+        的问题（它在链的**第一**级就被写上，却被当成最后一级用）。
+        """
         bad: list[str] = []
         if self.evaluable + self.blocked_capability != self.considered:
             bad.append(
@@ -241,10 +312,18 @@ class SignalEvalStats:
                 f"{self.signal}: evaluated_no_hit({self.evaluated_no_hit}) + "
                 f"hit_candidates({self.hit_candidates}) != "
                 f"evaluable({self.evaluable})")
-        if self.published > self.hit_candidates:
+        if self.rule_selected > self.hit_candidates:
             bad.append(
-                f"{self.signal}: published({self.published}) > "
+                f"{self.signal}: rule_selected({self.rule_selected}) > "
                 f"hit_candidates({self.hit_candidates})")
+        if self.bus_accepted > self.rule_selected:
+            bad.append(
+                f"{self.signal}: bus_accepted({self.bus_accepted}) > "
+                f"rule_selected({self.rule_selected})")
+        if self.committed > self.bus_accepted:
+            bad.append(
+                f"{self.signal}: committed({self.committed}) > "
+                f"bus_accepted({self.bus_accepted})")
         if self.advisory_missing > self.evaluable:
             bad.append(
                 f"{self.signal}: advisory_missing({self.advisory_missing}) > "
@@ -261,7 +340,16 @@ class SignalEvalStats:
             "advisory_missing": self.advisory_missing,
             "evaluated_no_hit": self.evaluated_no_hit,
             "hit_candidates": self.hit_candidates,
-            "published": self.published,
+            # 交付阶段链（IT-P1-EVAL-PUBLISH-001）——
+            # 三级分开记，消费方才能分辨"被截断"与"被冷却"。
+            "rule_selected": self.rule_selected,
+            "bus_accepted": self.bus_accepted,
+            "committed": self.committed,
+            "dropped_by_bus": self.dropped_by_bus,
+            "committed_ratio": (round(self.committed_ratio, 4)
+                                if self.committed_ratio is not None else None),
+            # 兼容键：等价于 rule_selected。**不要**再用它当"已发布"。
+            "published": self.rule_selected,
             # None 表示 not_measured；不要用 0.0 冒充"整类失效"。
             "evaluable_coverage": (round(cov, 4) if cov is not None else None),
             "blocked_reasons": dict(self.blocked_reasons),
@@ -448,13 +536,29 @@ class RoundObservationSet:
             st.evaluated_no_hit += 1
 
     def mark_published(self, signal: str, code: str) -> None:
-        """该 code 的命中**真的发出去了**（未被截断/冷却吞掉）。
+        """规则**选中**了该 code 的命中并让它进入返回值。
 
-        注意它**不**落终态桶：published 是 hit_candidate 的后续状态，
-        不是与 blocked/evaluated 并列的第三种终态。
+        ⚠ 语义已改（IT-P1-EVAL-PUBLISH-001）：这里记的是
+        :attr:`SignalEvalStats.rule_selected`，**不是**"已发布"。
+        真正的交付由 :meth:`mark_bus_accepted` / :meth:`mark_committed`
+        在 Engine 走完 ``AlertBus.accept`` 与 ``store.add_alert`` 后记。
+
+        保留方法名 ``mark_published`` 是为了不打断既有规则调用点
+        （``volume_burst`` / ``spirit_order`` 各一处）；它们记的本来
+        就只是"规则选中"，所以调用点无需改动、语义反而更正。
         """
         st = self.eval_stats(signal)
-        st.published += 1
+        st.rule_selected += 1
+
+    def mark_bus_accepted(self, signal: str, code: str) -> None:
+        """该 code 的告警通过了 ``AlertBus.accept``（key 去重 + cooldown）。"""
+        st = self.eval_stats(signal)
+        st.bus_accepted += 1
+
+    def mark_committed(self, signal: str, code: str) -> None:
+        """该 code 的告警真正写进了 Store（会被看板/通知器看到）。"""
+        st = self.eval_stats(signal)
+        st.committed += 1
 
     def check_signal_invariants(self) -> list[str]:
         """全部 signal 的机械不变量自检，返回违规列表（空 = 全成立）。"""

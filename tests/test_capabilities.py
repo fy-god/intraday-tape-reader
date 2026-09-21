@@ -140,6 +140,53 @@ def test_unknown_source_is_conservative():
         assert not caps.supports("turnover")
 
 
+def test_replay_source_declares_the_fields_it_really_builds():
+    """IT-P1-EVAL-PUBLISH-001-R3：``replay`` 必须登记能力，否则规则整类静默。
+
+    ``ReplayQuoteSource`` 由 ``build_script()`` 直接构造 ``Quote``，字段齐全
+    （实测 ``600519 turnover=0.0401``）。此前 ``CAPABILITY_TABLE`` 里**没有**
+    ``replay`` 条目，于是回落到 ``UNKNOWN_CAPABILITIES``（全 False），
+    后果是 ``volume_burst`` 把 turnover 当硬依赖 -> 每只票 blocked ->
+    放量告警**一条都不出**（实测 selftest 里 volume_burst 从 6 条掉到 0 条）。
+
+    这与 IT-P1-CAPABILITY-001（Sina 占位零）同类：把"来源未知"错当
+    "能力缺失"。看板演练模式恰恰是用户确认功能存在的地方，不能比真实源还少。
+    """
+    r = CAPABILITY_TABLE["replay"]
+    assert r.turnover and r.volume_ratio, "合成行情确实给了这两个字段"
+    assert r.depth_l1 and r.depth_l5, "五档由 build_script 构造"
+    assert r.outer_inner and r.float_cap
+    # 反过来：它**不该**被当成未知源
+    assert capabilities_for("replay").supports("turnover") is True
+    assert capabilities_for("replay") is not UNKNOWN_CAPABILITIES
+
+
+def test_replay_declaration_matches_real_quotes():
+    """声明必须与合成源**真的构造出来**的 Quote 字段一致（防表与实现漂移）。"""
+    from arad.replay import Replay, default_universe
+    from arad.config import load_settings
+
+    st = load_settings(use_cache=False)
+    rp = Replay(default_universe(5), seed=42, minutes=10, settings=st,
+                rules=[], notifiers=[], store=None)
+    src = rp.build_engine().source
+    quote = None
+    for ts in rp.timeline[:1]:
+        rp.clock.set(ts)
+        batch = src.snapshots([s.code for s in default_universe(5)])
+        if batch:
+            quote = batch[0]
+    assert quote is not None, "合成源必须能取到一帧"
+    caps = capabilities_for("replay")
+    for key, val in (("turnover", quote.turnover),
+                     ("volume_ratio", quote.volume_ratio),
+                     ("depth_l5", quote.has_depth),
+                     ("outer_inner", quote.outer_vol or quote.inner_vol),
+                     ("float_cap", quote.float_shares)):
+        assert caps.supports(key), f"表说 replay 不提供 {key}，但合成数据有"
+        assert val is not None, f"{key} 在合成 Quote 里必须有值"
+
+
 def test_capabilities_for_prefers_instance_declaration():
     """源自己声明的 capabilities 优先于内置表（第三方源可覆盖）。"""
 

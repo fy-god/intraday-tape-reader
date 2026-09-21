@@ -1207,6 +1207,10 @@ class SpiritOrderRule:
             metrics=m,
             cooldown_key=f"{code}:{_KIND.value}:{pattern}",
             cooldown_seconds=self._cooldown,
+            # 稳定 signal 身份（须与账本键一致：spirit_order.<pattern>）。
+            # Engine 在 bus.accept / store 之后按它记账；不填就只能靠 title 猜，
+            # 8 个 pattern 共用同一 AlertKind，猜错必然串账。
+            signal_id=signal_name(pattern),
         )
 
 

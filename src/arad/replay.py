@@ -149,15 +149,26 @@ class ScriptedStock:
     float_cap: float = 50.0        # 亿元，用于 filters 的市值过滤
     vol_base: float = 20000.0      # 起始累计成交量（手）
 
-    def limit_rate(self) -> float:
-        """按**代码**算涨跌停比例。
+    def limit_rate(self, when: object = None) -> float:
+        """按**代码**算涨跌停比例；``when`` 是交易日（影响 ST 制度 5%→10%）。
 
         必须传 ``self.code``：``limit_rate_of`` 内部靠代码前缀判板块，
         传 ``Board`` 枚举会被判成 ``Board.OTHER``（10%），
         导致创业板/科创板剧本的涨停价算错（如 300750 会算成 55.00 而非 60.00），
         整个离线校验的价值就没了。
+
+        IT-P1-ST-REPLAY-BYPASS-001（**既有缺陷**，本轮由云端 11:31 审计指认、
+        我已独立复现）：本方法原先**不传日期**，于是 ``limit_rate_of`` 落到
+        "按现行制度"，回放任何历史交易日的主板 ST 都得到 10% —— 而 2026-07-06
+        之前是 5%。因为 ``build_script`` 把这个值算成 ``limit_up``/``limit_down``
+        塞进 ``Quote``（见下），而 ``Quote.limit_up_price`` 在 ``limit_up>0`` 时
+        **提前返回**，``Quote`` 里那条日期感知分支**永远不会执行**：
+        整条回放链路结构性地绕过了 ST 修复。
+
+        实测（回放 2025-03-10 主板 ST ``600001``）：``limit_up_price=11.00``，
+        而当时 5% 制度下正确值是 **10.50** —— 真实 5% 封板不会被识别为涨停。
         """
-        return limit_rate_of(self.code, self.name)
+        return limit_rate_of(self.code, self.name, when)
 
     def listed_days(self) -> str:
         """上市日期占位，避免 ``filters.min_list_days`` 因缺字段而误杀。"""
@@ -246,7 +257,10 @@ def build_script(stock: ScriptedStock, timeline: Sequence[datetime],
     n = len(timeline)
     if n == 0:
         return []
-    rate = stock.limit_rate()
+    # IT-P1-ST-REPLAY-BYPASS-001：必须把**回放当日**传给涨跌停判定，
+    # 否则 ST 制度变更（2026-07-06 主板 5%→10%）在整条回放链路上被绕过。
+    trade_day = timeline[0].date()
+    rate = stock.limit_rate(trade_day)
     limit_up = round(stock.start_price * (1 + rate), 2)
     limit_down = round(stock.start_price * (1 - rate), 2)
     # 触发窗口（以 tick 数表示）

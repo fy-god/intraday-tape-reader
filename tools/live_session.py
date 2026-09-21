@@ -268,17 +268,28 @@ def make_round_sample(
             for sig, cell in sig_ev.items():
                 if not isinstance(cell, dict):
                     continue
-                slim[str(sig)] = {
+                row = {
                     "considered": _safe_int(cell.get("considered")),
                     "evaluable": _safe_int(cell.get("evaluable")),
                     "blocked_capability": _safe_int(cell.get("blocked_capability")),
                     "advisory_missing": _safe_int(cell.get("advisory_missing")),
                     "hit_candidates": _safe_int(cell.get("hit_candidates")),
+                    # 兼容键：等价 rule_selected。保留是为了旧消费方不炸，
+                    # 但**不再是**交付数的真值来源。
                     "published": _safe_int(cell.get("published")),
                     "blocked_reasons": (
                         dict(cell.get("blocked_reasons"))
                         if isinstance(cell.get("blocked_reasons"), dict) else {}),
                 }
+                # IT-P1-EVAL-PUBLISH-001：交付三级**仅在源样本真的有该键时**
+                # 才写进 slim。写成 `_safe_int(cell.get(...))` 会让缺失的键
+                # 变成 0 —— 于是下游"键在不在"的探测永远为真，旧轮样本
+                # 会被读成"交付 0 条"（把字段缺失误报成灾难）。
+                for k in ("rule_selected", "bus_accepted", "committed",
+                          "dropped_by_bus"):
+                    if k in cell:
+                        row[k] = _safe_int(cell.get(k))
+                slim[str(sig)] = row
             out["signal_evaluability"] = slim
         caps = obs.get("capabilities")
         out["capabilities"] = dict(caps) if isinstance(caps, dict) else {}
@@ -409,7 +420,13 @@ def summarize_rounds(rounds: Sequence[dict], *,
     ev_blocked: dict[str, int] = {}              # signal -> blocked_capability
     ev_advisory: dict[str, int] = {}             # signal -> advisory_missing
     ev_hits: dict[str, int] = {}                 # signal -> hit_candidates
-    ev_published: dict[str, int] = {}            # signal -> published
+    ev_published: dict[str, int] = {}            # signal -> published（兼容别名）
+    # IT-P1-EVAL-PUBLISH-001：交付阶段链三级。
+    # ``published`` 只是 ``rule_selected`` 的别名，**不能**代表交付；
+    # 用户真正收到多少看 ``ev_committed``。
+    ev_selected: dict[str, int] = {}             # signal -> rule_selected
+    ev_bus: dict[str, int] = {}                  # signal -> bus_accepted
+    ev_committed: dict[str, int] = {}            # signal -> committed
     ev_blocked_by_reason: dict[str, int] = {}    # reason -> 次数（跨 signal 汇总）
     ev_rounds = 0                                # 真的带了 signal_evaluability 的轮数
 
@@ -512,6 +529,19 @@ def summarize_rounds(rounds: Sequence[dict], *,
                     cell.get("hit_candidates"))
                 ev_published[s_key] = ev_published.get(s_key, 0) + _safe_int(
                     cell.get("published"))
+                # IT-P1-EVAL-PUBLISH-001：交付三级各自累计。
+                # 读不到时**退回 published**（旧轮样本只有这一个键）——
+                # 不能退成 0，否则旧样本会被读成"一条都没交付"。
+                _legacy_pub = _safe_int(cell.get("published"))
+                ev_selected[s_key] = ev_selected.get(s_key, 0) + (
+                    _safe_int(cell.get("rule_selected"))
+                    if "rule_selected" in cell else _legacy_pub)
+                ev_bus[s_key] = ev_bus.get(s_key, 0) + (
+                    _safe_int(cell.get("bus_accepted"))
+                    if "bus_accepted" in cell else _legacy_pub)
+                ev_committed[s_key] = ev_committed.get(s_key, 0) + (
+                    _safe_int(cell.get("committed"))
+                    if "committed" in cell else _legacy_pub)
                 reasons = cell.get("blocked_reasons")
                 if isinstance(reasons, dict):
                     for rk, rv in reasons.items():
@@ -602,6 +632,13 @@ def summarize_rounds(rounds: Sequence[dict], *,
                 "blocked_capability": ev_blocked.get(sig, 0),
                 "advisory_missing": ev_advisory.get(sig, 0),
                 "hit_candidates": ev_hits.get(sig, 0),
+                # 交付三级（IT-P1-EVAL-PUBLISH-001）
+                "rule_selected": ev_selected.get(sig, 0),
+                "bus_accepted": ev_bus.get(sig, 0),
+                "committed": ev_committed.get(sig, 0),
+                "dropped_by_bus": max(
+                    ev_selected.get(sig, 0) - ev_bus.get(sig, 0), 0),
+                # 兼容别名：== rule_selected。**不是**交付数。
                 "published": ev_published.get(sig, 0),
                 # 没有分母时是 None（not_measured），**不是 0.0** ——
                 # 填 0 会把"这一项没测"误报成"整类失效"。
@@ -618,6 +655,15 @@ def summarize_rounds(rounds: Sequence[dict], *,
         "evaluability_advisory_total": sum(ev_advisory.values()),
         "evaluability_hit_candidates_total": sum(ev_hits.values()),
         "evaluability_published_total": sum(ev_published.values()),
+        # IT-P1-EVAL-PUBLISH-001：交付三级总量。
+        # ``evaluability_published_total`` == ``evaluability_rule_selected_total``
+        # （别名），它**不是**交付数；真正交付看 ``evaluability_committed_total``。
+        "evaluability_rule_selected_total": sum(ev_selected.values()),
+        "evaluability_bus_accepted_total": sum(ev_bus.values()),
+        "evaluability_committed_total": sum(ev_committed.values()),
+        "evaluability_dropped_by_bus_total": sum(
+            max(ev_selected.get(s, 0) - ev_bus.get(s, 0), 0)
+            for s in ev_selected),
         "evaluability_blocked_by_reason": ev_blocked_by_reason,
         "worst_rounds": worst,
     }

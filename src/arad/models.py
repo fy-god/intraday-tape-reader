@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime
 from enum import Enum
 import math
+import re
 
 __all__ = [
     "Board",
@@ -52,6 +53,13 @@ ST_LIMIT_RATE_LEGACY = 0.05          # 2026-07-06 之前
 ST_LIMIT_RATE_CURRENT = 0.10         # 2026-07-06 起
 ST_LIMIT_RATE_CHANGED_ON = date(2026, 7, 6)
 
+#: 日期串的**严格**形态（YYYY-MM-DD / YYYYMMDD / YYYY/MM/DD）。
+#: 必须显式钉位数：``strptime(..., "%Y%m%d")`` 会宽松接受 ``"2025031"``
+#: 并解析成 2025-03-01，把 7 位乱码当成合法日期（实测）。
+_DATE_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})$"
+                      r"|^(\d{4})(\d{2})(\d{2})$"
+                      r"|^(\d{4})/(\d{2})/(\d{2})$")
+
 
 def market_rule_version(when: date | datetime | None = None) -> str:
     """该交易日适用的市场规则版本号（可写入告警/样本身份，便于事后追溯）。"""
@@ -62,13 +70,64 @@ def market_rule_version(when: date | datetime | None = None) -> str:
 
 
 def _as_date(when: date | datetime | None) -> date | None:
-    """把 ``date``/``datetime`` 归一成 ``date``；``None``/非法值返回 ``None``。"""
+    """把 ``date``/``datetime``/常见字符串与整数形式归一成 ``date``。
+
+    IT-P1-UNKNOWN-DATE-FAILOPEN-001（**既有缺陷**，本轮由云端 11:31 审计指认、
+    我已独立复现）：本函数原先只认 ``date``/``datetime`` 实例，**其它一律
+    返回 ``None``**。而调用方把 ``None`` 解释成"拿不到交易日 -> 按现行制度算"，
+    于是**一个完全可解析的历史日期字符串会静默套用现行制度**：
+
+        st_limit_rate_on("2025-03-10") == 0.10   # 错！当时是 0.05
+        st_limit_rate_on("20250310")   == 0.10   # 错！
+        st_limit_rate_on(20250310)     == 0.10   # 错！
+
+    这不是理论问题：``Quote.ts`` 由真实解析器填充，而它们**确实**会给出
+    字符串或 ``None`` —— ``sources/sina.py``、``sources/eastmoney.py`` 的
+    ``_ts_of``、``sources/tencent.py``（``len(fields) <= I_TIMESTAMP`` 时给
+    ``None``）、``server/web.py:coerce_ts`` 都在这条路径上。
+    当日无影响（今天现行制度恰是 10%），但在**历史回放**或**制度再次变更后**
+    立刻变成真实故障：5% 制度下的封板会被算成"没到板"而漏报，或把
+    ``limit_board`` 状态机判错。
+
+    因此这里补齐真实出现过的输入形态：ISO 串 ``"2025-03-10"``、
+    紧凑串 ``"20250310"``、斜杠串 ``"2025/03/10"``、以及等价的整数
+    ``20250310``。**仍然无法解析的**（``None``/空串/乱码/epoch 秒）返回
+    ``None``，保持既有"按现行制度"的降级语义不变 —— 本次只修"可解析却被
+    当成不可解析"这一处静默错误，不改变真正的未知情形。
+    """
     if when is None:
         return None
     if isinstance(when, datetime):
+        # 注意 datetime 是 date 的子类，必须先判，否则会丢掉时间部分后又 .date()
         return when.date()
     if isinstance(when, date):
         return when
+    # --- 真实解析器会给出的字符串/整数形态 -----------------------------
+    if isinstance(when, str):
+        s = when.strip()
+        if not s:
+            return None
+        # ⚠ 不能只靠 strptime：``strptime("2025031", "%Y%m%d")`` 会**宽松地**
+        # 解析成 2025-03-01（它允许个位数的月/日），于是 7 位乱码被当成合法
+        # 日期。所以先用正则**钉住位数**，再交给 strptime 校验真实性。
+        m = _DATE_RE.match(s)
+        if m is None:
+            return None
+        # 三个分支各 3 组，未参与匹配的分支是 None —— 取非 None 的那三个。
+        parts = [g for g in m.groups() if g is not None]
+        if len(parts) != 3:
+            return None
+        y, mo, d = (int(g) for g in parts)
+        try:
+            return date(y, mo, d)
+        except ValueError:
+            return None
+    if isinstance(when, int) and not isinstance(when, bool):
+        # 仅接受 8 位 YYYYMMDD；epoch 秒（10 位）等一律不在此列。
+        s = str(when)
+        if len(s) != 8 or not s.isdigit():
+            return None
+        return _as_date(s)          # 复用上面的位数校验 + 真实性校验
     return None
 
 
@@ -481,6 +540,16 @@ class Alert:
     #: 虽然只差 1 秒，key 却不同，去重完全失效——实测两条急拉告警只隔 **11 秒**
     #: （配置的 cooldown 是 300 秒）。加上这个字段后才是真正的"至少隔 300 秒"。
     cooldown_seconds: float = 0.0
+    #: 稳定 signal 身份，取值与 ``SignalEvalStats`` 的账本键**完全一致**
+    #: （如 ``"volume_burst"``、``"spirit_order.institution_buy"``）。
+    #:
+    #: 为什么必须有它（IT-P1-EVAL-PUBLISH-001）：Engine 要在
+    #: ``AlertBus.accept`` 与 ``store.add_alert`` 之后**按 signal 记账**。
+    #: 没有这个字段，Engine 只能用 ``title`` 文案或 ``cooldown_key`` 去猜
+    #: 所属 signal —— 猜错就会把交付数记到别的信号头上，账本比不记还糟。
+    #: 由**产生该告警的规则**填写（它本来就知道自己的 signal 名）；
+    #: 留空表示该规则不参与 signal 账本（Engine 会跳过，不凭空建条目）。
+    signal_id: str = ""
 
     def to_dict(self) -> dict:
         def _num(v: object) -> object:
@@ -524,6 +593,24 @@ class Alert:
             "title": self.title,
             "detail": self.detail,
             "severity": self.severity,
+            # IT-P1-EVAL-PUBLISH-001：把稳定 signal 身份带给下游。
+            # 没有它，消费方（看板/报告/事后标签）只能用 title 文案反推
+            # 这条告警属于哪个 signal —— 8 个 spirit pattern 共用同一
+            # AlertKind 且文案会改，反推必然错。留空表示该规则不参与
+            # signal 账本（如实透出空串，不伪造成某个 signal）。
+            "signal_id": self.signal_id,
+            # IT-P2-RULE-VERSION-DEAD-001：把**该告警生成时适用的市场规则版本**
+            # 写进载荷，让"这条是按 5% 还是 10% 制度算的"可事后追溯。
+            #
+            # 为什么必须在这里接上：``market_rule_version`` 此前**零调用、零测试**
+            # （云端 11:31 审计指认，我已复核：全仓仅 ``models.py`` 的
+            # ``__all__`` 与定义两处命中）—— 一个导出了、有 docstring、还被报告
+            # 当作"便于事后追溯"来宣传的 API，实际没有任何消费者，
+            # 属于**死代码**。接在 to_dict() 是成本最低的真实消费点：
+            # alert 是唯一会被落盘/推流/长期保存的载体，正是"事后追溯"的场景。
+            #
+            # 用 ``self.ts`` 取交易日，所以历史回放的告警会如实带上当时的版本。
+            "rule_version": market_rule_version(self.ts),
             "metrics": {k: _num(v) for k, v in self.metrics.items()},
         }
 
