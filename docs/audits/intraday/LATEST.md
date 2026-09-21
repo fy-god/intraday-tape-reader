@@ -1,16 +1,72 @@
 # 最新审计
 
-**最新本地 Agent 轮**：[`2026-09-21_17-00-00_JST.md`](./2026-09-21_17-00-00_JST.md)  
+**最新本地 Agent 轮**：[`2026-09-21_17-40-00_JST.md`](./2026-09-21_17-40-00_JST.md)  
+**上一份本地 Agent 产品轮**：[`2026-09-21_17-00-00_JST.md`](./2026-09-21_17-00-00_JST.md)  
 **最新云端独立审计**：[`2026-09-21_16-07-37_JST.md`](./2026-09-21_16-07-37_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-21_16-07-37_JST_AGENT_TASK.md`](./2026-09-21_16-07-37_JST_AGENT_TASK.md)  
 **上一份本地 Agent 轮**：[`2026-09-21_13-37-29_JST.md`](./2026-09-21_13-37-29_JST.md)  
-**上一份本地 Agent 产品轮**：[`2026-09-21_13-00-00_JST.md`](./2026-09-21_13-00-00_JST.md)  
 **上一份云端独立审计**：[`2026-09-21_12-02-53_JST.md`](./2026-09-21_12-02-53_JST.md)  
-**上一份云端 Agent 任务书**：[`2026-09-21_12-02-53_JST_AGENT_TASK.md`](./2026-09-21_12-02-53_JST_AGENT_TASK.md)  
 **下一步计划**：[`NEXT_STEPS.md`](./NEXT_STEPS.md)  
 **仓库执行清单**：[`RUN_MANIFEST.json`](./RUN_MANIFEST.json)
 
 > 历史审计文件均保留在本目录；本索引只移动当前接续指针，不删除历史报告。
+
+## 2026-09-21 17:40 JST 独立审计轮（**复核 6997487：修复通过；但新门禁在运营面上只读"末轮"，且 R-12 仍不可观测**）
+
+- 被审：`6997487f0ec5d92f81299edbb8c68845e9e056a8`（上一被审基线 `eba8c4af5ed943a023ab09ab9c30000c1ac58f65`）。
+- 取证：全量 pytest **1660 passed in 120.52s（exit 0）**；`tools/check_*.py` **8/8 exit 0**。
+
+### ✅ `IT-P1-DELIVERY-LEDGER-002` 修复**复核通过、并独立复现**
+
+真实 `Replay + Engine + Store`（361 轮 / 30 只 / `seed=42`）：Store 里 **66/66** 告警带 `signal_id`；**逐 signal 账本 `committed` 与 Store 实数逐条相等**（`limit_board.*` / `tick_surge.*` / `unusual.*` / `volume_burst` 共 8 个 signal）。**修复前的 `6/66 = 0.0909` 我也独立复现**（用 `eba8c4a` 的旧门禁在同一批告警上做反事实）。
+
+**MUTATION 测试确认新门禁不是恒真式**（这是必须做的）：1/3 未打标 → `0.6667`；全未打标 → `0.0`；分母 0 → `None`（不是伪造的 1.0）。提交作者显式避开了"分子分母同源 → 覆盖率恒 1.0"的陷阱，**这一点做对了**。
+
+**⚠ 但必须限定**：9 个 `Alert(...)` 站点**全部**赋非空 `signal_id`（4 处三元表达式**两个分支都是非空字面量**），`RULE_MODULES` 恰好是这 7 个模块，`entry_point`/`pkgutil`/`plugin` 在 `src/` **0 命中** —— **不存在新增规则的第三方路径**。故 **`coverage == 1.0` 在当前规则集上是恒真式**：`9.1% → 100%` 作为**历史差量**为真，但 `100%` 是**这次编辑的性质**，不是**持续被验证的状态**；其唯一剩余价值是**未来某条规则忘填 `signal_id` 时的回归绊线**。
+
+### ⚠ `IT-P1-DELIVERY-FALSE-GREEN-001`（**本轮新增 · P1 · 已确认 · 最危险**）**账本永久损坏却报 PASS**
+
+`engine.py:1322-1325` 用**裸 `try/except Exception: pass`** 包住**分母自增本身**；`capabilities.py:831-833` 又用 `max(total - named, 0)` **夹逼**门禁。我构造并运行了反例（`D:\ccc\_sched\work\asr_h16_falsegreen.py`）：
+
+- **假绿**：分母自增抛异常 → 被吞掉 → `committed_alerts_total` 停在 0 → 门禁读 **0（PASS）**、`signed_ratio` 读 `None`。**一个彻底坏掉的账本与一个完美的账本，在运营面上完全无法区分。**
+- **夹逼把"少算"变成 PASS**：分母 1 / 分子 3 → `max(-2,0) = 0`（PASS），且 `signed_ratio = 3.0`（数学上不可能）而不触发任何告警。
+- **假红**：分子侧异常 → 门禁报 2 违规，而**那 2 条告警全部带 `signal_id`**（冤枉无辜规则）。
+
+全仓库**没有任何吞异常计数器**（`git grep -E 'swallow|_mark_errors|mark_failures|observability_errors' -- src` → 0 命中）；同文件 `_dispatch_many`（`:1462-1463`）**是有日志的** —— **内部标准不一致**。**修复：`except` 里计数并 `log.exception`；去掉或替换 `max(...,0)` 夹逼。**
+
+### ✅ `check_delivery_invariants()` 在生产里**零调用**（证伪成功）
+
+`git grep -n check_delivery_invariants` → **只有它自己的定义**（`capabilities.py:711`）+ 2 行散文。**连新测试都没调用**（新测试只测 `SignalDeliveryStats.check_invariants()` 的**单实例**版）。故 `NEXT_STEPS.md:11` 的"**逐轮交付不变量违规 0**"是**测试口径**，**不是生产保证**。
+
+### ⚠ `IT-P1-DELIVERY-GATE-PERROUND-001`（**本轮新增 · P1 · 已确认**）新门禁是"逐轮"的，运营面读到的是**最后一轮**
+
+`store.observation` 只保留最近一轮的 `as_dict()`（`store.py:156` 每轮**覆盖**）。实测 361 轮：**累计** 66/66 = **1.0**，但**末轮** `committed_alerts_total = 0` → 运营面 `signed_ratio = None`、`first_party_committed_without_signal_id = 0`。**305/361 轮是 0 条告警**，故该门禁绝大多数时候读 `None`。仓库内 `committed_alerts_total` **只有 `engine.py:1323` 一个写入点**，`store.py` / `web.py` / `cli.py` 对它**0 命中** —— **没有任何累计计数器可达运营面**。
+
+### ⚠ `R-12`（**仍是最严重未修项 · 且本轮确认它连可观测性都没有 · 头号数字还系算错**）
+
+新门禁对扫描范围**完全不敏感**：实测 100% 与 69% 扫描 `coverage` **都读 1.0** —— 它是**告警**的账，不是**标的**的账。引擎**已经知道**池子被截断（`engine.py:938-940/964-966` 打警告；`meta` 存于 `engine.py:953/972`，含 `eastmoney.py:474` 的 `usable_coverage`），但**零出口**：`store.py` / `web.py` / `cli.py` / `replay.py` / `session.py` 对 `universe_meta` **全部 0 命中**，唯一读取者是 `tests/test_engine.py:929-930` 戳私有属性。运营面唯一可见的是 `store.py:304` 的 `"universe": len(quotes)` —— **被截断后**的数量。**"没报警"与"没扫到"在产品上依旧等价。**
+
+**❗ 并且线内引用的头号数字本身算错了**（5 处文档：`13-00-00_JST.md:390/:403`、`17-00-00_JST.md:194`、`LATEST.md:56/:107`、`NEXT_STEPS.md:93-94`）：写的是 `4090/5917 = 73.0%`、`4576/5917 = 83.1%`，**实际是 `69.1229%` 与 `77.3365%`**；且分母 `5917` **不在任何机器产物中**（`git grep 5917 -- src tests fixtures tools` 仅命中 `fixtures/` 的字节巧合；代码口径是 **`5913`**）。**标为 `未复现`。修 `R-12` 的第一步不是加门禁，而是先落盘一个真实覆盖率数字。**
+
+**离线复现（我采信子 agent）**：`EastmoneySource(max_pages=41)` → `4100/5913 = 69.3%`、`transport_complete=False`，但 `refresh_universe()` **仍返回 4100 并写入 `eng._codes`**（部分池被静默接受，`engine.py:968-975`）；`tools/live_session.py:814-1139` 的 `evaluate_health` **完全无 universe 项**，对 `universe_size ∈ {0, 4100, 5000, 5563}` 给出**逐字节相同**的 `healthy=True exit=0`。**附带澄清**：默认 `page_size=100` / `max_pages=80` 时 `ceil(5913/100)=60 ≤ 80`，**`max_pages` 截断在算术上不可能** —— 任何短缺都是源端侧。
+
+### 其余本轮发现
+
+- `R-15`（**已复现崩溃**）：`Alert(ts=None).to_dict()` → `AttributeError: 'NoneType' object has no attribute 'strftime'`（`models.py:590`；`ts` 在 `:526` 是**非可选**，对比 `Quote.ts` 在 `:332` 是 `datetime | None`）。**单元层 100% 复现**；端到端可达性 `未复现`（引擎自身总传 `now`）。影响面大：`to_dict()` 是所有出站必经点。**一行守卫即可修。**
+- `IT-P1-NOTIFY-RESULT-001/002`（**仍未修**）：`NotificationResult` 与 `event_id` 在 `src/ tools/ tests/ fixtures/` **全 0 命中**；引擎**丢弃**通知返回值（`engine.py:1443/:1458/:1461`）；7 个通知器在"禁用/跳过"时**全部 `return True`** → **`skipped` 与 `sent` 不可区分**。
+- `R-14`（**仍未修 · 装饰性**）：`rule_version` 确为 write-only —— `src/`+`tools/` 穷举只命中 `models.py:27/64/605/613`；`tools/` **0 次**、`web.py`/`store.py`/`dashboard.html` **各 0 次**。
+- `R-13`（**有意默认，非缺陷**）：我实测 `build_rules(默认配置)` 只产 **4/7** 规则 `['limit_board','tick_surge','unusual','volume_burst']`，三个 `spirit_*` 在 `settings.yaml:188/223/257` 为 `enabled: false`。
+- `R-17`（**收窄**）：真正会漂移的是 **4 处字面量站点**（`limit_board.py:354/390/496`、`tick_surge.py:287`），它们与同 dict 里的 `metrics["pattern"]` 是同一事实的两份拷贝；另 3 个规则是 `f"...{pattern}"` 派生（不漂移）。`tools/` 8 个检查器**没有一个覆盖 `signal_id`**。**无一致性门禁。**
+  - **⚠ 警告**：`NEXT_STEPS.md:85-86` 提议的门禁 `signal_id == f"{module}.{pattern}"` **会对 3/7 规则误报** —— `tick_surge` 与 `volume_burst` 的 `metrics` **根本没有 `pattern` 键**，且 `volume_burst` 的 `signal_id` 是**无点裸串** `"volume_burst"`。必须带豁免表。
+- `IT-P2-ALERT-DICT-ROUNDTRIP-001`（**新增**）：`web.py:272-284` 从 dict 重建 `Alert` 时读 11 字段、**丢掉 `signal_id`**，而 `Alert.to_dict()` **是写出它的** —— 有损往返，静默（`signal_id` 默认 `""`）。
+- `web.py` 的 `spirit.signal_of` 取值链是 `metrics["pattern"] → metrics["signal"] → AlertKind`，**不含 `signal_id`** —— 看板信号名与账本 `signal_id` 无强制一致关系。
+- 一处**恒真式测试**：`tests/test_delivery_ledger_decoupled.py:162-180` 的 `test_signal_id_alone_is_not_enough`，其 L174/L176 对任何实现都成立（新建对象 `signal_evals` 本为空），**从未构造过旧门禁**。声称的结论**我独立确认成立**，但那条测试没有证明它。
+
+**本轮结论**：修复**真实且可复现**；但 §2.4 / §3 / §3.5 / §4 几条新的 P1 说明 —— **"交付账已闭合"不等于"这一轮扫描可信"**，也不等于"账本坏了会被发现"。后两者才是决定"没报警"能否被解释的。**
+
+**⚠ 更正上一轮（17:00）的两条结论**：① "`signed_ratio` = 1.0"是**会话累计**，运营面实际只读**末轮**（本 361 轮末轮为 0 条 → `None`）；② "逐轮交付不变量违规 0"是**测试口径**，生产零调用。
+
+---
 
 ## 2026-09-21 17:00 JST 本地 Agent 轮（产品改动：交付账本解耦）
 
