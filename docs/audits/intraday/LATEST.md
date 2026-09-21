@@ -38,6 +38,20 @@
 
 `git grep -n check_delivery_invariants` → **只有它自己的定义**（`capabilities.py:711`）+ 2 行散文。**连新测试都没调用**（新测试只测 `SignalDeliveryStats.check_invariants()` 的**单实例**版）。故 `NEXT_STEPS.md:11` 的"**逐轮交付不变量违规 0**"是**测试口径**，**不是生产保证**。
 
+### ⚠ `IT-P1-SOAK-LEDGER-BLIND-001`（**新增 · P1 · 我独立复现**）soak 长跑对交付账本**完全盲**
+
+用 `tools/live_session.py` **自己的常量**做端到端复现：`_OBSERVATION_MARKER_KEYS`（15 键）/ `_OBSERVATION_VALUE_FIELDS`（14 键）**都以旧账本 `signal_evaluability` 结尾**，真实 `as_dict()` 里的 `signal_delivery` 与 `delivery_accounting` **两个白名单都不含**。故 soak 的采样产物与阈值判定**永远看不到新门禁**。
+
+**汇总**：新门禁的执法者**只有单元测试** —— `tools/check_*.py` **8/8 零覆盖**（§2.5）、`check_delivery_invariants()` **零生产调用**（上条）、soak **白名单不含**（本条）、`dashboard.html` 零渲染。**"算得出、进 JSON、没人看"。**
+
+### ❌ 推翻子 agent C 的一处推理：`global_ignored` **不是** vestigial
+
+C 据 `engine.py:1144` 排除 ignore 码推断 `:1295` 分支"近似不可达"。**该推理漏看了 `:1148-1159` 的 watchlist 回填**：规则实际看到的 `snap.quotes = watch_cur ∪ eligible`，而 `watch_cur` **只按 `self.watchlist` 过滤、不做 ignore 判定**。故只要某代码**同时在 `watchlist` 与 `ignore`**，规则仍能为它产出 `Alert`，`:1298` 即被执行。**我记为"可达性与真实触发频率均未复现"，只推翻其过强表述**（不指控死、不声称活）。
+
+### ⚠ 不采信 C 的 D3 计数（定性成立、数字未复现）
+
+C 称"28 个 `signal_id` 仅 1 个可直接索引 `SIGNALS`"。**定性我确认**（账本键是 `模块.形态`，`SIGNALS` 用裸名，需自行 `rpartition('.')`）。但**"28"我没能复现** —— 静态可确定的 `signal_id` 字面量只有 **9** 个（其余是 f-string，需展开运行时注册表；`SIGNALS` 自身 30 条）。**故只采信定性，不引用该计数及其"无对应 signal_id 的展示名"清单**（在不完整枚举下该清单必然偏大，属枚举不全，非缺陷证据）。
+
 ### ⚠ `IT-P1-DELIVERY-GATE-PERROUND-001`（**本轮新增 · P1 · 已确认**）新门禁是"逐轮"的，运营面读到的是**最后一轮**
 
 `store.observation` 只保留最近一轮的 `as_dict()`（`store.py:156` 每轮**覆盖**）。实测 361 轮：**累计** 66/66 = **1.0**，但**末轮** `committed_alerts_total = 0` → 运营面 `signed_ratio = None`、`first_party_committed_without_signal_id = 0`。**305/361 轮是 0 条告警**，故该门禁绝大多数时候读 `None`。仓库内 `committed_alerts_total` **只有 `engine.py:1323` 一个写入点**，`store.py` / `web.py` / `cli.py` 对它**0 命中** —— **没有任何累计计数器可达运营面**。
