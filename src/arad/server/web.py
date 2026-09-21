@@ -595,12 +595,32 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def _alerts_total(self, items: list, kind: str | None) -> int:
         """total = 与过滤条件匹配的告警总数（不因 limit 截断而变）。"""
         try:
-            if kind is None:
-                st = self.store.status()
-                if isinstance(st, dict) and st.get("alerts_total") is not None:
-                    return int(st["alerts_total"])
-            else:
-                return len(_as_list(self.store.recent_alerts(ALERT_TOTAL_PROBE, kind)))
+            st = self.store.status()
+            if isinstance(st, dict):
+                if kind is None:
+                    if st.get("alerts_total") is not None:
+                        return int(st["alerts_total"])
+                else:
+                    # IT-P1-ALERT-TOTAL-KIND-TRUNCATION-001：**不能用
+                    # ``len(recent_alerts(probe, kind))``** —— Store 的告警缓冲是
+                    # ``deque(maxlen=web.max_alerts)``（默认 300），
+                    # 探测条数再大也只能拿到 maxlen 条。实测灌入 450 条
+                    # ``limit_up`` 后：``alerts_total()`` = 450（真值）、
+                    # ``len(recent_alerts(1000, 'limit_up'))`` = **300**。
+                    # 于是 ``/api/alerts?kind=limit_up`` 的 total 永远 ≤ 300，
+                    # 而**不带** kind 的同一字段走 ``status()['alerts_total']``
+                    # 却是正确的 450 —— 同一个展示字段两条路径语义不一致。
+                    #
+                    # 正确来源是 ``store`` 的**累计** ``_by_kind`` 计数
+                    # （``status()['by_kind']``，它不随 ring buffer 驱逐而减少）。
+                    by_kind = st.get("by_kind")
+                    if isinstance(by_kind, dict) and kind in by_kind:
+                        return int(by_kind[kind])
+                    # 退化路径：store 没导出 by_kind（老实现 / 测试替身）时，
+                    # 仍按旧口径探测。**它会被 ring buffer 截断** ——
+                    # 所以只是"比 len(items) 好一点"，不是正确来源。
+                    return len(_as_list(
+                        self.store.recent_alerts(ALERT_TOTAL_PROBE, kind)))
         except Exception as exc:                     # noqa: BLE001 —— total 只是展示字段，失败就退化
             logger.debug("alerts total probe failed: %r", exc)
         return len(items)

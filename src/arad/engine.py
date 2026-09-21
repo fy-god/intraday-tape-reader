@@ -1036,12 +1036,27 @@ class Engine:
             self.refresh_universe()
         # 全市场股票池拿不到时（东财被限流/断网），退回自选股，
         # 否则 _codes 为空 -> poll_once 直接 return，系统会静默地什么都不做。
+        #
+        # IT-P1-UNIVERSE-WATCHLIST-PIN-001：**这里绝不能用 ``self._codes =``**
+        # —— setter 的合同是"赋非空列表 = 显式 pin，之后不再自动刷新"
+        # （``_codes_pinned = bool(codes)``）。降级路径复用它，会把
+        # **一次临时降级变成永久**：下一次 ``_maybe_refresh_universe()``
+        # 一进门就 ``if self._codes_pinned: return``，
+        # **源端恢复后也再不会尝试全市场**。实测：降级后 ``_codes_pinned``
+        # 变 True，再等 TTL 过期 + 源端恢复，``refresh_universe``
+        # **调用次数为 0**，用户永久只盯自选股那几只，且此后再无任何提示。
+        #
+        # 所以走 ``_codes_raw`` 直赋（**不 pin**），保留"下轮还会重试全市场"。
+        # 对照：``--watch-only``（:1536）与 replay 用 setter 是**对的** ——
+        # 它们确实要 pin，``tests/test_cli_watch_only.py`` 明确断言这一点。
         if not self._codes and self.watchlist:
             self.log.warning(
                 "股票池为空，降级为仅监控自选股 %d 只（全市场扫描暂不可用）",
                 len(self.watchlist))
-            self._codes = list(self.watchlist)
+            self._codes_raw = list(self.watchlist)
             self._universe_refreshed_at = time.time()
+            # 明确保持未 pin：降级是**临时**的，TTL 到期后要重新尝试全市场。
+            self._codes_pinned = False
 
     # ------------------------------------------------------------------
     # 单轮

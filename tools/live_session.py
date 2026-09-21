@@ -1291,6 +1291,57 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     total = sum(int(v) for v in by_kind.values())
     add("alerts", True, f"共 {total} 条告警（0 条不算失败：休市时本就无告警）")
 
+    # --- IT-H20-DELIVERY-ACCOUNTING-GATE：交付账本必须参与**判决** ---------
+    #
+    # 为什么必须有这一项：我上一轮把"假绿"修在了**数据层**
+    # （``as_dict()`` 里有了 ``accounting_status``），但 ``evaluate_health``
+    # **一项都没读它** —— 实测注入
+    # ``accounting_status=inconsistent / accounting_errors=7 /
+    #   committed_alerts_total=0 / committed_with_signal_id=66``
+    # 之后，``healthy=True / exit_code=0`` 与健康基线**逐字节相同**。
+    # 也就是说假绿没有被消除，只是**从数据层搬到了判决层**。
+    #
+    # 三个设计决定（都有实测依据）：
+    #
+    # 1. ``not_measured`` 判 **ok**，不判 fail —— 实测仓库四个"应当判健康"的
+    #    helper（``empty_metrics()``、``finalize_metrics([])`` 等）产出的都是
+    #    ``not_measured``。判红会让所有现存绿色用例立刻转红。这也与
+    #    ``capability`` 项既有的"跳过不算失败"约定一致。
+    # 2. 键缺失 / 非 dict **不崩** —— ``evaluate_health`` 必须对脏 metrics 稳健
+    #    （``tests/test_live_session_observation.py`` 就是钉这条约束的）。
+    # 3. 用 ``level="fail"`` 而不是只给 ``ok=False`` —— 复用既有三级语义，
+    #    ``ok`` 仍是布尔，既有消费方不受影响。
+    #
+    # 注意：判据**不能**只看门禁 ``unsigned_total`` —— 那正是假绿的来源
+    # （分母被吞时门禁也是 0）。必须看 ``accounting_status`` 与
+    # ``accounting_errors``。
+    _dl = m.get("delivery_accounting_session")
+    if isinstance(_dl, dict) and _dl:
+        _dl_status = str(_dl.get("accounting_status") or "")
+        _dl_errs = _safe_int(_dl.get("accounting_errors"))
+        _dl_rounds = _safe_int(_dl.get("delivery_accounting_rounds"))
+        _dl_bad = _dl.get("inconsistent_rounds") or []
+        _dl_total = _safe_int(_dl.get("committed_alerts_total"))
+        _dl_named = _safe_int(_dl.get("committed_with_signal_id"))
+        if _dl_status == "inconsistent" or _dl_errs > 0:
+            add("delivery_accounting", False,
+                f"记账不自洽：status={_dl_status}、吞异常 {_dl_errs} 次、"
+                f"不自洽轮 {list(_dl_bad)[:5]}、账本轮数 {_dl_rounds}、"
+                f"committed={_dl_named}/{_dl_total} —— "
+                f"分母可能少算，此时门禁为 0 也不能算健康",
+                level="fail")
+        elif _dl_status == "ok":
+            add("delivery_accounting", True,
+                f"记账自洽（{_dl_rounds} 轮，committed={_dl_named}/{_dl_total}，"
+                f"吞异常 0 次）", level="ok")
+        else:
+            add("delivery_accounting", True,
+                f"无交付账本（status={_dl_status or 'missing'}），无法判定"
+                "（跳过不算失败）", level="ok")
+    else:
+        add("delivery_accounting", True,
+            "无交付账本字段，无法判定（跳过不算失败）", level="ok")
+
     healthy = all(c["ok"] for c in checks)
     if rounds < min_rounds:
         # 一轮都没跑完 = harness 级失败，与"跑起来了但有问题"要能区分开
