@@ -53,7 +53,10 @@ class AlertStore:
         self._engine: Any = None
 
         self._alerts: deque[dict] = deque(maxlen=max(int(max_alerts), 10))
-        self._acked: set[str] = set()
+        # IT-P1-ACK-TRIM-ORDER-001：**有序**容器（dict 保持插入序）。
+        # 以前是 set —— `list(set)` 是哈希序，裁剪 `[-2000:]` 会丢掉刚 ack 的。
+        # 值恒为 None，只借 key 的插入序当"最近 ack"时序。
+        self._acked: dict[str, None] = {}
         self._total = 0
         self._by_kind: dict[str, int] = {}
         self._subs: set[queue.Queue] = set()
@@ -287,6 +290,17 @@ class AlertStore:
             last_poll_ts = self._last_poll_ts
         quotes = getattr(state, "quotes", {}) if state is not None else {}
         watch = list(getattr(self._engine, "watchlist", []) or []) if self._engine else []
+        # IT-P2-UNIVERSE-STATUS-CACHE-001：真正的"本轮扫描池"是引擎的 `_codes`，
+        # **不是** `state.quotes`（累计缓存，含历史准入过的代码与指数，从不裁剪）。
+        # 取不到就不猜 —— 让消费方看到 None 而不是一个漂亮但错的数。
+        active_universe: int | None = None
+        if self._engine is not None:
+            try:
+                ac = getattr(self._engine, "_codes", None)
+                if ac is not None:
+                    active_universe = len(list(ac))
+            except Exception:  # noqa: BLE001 —— 展示字段，取不到就退化
+                active_universe = None
         with self._lock:
             observation = dict(self._observation)
             # 账本**自身**的身份（IT-P2-OBS-STATUS-001）。必须与
@@ -301,7 +315,22 @@ class AlertStore:
             "session_desc": self._describe_phase(phase),
             "is_open": phase in (SessionPhase.MORNING, SessionPhase.AFTERNOON),
             "uptime_s": round(time.time() - self._started, 1),
-            "universe": len(quotes),
+            # IT-P2-UNIVERSE-STATUS-CACHE-001：**不能**用 ``len(state.quotes)``。
+            #
+            # ``state.quotes`` 是**累计**最新报价缓存（``engine.py:302`` 是唯一
+            # 写入，``prune()`` **不回收**它），所以它包含**历史上准入过但本轮已
+            # 不在扫描池里**的代码与指数 —— 实测扫描范围缩 30% 后它**仍报旧规模**。
+            #
+            # 看板"股票池"芯片读的就是这个字段 -> 会**高报**扫描范围。
+            # 真值是本轮实际扫描的代码数（``sample['universe']`` 同口径）。
+            # 拿不到就把键省掉，让消费方知道"没测"，而不是给一个漂亮但错的数。
+            "universe": (active_universe if active_universe is not None
+                         else len(quotes)),
+            # 同一字段的两个口径必须都能读到，否则没法判断上面那个数是哪个：
+            #   universe        = 本轮实际扫描池（引擎 `_codes`），**递减会跟着变**
+            #   universe_cached = 累计最新报价缓存规模（旧口径，只会涨）
+            # 实测：扫描范围缩 30% 时二者会差出上千只。旧名保留兼容。
+            "universe_cached": len(quotes),
             "alerts_total": total,
             "by_kind": by_kind,
             "sources": health,
@@ -354,9 +383,27 @@ class AlertStore:
         if not key:
             return False
         with self._lock:
-            self._acked.add(str(key))
+            # IT-P1-ACK-TRIM-ORDER-001：`_acked` 必须是**有序**容器。
+            #
+            # 以前是 `set`，裁剪写 `set(list(self._acked)[-2000:])` ——
+            # 而 `list(set)` 的顺序是**哈希序**，不是插入序，
+            # 所以 `[-2000:]` 取的是**任意** 2000 条，会
+            # **系统性地丢掉刚 ack 的那条**（实测 `set(_acked) == 最新2000`
+            # 在 5 个 PYTHONHASHSEED 下**全为 False**，seed=0 时连最新 ack
+            # 都留不下）。
+            #
+            # 用户可见形式：某条告警仍在 300 条 ring buffer 内（看板可见）、
+            # 用户已点过"确认"，但 `recent_alerts()` 报 `acked=False`，
+            # 看板于是**把已确认的告警重新变回未确认**并重新显示 ack 按钮。
+            #
+            # `dict` 保持插入序，`pop` 再赋可以刷新"最近 ack"的时序。
+            k = str(key)
+            self._acked.pop(k, None)
+            self._acked[k] = None
             if len(self._acked) > 5000:
-                self._acked = set(list(self._acked)[-2000:])
+                # 只保留**最新** 2000（按 ack 时序），不是任意 2000。
+                keep = list(self._acked)[-2000:]
+                self._acked = dict.fromkeys(keep)
         return True
 
     # --- 行情榜单 -------------------------------------------------------

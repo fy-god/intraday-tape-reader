@@ -1111,6 +1111,60 @@ class Engine:
         idx_quotes = self._fetch_indices()
 
         if not quotes and not idx_quotes:
+            # IT-P1-OBS-EMPTY-ROUND-001：**空轮也必须落一份账**。
+            #
+            # 以前这里直接 ``return []`` —— 于是"provider 本轮一条都没返回"
+            # 这件事**根本不进观测账本**，Store 里留的是**上一成功轮**的
+            # observation（``observation_seq`` 不变）。
+            #
+            # 与 live_session 的 ``quotes=len(state.quotes)`` 叠加后后果是：
+            # 静默断供（provider 返回空、**不抛异常**）时
+            # ``error_rounds`` 与 ``no_data_rounds`` 都是 0，
+            # ``quotes_max`` 还是旧值 -> ``healthy=True / exit=0 / fail=[]``，
+            # 与健康基线**无法区分**。
+            # 对照：provider 抛异常时 ``error_rounds>0`` 会让 ``fetch`` 正确转红。
+            # 也就是说瞎的**恰好是静默的那种断供**。
+            #
+            # 这里发一份 returned=0 / admitted=0 的账：
+            # 让"本轮确实什么都没拿到"变得可观测，且不改变任何规则行为
+            # （照旧 return []，不跑规则）。
+            #
+            # ⚠ 坑：**不能**写 ``self.sources.capabilities()`` /
+            # ``self.sources.current_name()`` —— SourceManager **没有**这两个方法
+            # （只有 ``current`` / ``serving_of(route)``）。我第一版就是这么写的，
+            # 异常被下面的 except 吞掉，账本**静默地一份都没发**，
+            # 外表看完全正常。这正是我这一整轮在批评的那个反模式
+            # （"可观测性失败被吞掉 -> 假绿"）—— 我自己又踩了一次。
+            # 所以下面取 source/capabilities 的方式与正常路径
+            # （:1225-1230）保持一致，并且**先取数、再发账**，
+            # 取数失败时不吞异常而是记 ERROR（见 except）。
+            try:
+                _si = self.sources.serving_of(ROUTE_STOCKS)
+                if _si is None:
+                    _ssrc = self.sources.current
+                else:
+                    _ssrc = self.sources.sources[_si]
+                _caps = capabilities_for(_ssrc)
+                _name = str(getattr(_ssrc, "name", ""))
+                self.store.set_poll_stats(
+                    poll_ms=int((time.perf_counter() - t0) * 1000),
+                    count=self._poll_count, health=self.sources.health(),
+                    now=now,
+                    observation=RoundObservationSet(
+                        source=_name,
+                        capabilities=_caps,
+                        requested=len(self._codes) + (
+                            len(self.index_codes) if self.index_codes else 0),
+                        index_requested=len(self.index_codes) or 0,
+                        returned=0,
+                        admitted=0,
+                        index_admitted=0,
+                    ))
+            except Exception:  # noqa: BLE001
+                # 可观测性不打断主链路，但**必须留痕** —— 静默吞掉正是
+                # 本轮要消灭的模式。用 error 级别而非 debug。
+                self.log.error("空轮观测发布失败（本轮空数据将不可见）",
+                               exc_info=True)
             return []
 
         # 指数与个股共用同一准入合同（IT-P0-002-R1：股票和指数不得两套口径）。

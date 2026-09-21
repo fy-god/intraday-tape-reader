@@ -158,6 +158,20 @@ _OBSERVATION_VALUE_FIELDS: tuple[str, ...] = (
 MEM_GROWTH_LIMIT = 2.0
 MEM_GROWTH_SLACK = 500
 
+#: R-21 / IT-P1-UNIVERSE-HEALTH-GATE-001：扫描池规模的下限与警戒线。
+#:
+#: A 股全市场约 5900+ 只（eastmoney `total=5913`）。源端限流或分页失败时
+#: `refresh_universe()` 仍会**成功返回一个更小的池**（实测 4100/5913 = 69.3%），
+#: 而 `evaluate_health` 此前对此完全无感 —— 扫描范围缩 30% 仍报
+#: `healthy=True / exit=0`。
+#:
+#: 这里不写"必须等于 5913"（新股/退市/停牌使其本就会浮动），只设**下限**：
+#:   < UNIVERSE_MIN_ABS  -> fail（扫描范围过小，漏报风险高）
+#:   < UNIVERSE_WARN_ABS -> warn（偏小，不改退出码，但必须点名）
+#: 真实长跑若恒远超这两条线，说明源端稳定、本担心不成立 —— 可证伪。
+UNIVERSE_MIN_ABS = 3000
+UNIVERSE_WARN_ABS = 4500
+
 EXIT_HEALTHY = 0
 EXIT_UNHEALTHY = 1
 EXIT_NO_DATA = 2
@@ -199,6 +213,36 @@ def latency_stats(values: Sequence[float]) -> dict:
         "p95": round(float(percentile(vals, 95) or 0.0), 2),
         "max": round(max(vals), 2),
     }
+
+
+def _round_quote_count(obs: dict | None, state: Any) -> int:
+    """本轮真实拿到多少条行情（**不是**累计缓存规模）。
+
+    见 ``_soak_loop`` 写入点的长注释：``len(state.quotes)`` 是从不缩小的
+    累计缓存，拿它当逐轮行情数会让静默断供拿到完整假绿
+    （``healthy=True / exit=0 / fail=[]``）。
+
+    取数优先级：
+
+    1. ``obs['returned']`` —— provider **本轮原始返回**条数（含 price<=0）。
+       这是"我看到多少行情"最直接的口径，也是 ``coverage`` 的分子。
+    2. ``obs['admitted']`` —— 通过时间准入的条数。
+    3. 都没有 -> 退回 ``len(state.quotes)``（**退化**，仅用于旧报告/离线样本）。
+
+    必须容忍脏值：可观测性字段坏了不能让 soak 崩。
+    """
+    if isinstance(obs, dict):
+        for key in ("returned", "admitted"):
+            raw = obs.get(key)
+            if raw is None:
+                continue
+            try:
+                val = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if val >= 0:
+                return val
+    return len(getattr(state, "quotes", {}) or {})
 
 
 def make_round_sample(
@@ -1288,6 +1332,55 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     else:
         add("browser", True, "未运行（跳过不算失败）")
 
+    # --- R-21 / IT-P1-UNIVERSE-HEALTH-GATE-001：扫描范围必须参与判决 ------
+    #
+    # 为什么必须有这一项：`evaluate_health` 此前**没有任何一项**读股票池规模。
+    # metrics['setup'] 里的 `universe_size` / `fell_back_to_watchlist`
+    # **早已在生产路径传入**（`_run_session` -> `finalize_metrics(setup=...)`），
+    # 只是**没有读者**。所以：
+    #
+    #   真实运行 5913 -> 4100（缺 30%）  => healthy=True / exit=0
+    #
+    # 与 01:00 轮修掉的交付账本假绿**完全同类**（数据算了、没人读），
+    # 只是对象不同。云端 h=0 轮用真实 `Engine.refresh_universe` 证明
+    # 冷启动可达，并把它从"缺判决项"精确到"**数据早已传入、只差一个读者**"。
+    #
+    # 判据分三档，且**绝不把"没测"判红**（与 capability/delivery_accounting 同约定）：
+    #   * 降级为仅自选股（`fell_back_to_watchlist`）-> **fail**
+    #     这是"全市场扫描不可用"，用户拿到的告警面会窄得多，必须点名。
+    #   * 规模低于绝对下限（`UNIVERSE_MIN_ABS`）-> **fail**
+    #   * 规模低于绝对下限以上但明显偏小 -> **warn**（不改退出码）
+    #   * 旧报告没有 setup / `universe_size == 0` -> **ok**（跳过，不算失败）
+    _setup = m.get("setup")
+    if isinstance(_setup, dict) and _setup:
+        _u_size = _safe_int(_setup.get("universe_size"))
+        _u_fell = bool(_setup.get("fell_back_to_watchlist"))
+        _u_min = int(tol.get("universe_min") or UNIVERSE_MIN_ABS)
+        _u_warn = int(tol.get("universe_warn") or UNIVERSE_WARN_ABS)
+        if _u_fell:
+            add("universe", False,
+                f"股票池**已降级为仅自选股**（规模 {_u_size}）—— "
+                f"全市场扫描不可用，此期间'没有告警'不能解释为'没有异动'",
+                level="fail")
+        elif _u_size <= 0:
+            add("universe", True,
+                "无股票池规模记录（旧报告/未采集），无法判定（跳过不算失败）",
+                level="ok")
+        elif _u_size < _u_min:
+            add("universe", False,
+                f"扫描池仅 {_u_size} 只（下限 {_u_min}）—— "
+                f"扫描范围过小，漏报风险高", level="fail")
+        elif _u_size < _u_warn:
+            add("universe", True,
+                f"扫描池 {_u_size} 只（警戒 {_u_warn}，下限 {_u_min}）—— "
+                f"偏小，建议核对源端限流", level="warn")
+        else:
+            add("universe", True,
+                f"扫描池 {_u_size} 只（下限 {_u_min}）", level="ok")
+    else:
+        add("universe", True,
+            "无 setup 字段，无法判定（跳过不算失败）", level="ok")
+
     total = sum(int(v) for v in by_kind.values())
     add("alerts", True, f"共 {total} 条告警（0 条不算失败：休市时本就无告警）")
 
@@ -1968,7 +2061,30 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
             latency_ms=latency_ms,
             alerts=fresh,
             error=error,
-            quotes=len(getattr(state, "quotes", {}) or {}),
+            # IT-P1-OBS-EMPTY-ROUND-001：**这里必须用本轮的观测数，
+            # 绝不能用 ``len(state.quotes)``。**
+            #
+            # ``state.quotes`` 是**累计**最新报价缓存：
+            # ``engine.py:302 self.quotes[q.code] = q`` 是唯一写入，
+            # 而 ``engine.py:417-446 prune()`` 回收 history / last_price /
+            # watermark / first_seen … **独独不回收 self.quotes**。
+            # 实测：灌 5913 只后 ``prune(keep_codes={'sh600001'})``，
+            # ``len(state.quotes)`` **仍是 5913** ⇒ 它从不缩小。
+            #
+            # 后果（实测 6 轮全断供，provider 每轮返回 [] 且不抛异常）：
+            #   len(state.quotes) 恒 = 5913 -> sample['quotes'] 恒 = 5913
+            # 于是 ``no_data_rounds``（定义 ``int(r['quotes']) <= 0``）
+            # **结构上恒为 0**，``evaluate_health`` 的
+            # ``add("data", quotes_max > 0)`` 也恒为旧值 ——
+            # **两个专门盯行情数的判决项同时失效**。
+            # 最严重的形式：静默断供 6 轮得到
+            # ``healthy=True / exit=0 / fail=[]``，与健康基线**无法区分**。
+            #
+            # 所以取本轮真实计数：优先用本轮 observation 的 ``returned``
+            # （provider 原始返回条数，含 price<=0），退回 ``admitted``。
+            # 两者都拿不到（旧报告 / 离线造样本）时才退回累计口径 ——
+            # 那是**退化**，不是正确值。
+            quotes=_round_quote_count(obs_snapshot, state),
             universe=len(codes),
             history_points=sum(len(h) for h in history.values()),
             history_codes=len(history),
