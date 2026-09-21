@@ -10,20 +10,25 @@
 
 ## 最新本地 Agent 轮结论（2026-09-21 11:31:34 JST，`ce989ca`）
 
-1. **新确认 `IT-P1-UNKNOWN-DATE-FAILOPEN-001`（P1，根因；本轮最重要的推进）。** 上面第 1、2 条与「`ts` 为 `str`/`int` 时失效」**不是三个缺陷，而是同一个根因的多种可达表现**：`models.py:64-72 _as_date` 把「类型不认识」与「确实是 None」**折叠成同一个 `None`**，而 `st_limit_rate_on` / `market_rule_version`（`models.py:59`/`:82` 的 `if d is not None and d < CHANGED_ON`）把 `None` 解释为**「就用现行制度」**。实测：`st_limit_rate_on("2025-03-10")` 与 `(20250310)` 都返回 **0.10**（应为 0.05）；经真实 `Quote` 时 `ts="2025-03-10"`/`20250310`/`None` 三种都给 `limit_up_price=11.00`（应 10.50）。
+1. **新确认 `IT-P1-UNKNOWN-DATE-FAILOPEN-001`（P1，根因；本轮最重要的推进）。** 第 2 条的 replay 绕过与我探针里发现的「`ts` 为 `str`/`int` 时 ST 板率也错」**不是两个缺陷，而是同一个根因的多种可达表现**：`models.py:64-72 _as_date` 把「类型不认识」与「确实是 None」**折叠成同一个 `None`**，而 `st_limit_rate_on` / `market_rule_version`（`models.py:59`/`:82` 的 `if d is not None and d < CHANGED_ON`）把 `None` 解释为**「就用现行制度」**。实测：`st_limit_rate_on("2025-03-10")` 与 `(20250310)` 都返回 **0.10**（应为 0.05）；经真实 `Quote` 时 `ts="2025-03-10"`/`20250310`/`None` 三种都给 `limit_up_price=11.00`（应 10.50）。
    **可达性实证**：真实解析器**确实会产出 `None`** —— `sources/eastmoney.py:143 _ts_of`、`sources/sina.py:158 _ts_of`、`sources/tencent.py:397 _parse_ts(...) if len(fields) > I_TIMESTAMP else None`；`server/web.py:291 coerce_ts` 空/不可解析时返回 `None`，且 `:303-305` 对纯 `%H:%M:%S` **补今天的日期**。
    **性质**：这是**静默 fail-open** —— 不抛错、不告警、不计数，设计上无法区分「已知是今天」与「日期未知」。当日无影响（今天现行制度就是 10%），但在**存档/回填**数据上或**下一次制度变更之后**立刻成为真实故障。
    **讽刺点**：修复自己的 docstring（`models.py:334-336`）写的动机正是「否则**历史回放**会套用今天的制度」，而恰恰是历史回放这条路径整条绕过了该修复。
-   **修法（最低成本优先）**：让 `market_rule_version(None)` 返回显式 `"cn-unknown"` 哨兵并随告警写出 —— 它本就是**事后追溯**字段（`models.py:57`），这样「日期未知下生成了多少告警」立刻成为可统计数字。
+   **⚠ 修法更正**：我最初建议「让 `market_rule_version(None)` 返回 `"cn-unknown"` 哨兵」——**该建议已作废**，因为 `market_rule_version` 是**零调用死代码**（见第 5 条）。**正确的计数出口已存在**：`capabilities.py:424 RoundObservationSet.mark_advisory_missing`（有真实消费者 `live_session`，写进 `blocked_reasons` 且不污染 blocked 语义，`:435-437`）。
 2. **新确认 `IT-P1-ST-REPLAY-BYPASS-001`（P1）。** ST 制度修复（`22a51a2`）在 `Quote` 路径上**正确**（`models.py:354` 传 `self.trade_date`，边界 2026-07-06 实测正确），但 **replay 路径结构性绕过它**：`replay.py:160 return limit_rate_of(self.code, self.name)` **不传日期** → 永远取现行 10%；`replay.py:249-251` 把该值算成 `limit_up/limit_down` 并塞进 `Quote`；而 `models.py:349-350` `if self.limit_up and self.limit_up > 0: return self.limit_up` **提前返回**，日期感知分支永不执行。
    端到端反例（真跑）：同一只主板 ST 股、`start_price=10.00`，回放日 2025-03-10 得 `limit_up_price=11.0`（应为 **10.50**）；`price=10.50` 时 `is_at_limit_up()=False`（应为 **True**）——**真实 5% 封板不被识别**。`limit_board.py:115/155` 真实消费该值。
    **影响面如实限定**：实盘当日（今天 2026-09-21，`CURRENT==0.10`，`when=None` 亦为 0.10）**不受影响**；真实受影响 ST 股票数**未计数**。
 3. **新确认 `IT-P2-REPLAY-DOC-COVERAGE-001`。** `replay.py:178` docstring 声称默认池「板块覆盖主板/创业板/科创板/北交所与 **ST**」，实测 `default_universe(30, seed=42)` 中**名字含 ST 的股票 = 0 只**。故第 2 条的缺陷在默认参数下零测试覆盖（自定义 `ScriptedStock` 时立即成立）。**建议加一只主板 ST + 一只 `*ST` 并加自检断言 —— 本轮性价比最高的建议**：不改任何业务语义，却能把一个已确认 P1 从「无人知晓」变成「CI 红灯」。
 4. **新确认 `IT-P2-LEGACY-STATE-SLOT-001`（待验证风险／当前不可达）。** 按端口分文件（`4e73ded`）**核心修复为真**（两端口文件互不干扰；`tmp.replace()` 原子），但 `_write_state` 仍在 `run_daemon.py:136-138` 每次覆写旧单槽 `arad-daemon.json`，「最后写入者获胜」症状被移到无端口路径。**已如实降级**：`--port` 有 `default=8899`，`main()` `:522-523` 必然传 int，`_read_state(None)` 分支当前**不可达**；且 `:105` 有 port 匹配保护，删文件后实测返回 `{}`（无串号）。
-5. **云端报告 `2026-09-21_08-04-12_JST.md` 的 3 项声明经独立复核全部为真**（`mark_published` 先于 `bus.accept`；`_dispatch_many` 丢弃 bool；内置 notifier 在 disabled/severity-skip 时返回 True）。其 `IT-P1-NOTIFY-RESULT-001/002`、`IT-P1-EVAL-PUBLISH-001` 应予采纳。
-6. **回归：STILL_OPEN 8 / FIXED 2 / NOT_REPRODUCED 0。** FIXED = `IT-P1-CAPABILITY-004`（L1 数量兜底 `spirit_order.py:1080-1089`）、`IT-P2-OBS-STATUS-001`（`store.py:152-161` 单临界区，12 passed）。**三处旧引用已漂移需更正**：`capabilities.py:227-229`（现为 `evaluable_coverage`，非 `provides`）、`spirit_order.py:547-550`、`sina.py:221-225`。
-7. **真实测试**：冻结树 `D:\ccc\_sched\work\asr-h04` @`ce989ca` 跑 `pytest -o addopts="" -p no:cacheprovider -q --ignore=reference` → **1579 passed in 108.71s**，exit 0。
-8. **发现分类**：已确认错误 4（其中第 1、2 条为同一根因的两个表现，可合并为一个待修项）／待验证风险 1／已经修复 2／修复后回归 0。三项分离：程序修复 **0**／任务定义变更 **0**／真实模型增益 **0**（本轮无新增实股结果）。
+5. **新确认 `IT-P2-RULE-VERSION-DEADCODE-001`（待验证风险；事实已确认）。** `market_rule_version`（`models.py:56`）**零调用、零测试**：全仓（含 `tests/`、`docs/`）仅 3 处命中 —— `models.py:26`（`__all__` 导出）、`:56`（定义本身），以及历史审计 docs 的**文字提及**；运行时 `callable=True`、`market_rule_version(None)="cn-2026-07-06"` 但**返回值无任何消费者**（对照真正在用的 `st_limit_rate_on` 有调用点 `models.py:235`）。
+   而 `models.py:57` 的 docstring 宣称它用于「事后追溯」，上一轮审计也把它列为新增能力 —— **即「制度版本可追溯」目前只是一句声明，不是事实**，而这恰恰是第 1 条 fail-open 最需要的那个信号。
+   建议二选一：把 `market_rule_version` 真正接进 `SignalEvalStats`/告警 metrics，或删掉它并撤下相关能力声明。**不要两不沾。**
+   > 本条同时是**对我自己上一版建议的更正**：教训是「给出修复建议前必须先确认该通道有消费者」，否则等于把信号写进黑洞。
+6. **云端报告 `2026-09-21_08-04-12_JST.md` 的 3 项声明经独立复核全部为真**（`mark_published` 先于 `bus.accept`；`_dispatch_many` 丢弃 bool；内置 notifier 在 disabled/severity-skip 时返回 True）。其 `IT-P1-NOTIFY-RESULT-001/002`、`IT-P1-EVAL-PUBLISH-001` 应予采纳。
+7. **回归：STILL_OPEN 8 / FIXED 2 / NOT_REPRODUCED 0。** FIXED = `IT-P1-CAPABILITY-004`（L1 数量兜底 `spirit_order.py:1080-1089`）、`IT-P2-OBS-STATUS-001`（`store.py:152-161` 单临界区，12 passed）。**三处旧引用已漂移需更正**：`capabilities.py:227-229`（现为 `evaluable_coverage`，非 `provides`）、`spirit_order.py:547-550`、`sina.py:221-225`。
+8. **真实测试**：冻结树 `D:\ccc\_sched\work\asr-h04` @`ce989ca` 跑 `pytest -o addopts="" -p no:cacheprovider -q --ignore=reference` → **1579 passed in 108.71s**，exit 0。
+9. **发现分类**：已确认错误 4（其中第 1、2 条为同一根因的两个表现，可合并为一个待修项）／待验证风险 2／已经修复 2／修复后回归 0。三项分离：程序修复 **0**／任务定义变更 **0**／真实模型增益 **0**（本轮无新增实股结果）。
+   **我自己本轮的两处更正**：① 曾把 `IT-P2-LEGACY-STATE-SLOT-001` 判为「已确认错误」，复核可达性后降级为「待验证风险／当前不可达」；② 曾建议用 `market_rule_version` 哨兵计数，发现其零调用后作废并改写（见第 5 条）。
 
 > 并发写者提示：主工作树仍有 8 个他人未提交文件，本轮全程用 `git worktree` 隔离，未读未改未提交他人 WIP。
 
