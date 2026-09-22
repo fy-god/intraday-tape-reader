@@ -17,6 +17,19 @@ https://github.com/fy-god/intraday-tape-reader/blob/7b0404a8e8d1a3ea56b1498ad865
 
 ---
 
+## 2026-09-22 21:40 JST 轮审（独立审计线）：`bf0b83b` 三项假绿修复**确认为真**，但肯定句留下同类残余假绿
+
+[2026-09-22_21-40-00_JST.md](./2026-09-22_21-40-00_JST.md)
+
+- `reviewed_source_sha`（产品源码）= **`bf0b83bf212f169c720ca8a1c5108405c18a9712`**；`main_head_at_audit_start` = `bf0b83bf212f169c720ca8a1c5108405c18a9712`。
+- **独立确认**：修前 `7b0404a8e8d1a3ea56b1498ad8650b2bfa75acae` 与修后 `bf0b83bf212f169c720ca8a1c5108405c18a9712` **双树同输入对照**，四项全部可判别 —— 零证据、空扫描、会话内覆盖下降、t0 `transport_complete=False` 被会话盖掉，**均为真修**；并复现了作者自述的『一个单位就翻绿』（`rounds_transport_measured` 0→1 即 fail→ok）。
+- **新发现 P1（未修）**：肯定分支的分母是**只含带证据轮次的子集**（`live_session.py:1737` 把 `full_market_rounds` 与 `scope_measured_rounds` 相比，而 `:609` 明确老轮样本无该键则**不计入**，`:663` 仅对带键轮次求和）。实测：30 轮中**只有 1 轮**有扫描范围证据时，修后仍输出 **「全程全市场扫描，1/1 轮有明确扫描范围证据」**（5/30→5/5、15/30→15/15 同理）。会话总数就在同一聚合里（`:687` `rounds=len(rows)`）却**从不被该分支读取**（全树 `_sess.get('rounds')` 出现 **0** 次）。
+- 该实现**低于作者自己的合同**（其 21:00 报告 §1.1 写「每一轮都有明确扫描范围证据」才允许肯定句）。
+- **新发现 P3**：`coverage_active_denominator_kinds`（`:679`）、`coverage_active_p05`（`:676`）、`coverage_active_last`（`:678`）三字段**写后零读者**。
+- **我自己否证并撤回两条假设**：①『修复造出新假红』 —— 7 份真实归档休市段 `universe.min` 为 5563（非 0），且 `engine.py:1203` 明确失败时**保留**原池绝不清空，故空扫描硬 fail 打中的是真故障；②『会话覆盖聚合忽略分母种类』 —— 机制属实但**可达性 0**（45 组 meta 穷举中数值 coverage 18 组，分母非 provider 的 0 组），仅作死字段上报。
+- 测试真数：`pytest -o addopts= -ra` 于纯净树 `bf0b83bf212f169c720ca8a1c5108405c18a9712` = **1802 passed in 120.05s**，退出码 **0**（独立子 agent 复跑 1802/121.29s）。
+- 本仓库**无** `docs/audits/validate_latest.py`，校验器步骤不适用，不声称 gate PASS。
+
 ## 2026-09-22 21:00 JST 本地 Agent 产品轮（**我 17:00 轮的"会话优先"造出了两个新假绿**）
 
 - 起点 HEAD `6c8f11e` → pull 到 `7b0404a`（只见审计文档）；
