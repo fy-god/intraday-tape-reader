@@ -874,6 +874,159 @@ class Engine:
             self._universe_src = chain or [self.sources]
         return self._universe_src
 
+    def universe_truth(self) -> dict:
+        """股票池真相：**分母**、四个 coverage 与恢复时钟（R-12 / WP01）。
+
+        为什么必须有这个方法：``self._universe_meta`` 早就由
+        ``_universe_meta_of()`` 算好了（Eastmoney 的 ``universe_info()``
+        会给出 ``transport_expected_total`` / ``raw_unique_codes`` /
+        ``usable_quotes`` / ``transport_complete`` / ``usable_coverage`` /
+        ``shortfall``），但它**零出口** —— 全仓只有本类的写入点与测试读它。
+        于是 ``evaluate_health`` 只能看**绝对只数**，回答不了：
+
+            4500 / ? = ?
+
+        实测（复核云端 EXP-IT-UNIVERSE-TRUTH-002 的矩阵）：只要分母未知，
+        绝对门禁会把 ``4500/5913 = 76.10%`` 与 ``4100/4200 = 97.62%``
+        **判成同一个结果**（前者 OK）。这不是"阈值再调一下"能解决的，
+        而是**分母缺失**。
+
+        四个 coverage 的语义（见云端 §8.3，这里不合并它们）：
+
+        * ``C_transport`` = raw_unique_codes / expected_total
+          —— 服务端 transport 是否给全
+        * ``C_usable``    = usable_quotes / expected_total
+          —— universe 行里多少能直接变 Quote
+        * ``C_active``    = active_scan_codes / expected_total
+          —— 系统**准备扫描**多少市场成员
+        * ``C_round``     = round_returned / round_requested
+          —— 已准备扫描的成员本轮回来多少
+
+        **``C_round`` 永远不能替代 ``C_active``** —— 前者只说明"我要的拿到了"，
+        后者才说明"我要的是不是全市场"。
+
+        ``denominator_kind`` 区分三种情况，**不许硬塞成同一种 coverage**：
+
+        * ``provider_declared_total``：provider 给了 numeric total（东财）
+        * ``pagination_exhausted_non_numeric``：翻页翻完了但无 numeric total（新浪）
+        * ``unknown``：拿不到
+        """
+        meta = dict(getattr(self, "_universe_meta", {}) or {})
+        active = list(getattr(self, "_codes_raw", []) or [])
+        active_n = len(active)
+
+        exp = meta.get("transport_expected_total")
+        if exp is None:
+            exp = meta.get("expected_total")
+        try:
+            exp_n = int(exp) if exp is not None else 0
+        except (TypeError, ValueError):
+            exp_n = 0
+        if exp_n < 0:
+            exp_n = 0
+
+        # 分母来源判定：有 numeric total 才算 provider_declared_total；
+        # 否则看 transport 是否"翻页翻完"（complete=True 且非数字总数）。
+        transport_complete = meta.get("transport_complete")
+        if transport_complete is None:
+            transport_complete = meta.get("complete")
+        if exp_n > 0:
+            denom_kind = "provider_declared_total"
+        elif transport_complete is True:
+            denom_kind = "pagination_exhausted_non_numeric"
+        else:
+            denom_kind = "unknown"
+
+        def _ratio(num: object, den: int) -> float | None:
+            """分母未知时返回 None —— **绝不返回 0 或 1 冒充已知**。"""
+            if den <= 0:
+                return None
+            try:
+                return float(int(num)) / float(den)
+            except (TypeError, ValueError):
+                return None
+
+        raw_unique = meta.get("raw_unique_codes")
+        usable = meta.get("usable_quotes")
+        if usable is None:
+            usable = meta.get("returned")
+
+        out = {
+            "_schema": "UniverseTruth",
+            "denominator_kind": denom_kind,
+            #: provider 声明的总数（numeric）；0 = 未测
+            "expected_total": exp_n,
+            "transport_expected_total": exp_n,
+            #: 传输层发现的唯一代码数
+            "raw_unique_codes": (int(raw_unique)
+                                 if isinstance(raw_unique, (int, float)) else None),
+            "usable_quotes": (int(usable)
+                              if isinstance(usable, (int, float)) else None),
+            #: 引擎**实际安排轮询**的成员数（这才是 active membership）
+            "active_scan_codes": active_n,
+            "transport_complete": bool(transport_complete),
+            "shortfall": int(meta.get("shortfall") or 0),
+            # ---- 四个 coverage，全部分开 ----
+            "coverage_transport": _ratio(raw_unique, exp_n),
+            "coverage_usable": _ratio(usable, exp_n),
+            "coverage_active": _ratio(active_n, exp_n),
+            "denominator_known": exp_n > 0,
+        }
+        # 恢复时钟（§8.4）：三个时刻语义不同，不得合并。
+        for key in ("last_attempt_at", "last_applied_at", "last_complete_at"):
+            if key in meta:
+                out[key] = meta[key]
+        return out
+
+    def _bump_poll_count(self) -> int:
+        """推进本轮的 poll 计数并返回新值（**唯一**自增点）。
+
+        WP04 / 云端 08:08 §7：我上一轮新增的零返回分支在 ``return`` 时
+        **早于**原来的 ``self._poll_count += 1``，于是连续空轮得到
+
+            observation_seq      = 1, 2, 3, 4, 5, 6
+            observation_poll_count = 1, 1, 1, 1, 1, 1   <- 全部相同
+
+        "第 N 轮观测"无法与"第几次 poll"对上 —— **poll identity 断裂**。
+        空轮本身就是一次 poll，账本给了它一个 seq 却不给它一个 poll 序号，
+        等于制造了一批无法归属的观测。
+
+        所以自增收进这一个函数，正常路径与空轮分支**都调它**，
+        两条路的 poll 语义从此不可能再分叉。
+        """
+        self._poll_count += 1
+        self.state.stats["polls"] = self._poll_count
+        return self._poll_count
+
+    def _request_arithmetic(self) -> tuple[int, int, int]:
+        """本轮的 ``(stock_requested, index_requested, requested_total)``。
+
+        **唯一事实来源** —— 正常路径与空轮分支都必须调它，不许各写一套。
+
+        为什么要有这个函数（WP04 / 云端 08:08 §7）：我上一轮的零返回分支
+        自己手写了一套简化账：
+
+            requested = len(self._codes) + len(self.index_codes)
+            index_requested = len(self.index_codes)
+
+        但默认配置下 ``rules.spirit_index.enabled=false``，
+        ``_fetch_indices()`` **根本不 dispatch** index 请求。实测（500 只个股、
+        5 个指数码、``_wants_indices=False``）：账本报
+        ``requested=505 / index_requested=5``，而**实际 dispatch 只有 500**。
+
+        ``index_requested=5`` 是**幻影** —— 它让观测层无法区分
+        "指数抓了但没回来"和"根本没抓"，后者不是数据质量事故。
+        正常路径早在 ``IT-P2-OBS-008`` 就修了这个语义，
+        我的新分支把它**又写坏了一次**。
+
+        教训：**新增分支必须复用既有语义，不能"顺手简化"** ——
+        简化出来的第二套算术，就是下一个假绿的温床。
+        """
+        stock_requested = len(self._codes)
+        idx_dispatched = bool(self.index_codes) and self._wants_indices
+        index_requested = len(self.index_codes) if idx_dispatched else 0
+        return stock_requested, index_requested, stock_requested + index_requested
+
     def _universe_meta_of(self, src: Any, quotes: list[Any]) -> dict:
         """取某来源最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
 
@@ -1146,6 +1299,16 @@ class Engine:
                     _ssrc = self.sources.sources[_si]
                 _caps = capabilities_for(_ssrc)
                 _name = str(getattr(_ssrc, "name", ""))
+                # WP04：requested 算术必须与正常路径**同源**。
+                # 我上一版在这里手写了
+                #   requested=len(_codes)+len(index_codes) / index_requested=len(index_codes)
+                # —— 但 _wants_indices=False 时 index **根本没 dispatch**，
+                # 账本却报 index_requested=5（实测 500 -> 报 505），是**幻影**。
+                _st_req, _idx_req, _req_total = self._request_arithmetic()
+                # WP04：空轮**也是**一次 poll，必须推进 poll 计数 ——
+                # 否则 observation_seq 涨而 poll_count 不动，
+                # "第 N 轮观测"没法与"第几次 poll"对上。
+                self._bump_poll_count()
                 self.store.set_poll_stats(
                     poll_ms=int((time.perf_counter() - t0) * 1000),
                     count=self._poll_count, health=self.sources.health(),
@@ -1153,9 +1316,8 @@ class Engine:
                     observation=RoundObservationSet(
                         source=_name,
                         capabilities=_caps,
-                        requested=len(self._codes) + (
-                            len(self.index_codes) if self.index_codes else 0),
-                        index_requested=len(self.index_codes) or 0,
+                        requested=_req_total,
+                        index_requested=_idx_req,
                         returned=0,
                         admitted=0,
                         index_admitted=0,
@@ -1259,19 +1421,12 @@ class Engine:
         # 记成"没返回"（unknown_missing 同时表达三种互斥语义）；`admitted`
         # 又把"个股业务粗筛后"与"指数纯时间准入"相加，使 returned-admitted
         # 无法解释为"被时间拒绝"（IT-P2-OBS-003）。现在三者互斥且可对账。
-        req_stocks = len(self._codes)
+        # WP04：requested 算术走**唯一事实来源**，与空轮分支同源。
+        # （原来这里是内联的 ``req_stocks`` / ``index_requested`` 计算，
+        #  空轮分支"顺手简化"复制了一份并写错 —— 现在两边都调这里。）
+        req_stocks, index_requested, _req_total = self._request_arithmetic()
         raw_stock = list(quotes)
         raw_idx = list(idx_quotes)
-        # IT-P2-OBS-008：**没发出去的请求不能算"请求了"**。
-        #
-        # ``_fetch_indices()`` 在 ``spirit_index`` 关闭时会直接返回 []（故意不发
-        # 请求，省流量）。以前 ``index_requested`` 无条件写 ``len(self.index_codes)``，
-        # 于是 ``wants_indices=False`` 与 ``True`` 的账本**取值完全相同**
-        # （requested=5 / index_requested=3 / coverage=0.40）—— 观测层无法区分
-        # "指数抓了但没回来"和"根本没抓"。后者不是数据质量事故，
-        # 按前者记账会让 coverage 恒低、把正常配置误报成丢数。
-        _idx_dispatched = bool(self.index_codes) and self._wants_indices
-        index_requested = len(self.index_codes) if _idx_dispatched else 0
         future_rej = int(self.state.stats.get("t_reject:future", 0)) - _t0_future
         ooo_rej = int(self.state.stats.get("t_reject:out_of_order", 0)) - _t0_ooo
         # WP04：陈旧诊断的**本轮增量**，按 route 分账后再合计。
@@ -1435,8 +1590,8 @@ class Engine:
         # 本轮所有告警一次性交给通知器；由通知器自己决定逐条还是聚合
         self._dispatch_many(fresh)
 
-        self._poll_count += 1
-        self.state.stats["polls"] = self._poll_count
+        # WP04：poll 计数走**唯一自增点**，与空轮分支共用（见 _bump_poll_count）。
+        self._bump_poll_count()
         self.state.stats["alerts"] = self.state.stats.get("alerts", 0) + len(fresh)
 
         # 分时序列（只记自选 + 异动榜，控制内存）

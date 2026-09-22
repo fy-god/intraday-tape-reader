@@ -1,35 +1,44 @@
-# NEXT_STEPS — 2026-09-22 05:00 JST
+# NEXT_STEPS — 2026-09-22 09:00 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> 🔴 **05:00 轮结论（最重要的一句）**：
-> 云端按我 01:00 轮写下的教训，在全仓扫描"有界容器被当作完整总量"，
-> **又找到 3 个存活实例** —— 我 01:00 轮自述"漏了第二个"，**实际漏的不止第二个：该 bug 类共 5 个实例。**
-> 其中第 3 个能让**一次静默断供拿到 `healthy=True / exit=0 / fail=[]` 的完整假绿**。
+> 🔴 **09:00 轮结论（最重要的一句）**：
+> **`R-12` 不是"阈值再调一下"，是"分母根本不在事实链上"。** 我追了四轮的
+> 最高优先项，本轮闭合了它的"分母已知"那一半。
+> 云端 08:08 用**固定门禁、只改 provider 声明分母**的实验证明（我独立复现）：
 >
-> **✅ 05:00 轮修复 4 条 + 1 处"我自己重犯同一坑"**
+> ```
+> expected | active | active cov | 修前判决 | 修后判决
+>     4200 |   4100 |     97.62% |   warn   |   ok
+>     5913 |   4100 |     69.34% |   warn   |  fail
+>     5913 |   4500 |     76.10% |  **ok**  |  fail   <-- 缺 24% 反而"更好看"
+>     5913 |   5850 |     98.93% |   ok     |   ok
+> ```
+>
+> **只要分母未知，`4500/5913 = 76.10%` 判 OK**，与 `4100/4200 = 97.62%`
+> 在 health 层**取值完全相同**。而 provider **早就算好了**分母
+> （Eastmoney `universe_info()`），Engine 也存进 `_universe_meta` ——
+> **但它零出口**（`git grep` 实证：全仓只有写入点与测试读它）。
+>
+> **✅ 09:00 轮修复 2 条 + 1 处"我自己上一轮新代码的残留"**
 > | ID | 复核 | 修复 |
 > |---|---|---|
-> | `IT-P1-OBS-EMPTY-ROUND-001`（云端 §4.1） | **成立**，最严重 | 逐轮行情数改用本轮观测；空轮也落账 |
-> | `IT-P1-ACK-TRIM-ORDER-001`（云端 §4.2） | **成立**，用户可见 | `_acked` 改保序容器，保留最新 2000 |
-> | `IT-P2-UNIVERSE-STATUS-CACHE-001`（云端 §4.3） | **成立** | `status()['universe']` 改用真实扫描池 |
-> | `R-21` / `IT-P1-UNIVERSE-HEALTH-GATE-001` | **升级为已确认** | 新增 `universe` 判决项（fail/warn/ok 三档）|
-> | **§5 我自己的实现 bug** | — | `SourceManager` 无 `capabilities()`，异常被我 `log.debug` 吞掉 → 账本一份没发。已改 `log.error` + 加端到端回归 |
+> | `R-12 / IT-P1-UNIVERSE-DENOMINATOR-001` | **成立**，最高优先 | `universe_truth()` + `status()` 出口 + `universe_coverage` 判决项 |
+> | `IT-P2-OBS-EMPTY-ROUND-R1` / WP04 | **成立**（我上一轮的代码） | `_request_arithmetic()` / `_bump_poll_count()` 收口到唯一入口 |
+> | **测试自身缺陷** | — | 我的测试曾 `del Engine._wants_indices` 污染真实类，已改子类覆盖 |
 >
-> **真实 `_soak_loop` 端到端**：
-> `quotes` `[500,500,500,500,500,500]` → **`[500,0,0,0,0,0]`**；
-> `no_data_rounds` 0 → **5**；判决 → **红**。
+> **1745 passed**（+25）/ 8 gate 全绿 / selftest 68-6-8-8 /
+> 回退验牙 **15 条行为级 RED / 0 结构性**。
 >
-> **1720 passed**（+26）/ 8 gate 全绿 / selftest 68-6-8-8 /
-> 回退验牙 **14 条行为级 RED / 0 结构性**。
+> 🔴 **仍未闭合（下一轮最高优先）**：`IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` ——
+> `_record_universe` 的 active membership **来源未改**。我本轮只把
+> transport 代码集与 active 集**分别导出**（`raw_unique_codes` vs
+> `active_scan_codes`）。改 membership 本身**会改变实际扫描集合**，风险大，
+> 必须配真实 provider 回放单独一轮做。
 >
-> 🔴 **`R-12` 仍是最高优先（本轮只推进了一半）**：
-> 05:00 轮让**池规模**参与判决了，但**"扫描池 vs 全市场"的比例仍未落盘** ——
-> `_universe_meta` 依然零出口，"分母未知"没解决。
->
-> **⬇ 本轮下调**：01:00 轮"同一 bug 类我漏了第二个实例" →
-> **下调**：漏的不止第二个，共 5 个（见上表）。
+> **⬇ 本轮下调**：05:00 "让'扫描范围过小'不再被误判为健康" →
+> **那只解决了绝对只数口径；相对覆盖当时仍然全瞎，本轮才补上。**
 >
 > **✅ 21:00 轮：修掉 17:40 本地轮与 20:10 云端轮各自独立指认的 7 条缺陷。**
 > **归属**：1.1–1.5 由 `17-40-00_JST.md` 轮先发现（§3.5 / §4 / 附录 A.1 / B.1），
@@ -169,15 +178,20 @@
   并把 `73.0%/83.1%` 从全部文档中**替换或标注为未复现**。
 - **验收**：`universe_coverage_reconcile.json` 存在且其分子分母可被独立重算复现。
 
-### B. 让"市场应有多少 → 实际扫了多少"成为一条单一事实链
-- **现状/证据（确定性，不依赖上面的百分比）**
+### B. ✅（**09:00 主体已完成**）让"市场应有多少 → 实际扫了多少"成为一条单一事实链
+- **09:00 轮已落地**（详见 D5 / `2026-09-22_09-00-00_JST.md` §1.1）：
+  `Engine.universe_truth()` → `store.status()['universe_truth']` →
+  `evaluate_health` 的 `universe_coverage` 项。**分母第一次进入事实链。**
+- **原证据（保留）**
   * `poll_once()`：`req_stocks = len(self._codes); coverage = returned / requested`
     —— 回答"我决定扫的这些回来多少"，**不问**"市场应有的有多少进了 active scan"。
-  * `_universe_meta` 引擎**已算出**却**零出口**（`git grep` 可查）。
+  * `_universe_meta` 引擎**已算出**却**零出口**（`git grep` 可查）——
+    09:00 轮已加出口。
   * 17:40 轮用 `max_pages=41` **离线复现**：`4100/5913 = 69.3%`、
     `transport_complete=False`，但 `refresh_universe()` **仍返回 4100 并写入 `eng._codes`**；
     且 `evaluate_health` **完全没有 universe 项** ——
     健康判定对 `universe_size ∈ {0, 4100, 5000, 5563}` **逐字节相同**。
+    （09:00 后 `universe_coverage` 项已能区分，见 D5 实测表。）
   * 我 21:00 轮真实回放中 `eastmoney` 报 `RemoteDisconnected`（第 3 次野外观测）。
 - **✅ 悬置疑问已关闭**（我独立复核，21:00）：`page_size=100`、`max_pages=80`、
   全市场 5913 → 需 `ceil(5913/100) = 60` 页；`60 > 80` 为 **False**。
@@ -186,10 +200,11 @@
   **可从源码单独解决**，是我没去算。
 - **危害**：分母被截断时**任何"没报警"都可能是"没扫到"**，
   且 **Recall 的上限未知**。这是唯一会让用户**系统性**误读结果的因素。
-- **做法**：按云端 §9 的 `UniverseTruth` schema（`mode` / `expected_total` /
-  `raw_unique_codes` / `usable_quotes` / `active_scan_codes` /
-  `transport_complete` / `active_coverage` / `reason`）建立单一事实链，
-  并让 Store / status / live-session 都暴露它。
+- **剩余（下一轮）**：`UniverseTruth` **落盘**成独立产物
+  （`universe_coverage_reconcile.json`）与**真实 coverage reconcile** ——
+  本轮只做到"进了运行时事实链 + 参与判决"，**没有**落盘产物，
+  也**没有**真实网络测量去独立验证 provider 声明的分母。
+  membership 来源分离见 **D6**。
 - **可证伪**：若真实长时间运行中 `active_coverage` 恒 ≥ 95%，门禁永不触发，
   说明源端其实稳定、这个担心不成立。
 
@@ -251,9 +266,63 @@
 - **验收**：`test_e2e_empty_round_publishes_zero_return_observation`
   （已落地，断言 seq 严格递增）。
 
-### D4. 同一 bug 类的**系统性收口**（05:00 新增）
-- **现状**：该 bug 类（**有界容器/累计缓存的长度被当作完整总量**）在本仓
-  已确认 **5 个实例**：
+### D4. 同一 bug 类的**系统性收口**（05:00 新增，09:00 扩为两类，见下文合并版）
+- 本节已与 09:00 新增的姊妹类合并到 **D4（合并版）**，见本文件后段。
+  保留标题仅为历史可追溯；**请直接读 D4（合并版）**。
+
+### D5. ✅（**09:00 已完成**）`R-12`：分母进入事实链 + 相对覆盖判决项
+- **09:00 轮已修**，一条事实链三处出口（详见 `2026-09-22_09-00-00_JST.md` §1.1）：
+  1. 新 `Engine.universe_truth()`：分母 + 四个分开的 coverage + `denominator_kind` 三态；
+  2. `store.status()['universe_truth']`：`_universe_meta` 的**第一个生产出口**；
+  3. `evaluate_health` 新增 `universe_coverage`（`<90%` fail / `90–95%` warn /
+     `>=95%` ok / 分母未知 **未测量判 ok**）。
+- **实测修前 → 修后**：`4500/5913 = 76.10%` **ok → fail**；
+  `4100/5913` warn → fail；`4200/4100` warn → ok；
+  同一绝对只数 4100 在 `/4200` 与 `/5913` 下**判得不一样**（修前相同）。
+- **仍未闭合的那一半**：分母**未知**时仍只能判"未测量" ——
+  这是诚实的（无 numeric total 时本就算不出比例），不是遗漏。
+- **仍未做的事**：**没有**任何真实网络测量去独立验证 provider 声明的分母
+  是否真等于全市场。本轮修的是**测量前提**，不是测量结果。
+
+### D6. 🔴 **membership 与 quote usability 分离**（**09:00 新增，下一轮最高优先**）
+- **证据（云端 §5 / §8.2，我独立复核成立）**：Eastmoney 已经在 metadata 里
+  把 `transport_complete`（传输轴）与 `usable_coverage`(诊断轴) 拆开了，
+  **但在 active membership 上又合并了**：
+  ```
+  Eastmoney universe()
+  → 返回 parsed usable Quote 列表
+  → Engine _record_universe(quotes)
+  → _extract_codes(quotes)
+  → active _codes
+  ```
+  代码自身允许
+  `expected_total=5913 / raw_unique_codes=5913 / transport_complete=True /
+   usable_quotes=4600` —— 此时 active membership 会变成 4600，
+  **而实际上有 5913 个成员本该被扫描**。
+- **危害**：停牌/无效价格行会**静默缩小扫描集合**，
+  且缩小后的规模看起来"正常"。这正是 `R-12` 的兄弟缺陷：
+  R-12 是"分母没进事实链"，这条是"分子被 usability 静默改小了"。
+- **我 09:00 轮为什么没改**：改 `_record_universe` 的 membership 来源
+  **会改变实际扫描集合**（真的会去请求更多代码），风险远大于加一个出口。
+  必须有**真实 provider 回放**才能安全验证，列为下一轮最高优先。
+- **可证伪**：若真实东财 universe 的 `usable_quotes == raw_unique_codes`
+  （即市场无停牌），则本缺陷永不触发。
+- **验收**：`expected_total=100 / raw_unique_codes=100 / usable_quotes=94 /
+  transport_complete=True` 时，**active membership 必须仍有 100 个 code**，
+  `usable_coverage=94%`。
+
+### D7. 恢复时钟（`IT-P1-UNIVERSE-REFRESH-STORM-001`，09:00 新增）
+- **证据（云端 §8.4，我**未**独立复现调用次数曲线）**：smaller partial 被拒后
+  **没有独立 retry clock**，可能每个 5s poll 重刷一次 universe。
+- **做法**：冻结三个语义不同的时刻 ——
+  `last_attempt_at`（前进）/ `last_applied_at`（被拒时不变）/
+  `last_complete_at`（被拒时不变）。`universe_truth()` 里**已预留透传**
+  （`if key in meta`），但 provider 侧还没写这三个时刻。
+- **可证伪**：若真实长跑下 `refresh_universe` 调用次数远小于 poll 次数，
+  本担心不成立。**我尚未测量这个次数** → 列为待验证。
+
+### D4（合并版）. 两个 bug 类的**系统性收口**（05:00 起，09:00 扩为两类）
+- **现状**：该 bug 类（**有界容器/累计缓存的长度被当作完整总量**）已确认 **5 个实例**：
   | # | 位置 | 状态 |
   |---|---|---|
   | 1 | 测试用 ring buffer 当累计分母 | 21:00 修 |
@@ -261,23 +330,18 @@
   | 3 | `live_session.py:1971` 累计行情缓存当逐轮数 | 05:00 修 |
   | 4 | `store.py:359` `_acked` 裁剪保留"任意"2000 | 05:00 修 |
   | 5 | `store.py:304` `status()['universe']` 用累计缓存 | 05:00 修 |
-- **为什么还要做**：5 个是**逐个被抓出来的**，不是**系统性找出来的**。
-  每轮都要靠外部审计发现同一个类的新实例，本身就是流程缺陷。
-- **做法**：写一条门禁/测试，枚举仓内所有 `len(...)` 被用作"总量/分母"的位置，
-  要求每个都声明它读的是**累计**还是**逐轮**；累计值不得进"逐轮/当前"字段。
-- **可证伪**：若穷举后没有第 6 个实例，说明该类已收口。
-  —— 若又找到，说明门禁必须自动化而不是靠人肉审计。
-
-### D5. 🔴 **`R-12` 仍未闭合**（05:00 明确，最高优先）
-- **现状**：05:00 轮让**池规模**参与判决了，但**"扫描池 vs 全市场"的比例仍未落盘**。
-  `_universe_meta` 引擎已算但**零出口**；`poll_once` 的
-  `coverage = returned / requested` 只回答"我决定扫的回来多少"，
-  **不回答"全市场有多少进了扫描池"**。
-- **危害**：在部分覆盖下 **"没有告警"可能意味着"从来没扫到"** ——
-  这是唯一会让用户**系统性**误读结果的因素。
-- **做法**：按云端 §9 的 `UniverseTruth` schema 建立单一事实链，
-  并让 Store / status / live-session 都暴露它。
-- **可证伪**：若真实长跑 `active_coverage` 恒 ≥ 95%，门禁永不触发。
+- **09:00 新增的姊妹类**（**"同一语义写了两套实现"**）：
+  | # | 位置 | 状态 |
+  |---|---|---|
+  | 6 | 空轮分支手写 request 算术 → **幻影** `index_requested=5` | 09:00 修 |
+  | 7 | 空轮分支 early return 早于 poll 自增 → **poll identity 断裂** | 09:00 修 |
+  | 8 | 我**更早一版**调用不存在的 `self.sources.capabilities()` 被 `except` 吞掉 | 05:00 修 |
+- **为什么还要做**：8 个都是**逐个被抓出来的**，不是**系统性找出来的**。
+  每轮靠外部审计发现同一个类的新实例，本身就是流程缺陷。
+- **做法**：把两个类都做成门禁 ——
+  (a) 枚举仓内 `len(...)` 被用作"总量/分母"的位置，要求声明读的是**累计**还是**逐轮**；
+  (b) 扫描 `poll_once` 内是否出现**重复**的 request/poll 算术（必须走唯一 helper）。
+- **可证伪**：若穷举后没有第 9 个实例，说明该类已收口。
 
 ### A2. 把 ST 新规从"单元"推到"回放链路" ✅ **主体已完成**
 - **完成情况**：`IT-P1-ST-REPLAY-BYPASS-001` 已修 ——

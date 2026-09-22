@@ -1,10 +1,104 @@
 # 最新审计
 
+**最新本地 Agent 产品轮**：[`2026-09-22_09-00-00_JST.md`](./2026-09-22_09-00-00_JST.md)  
 **最新云端独立审计**：[`2026-09-22_08-08-19_JST.md`](./2026-09-22_08-08-19_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_08-08-19_JST_AGENT_TASK.md`](./2026-09-22_08-08-19_JST_AGENT_TASK.md)  
-**最新本地 Agent 产品轮**：[`2026-09-22_05-00-00_JST.md`](./2026-09-22_05-00-00_JST.md)  
+**上一份本地 Agent 产品轮**：[`2026-09-22_05-00-00_JST.md`](./2026-09-22_05-00-00_JST.md)  
 **上一份云端独立审计**：[`2026-09-22_04-05-26_JST.md`](./2026-09-22_04-05-26_JST.md)  
 **上一份云端 Agent 任务书**：[`2026-09-22_04-05-26_JST_AGENT_TASK.md`](./2026-09-22_04-05-26_JST_AGENT_TASK.md)  
+
+## 2026-09-22 09:00 JST 本地 Agent 产品轮（R-12 分母落地：76.10% 不再判 OK）
+
+- 起点 HEAD：`2406d818168da9e642e73b73b254762050e229e5`；`reviewed_source_sha` = `2406d818`（我 05:00 轮推的提交，正是云端 08:08 轮审的那个）。
+- 归档机器证据：**1745 passed in 83.43s**（上轮 1720 → +25）；`check_*.py` **8/8**；`check_bom` 通过；`dash_render_check.js` 通过；`selftest` **68 / 6 类型 / 8-8**。
+- 回退验牙：**15 条行为级 RED / 0 结构性，无 ImportError**。
+
+### 🔴 `R-12` 闭合"分母已知"那一半 —— 我追了四轮的最高优先项
+
+云端 08:08 轮用**固定门禁、只改 provider 声明分母**的确定性实验证明（我独立复现）：
+
+```
+expected | active | active cov | 修前判决 | 修后判决
+    4200 |   4100 |     97.62% |   warn   |   ok
+    5913 |   4100 |     69.34% |   warn   |  fail
+    5913 |   4500 |     76.10% |  **ok**  |  fail   <-- 缺 24% 反而"更好看"
+    5913 |   5850 |     98.93% |   ok     |   ok
+```
+
+**关键**：只要分母未知，`4500/5913 = 76.10%` 被判 **OK**，而它与
+`4100/4200 = 97.62%` 在 health 层**取值完全相同**（都只是 `universe_size`）。
+**这不是"阈值再调一下"，是"分母根本不在事实链上"。**
+
+而 provider **早就算好了**分母：Eastmoney `universe_info()` 返回
+`transport_expected_total / raw_unique_codes / usable_quotes / shortfall /
+usable_coverage`，Engine 也存进 `self._universe_meta`。**但它零出口** ——
+`git grep` 实证：全仓只有写入点与测试读它。
+
+**修复（一条事实链，三处出口）**
+1. 新 `Engine.universe_truth()`：分母 + **四个分开的** coverage
+   （`coverage_transport` / `coverage_usable` / `coverage_active`）
+   + `denominator_kind` 三态（`provider_declared_total` /
+   `pagination_exhausted_non_numeric` / `unknown`）。**分母未知返回 `None`，不冒充已知。**
+2. `store.status()['universe_truth']`：`_universe_meta` 的**第一个生产出口**。
+3. `evaluate_health` 新增 `universe_coverage` 判决项：`<90%` **fail**、
+   `90–95%` warn、`>=95%` ok、分母未知 **未测量判 ok**。
+
+**两条设计纪律（都有实测依据）**
+- 判据用 **`coverage_active`**，**不是** `coverage`（那是 `C_round`）。
+  实测 `C_round=100%` + `C_active=76.10%` → **仍然转红**，
+  即 **`C_round` 不能替代 `C_active`**（云端 §8.3）。
+- **成员集 ≠ 可用 Quote 数**（云端 §8.2）：transport 拿到 100 码、
+  94 个能构造 Quote 时，`active_scan_codes` 必须仍是 **100** 而非 94 ——
+  否则"市场里有停牌股"会被读成"扫描范围缩了"。
+
+### ⚠ 云端在我**上一轮自己新写的**空轮分支里找到 2 条残留（WP04）
+
+| 缺陷 | 修前 | 修后 |
+|---|---|---|
+| **幻影** `index_requested`（`spirit_index` 关闭仍报） | **5** | **0** |
+| 同轮 `requested` | **505** | **500** |
+| 5 个空轮的 `observation_poll_count` | **1,1,1,1,1** | **1,2,3,4,5** |
+
+- **幻影**：`_wants_indices=False` 时 `_fetch_indices()` **根本不 dispatch**，
+  我的分支却写 `index_requested = len(self.index_codes)` ——
+  观测层**无法区分**"指数抓了没回来"与"根本没抓"（后者不是数据事故）。
+  **正常路径早在 `IT-P2-OBS-008` 就修过这个语义，我新增分支时又写坏了一次。**
+- **poll identity 断裂**：我的 `return []` 早于 `self._poll_count += 1`，
+  于是 `observation_seq` 涨而 `poll_count` 冻结 —— 制造了一批**无法归属的观测**。
+- **修复 = 收口到唯一入口**：新 `_request_arithmetic()` 与 `_bump_poll_count()`，
+  正常路径与空轮分支**都调**（有结构测试断言 `poll_once` 里不再出现内联自增）。
+
+### ✅ 云端确认我上一轮 5 条修复**全部成立**
+
+`IT-P1-OBS-EMPTY-ROUND-001`、`IT-P1-SOAK-CUMULATIVE-QUOTES-001`、
+`IT-P1-ACK-TRIM-ORDER-001`、`IT-P2-UNIVERSE-STATUS-CACHE-001`、
+`R-21 / IT-P1-UNIVERSE-HEALTH-GATE-001` —— 本轮**全部回归通过**，不重开。
+
+### 对上一轮结论的下调
+
+* 05:00 "让'扫描范围过小'不再被误判为健康" → **下调**：那只解决了**绝对**只数口径；
+  **相对覆盖当时仍然全瞎**，本轮才补上。
+* 05:00 "修一个可观测性缺陷必须走到有人改变结论为止" → **本轮我自己违反了它**：
+  修空轮分支时又写了第二套算术。教训升级：
+  **光"走到有人读"不够，新增分支必须复用既有语义，不许"顺手简化"。**
+* `R-12` 从"仍未闭合" → **上调为已闭合"分母已知"那一半**；
+  分母**未知**时仍只能判"未测量"（诚实，非遗漏）。
+
+### ⚠ 我在写这批测试时也制造过一个缺陷（如实记录）
+
+第一版 `test_empty_round_has_no_phantom_index_request` 用
+`del eng.__class__._wants_indices` 收尾，**把真实 `Engine` 类的 property 删掉了**，
+直接污染同进程后续所有测试（把端到端用例打挂）。改为**子类覆盖**，
+并加收尾自证 `assert isinstance(Engine.__dict__["_wants_indices"], property)`
+—— **测试不得破坏被测类**。
+
+### 仍未闭合（下一轮最高优先）
+
+`IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001`：`_record_universe` 的 active membership
+**来源未改**（我本轮只把 transport 代码集与 active 集**分别导出**）。
+改它**会改变实际扫描集合**，必须配真实 provider 回放单独一轮做。
+
+---
 
 ## 2026-09-22 08:08:19 JST 云端审计
 

@@ -294,6 +294,11 @@ class AlertStore:
         # **不是** `state.quotes`（累计缓存，含历史准入过的代码与指数，从不裁剪）。
         # 取不到就不猜 —— 让消费方看到 None 而不是一个漂亮但错的数。
         active_universe: int | None = None
+        # R-12 / WP01：**分母**必须沿同一条事实链出去，否则 health 只能看绝对只数。
+        # `engine.universe_truth()` 把 provider 早就算好的
+        # expected_total / raw_unique_codes / usable_quotes 与四个 coverage
+        # 一起带出来。取不到就留 None（消费方据此判"未测量"），**不猜**。
+        universe_truth: dict | None = None
         if self._engine is not None:
             try:
                 ac = getattr(self._engine, "_codes", None)
@@ -301,6 +306,14 @@ class AlertStore:
                     active_universe = len(list(ac))
             except Exception:  # noqa: BLE001 —— 展示字段，取不到就退化
                 active_universe = None
+            try:
+                ut = getattr(self._engine, "universe_truth", None)
+                if callable(ut):
+                    got = ut()
+                    if isinstance(got, dict):
+                        universe_truth = got
+            except Exception:  # noqa: BLE001
+                universe_truth = None
         with self._lock:
             observation = dict(self._observation)
             # 账本**自身**的身份（IT-P2-OBS-STATUS-001）。必须与
@@ -326,6 +339,11 @@ class AlertStore:
             # 拿不到就把键省掉，让消费方知道"没测"，而不是给一个漂亮但错的数。
             "universe": (active_universe if active_universe is not None
                          else len(quotes)),
+            # R-12 / WP01：股票池**真相**（分母 + 四个 coverage + 恢复时钟）。
+            # 这是 `_universe_meta` 的第一个生产出口 —— 在此之前它零出口，
+            # health 只能看绝对只数，回答不了 "4500 / ? = ?"。
+            # 键恒存在（值可能是 None），消费方据此区分"未测量"与"没有该字段"。
+            "universe_truth": universe_truth,
             # 同一字段的两个口径必须都能读到，否则没法判断上面那个数是哪个：
             #   universe        = 本轮实际扫描池（引擎 `_codes`），**递减会跟着变**
             #   universe_cached = 累计最新报价缓存规模（旧口径，只会涨）

@@ -172,6 +172,21 @@ MEM_GROWTH_SLACK = 500
 UNIVERSE_MIN_ABS = 3000
 UNIVERSE_WARN_ABS = 4500
 
+#: R-12 / WP01：**相对**覆盖阈值（active_scan_codes / expected_total）。
+#:
+#: 为什么绝对阈值不够（实测）：只要分母已知，
+#:   active=4500 / expected=5913 = **76.10%** 会被绝对门禁判 **OK**
+#:   active=4100 / expected=4200 =  97.62% 却被判 WARN
+#: —— 缺 24% 的那个反而"更好看"。**这不是阈值再调一下能解决的，是分母缺失。**
+#:
+#: 云端 §8.5 给出的候选起点（**非已认证最优**，先落地再据真实长跑校准）：
+#:   < 90%  -> fail
+#:   90-95% -> warn
+#:   >= 95% -> ok
+#: 分母未知 -> **不判红**（未测量）。
+UNIVERSE_COV_FAIL = 0.90
+UNIVERSE_COV_WARN = 0.95
+
 EXIT_HEALTHY = 0
 EXIT_UNHEALTHY = 1
 EXIT_NO_DATA = 2
@@ -1381,6 +1396,87 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         add("universe", True,
             "无 setup 字段，无法判定（跳过不算失败）", level="ok")
 
+    # --- R-12 / WP01：**相对覆盖**必须参与判决 -----------------------------
+    #
+    # 为什么必须有这一项：上面那个 `universe` 项只回答"池子有多大"，
+    # 回答不了 "4500 / ? = ?"。实测（复核云端 EXP-IT-UNIVERSE-TRUTH-002）：
+    # 只要分母未知，绝对门禁会把
+    #   4500 / 5913 = 76.10%  判 **OK**
+    #   4100 / 4200 = 97.62%  判 WARN
+    # —— 前者实际缺 24%，却比后者"更好看"。**这不是阈值问题，是分母缺失。**
+    #
+    # 判据用 ``coverage_active``（= active_scan_codes / expected_total），
+    # **不是** `coverage`（那是 C_round = 本轮返回/本轮请求，只说明
+    # "我要的拿到了"，不说明"我要的是不是全市场"）。
+    # 云端 §8.3 明确：**C_round 永远不能替代 C_active。**
+    #
+    # 三档起点（云端 §8.5 候选，非已认证最优）：
+    #   < 90%  -> fail
+    #   90-95% -> warn
+    #   >= 95% -> ok
+    # 分母未知（无 numeric total，如新浪"翻页翻完但无总数"）-> **ok/未测量**，
+    # 与 capability / delivery_accounting / universe 同约定：**不把"没测"判红**。
+    _ut = _setup.get("universe_truth") if isinstance(_setup, dict) else None
+    if isinstance(_ut, dict) and _ut:
+        _dk = str(_ut.get("denominator_kind") or "unknown")
+        _exp = _safe_int(_ut.get("expected_total"))
+        _act = _safe_int(_ut.get("active_scan_codes"))
+        _raw = _ut.get("raw_unique_codes")
+        _use = _ut.get("usable_quotes")
+        _cov_a = _ut.get("coverage_active")
+        _cov_t = _ut.get("coverage_transport")
+        _cov_u = _ut.get("coverage_usable")
+        _f_cov = _safe_float(tol.get("coverage_active_fail"), UNIVERSE_COV_FAIL)
+        _w_cov = _safe_float(tol.get("coverage_active_warn"), UNIVERSE_COV_WARN)
+
+        def _f(v: object) -> float | None:
+            """脏值安全转 float —— **判决层绝不许因为脏值抛异常**。
+
+            实测：`{'coverage_active': 'z', 'expected_total': 100}` 曾让
+            `evaluate_health` 直接抛 `ValueError`。判决层崩溃比判错更糟：
+            健康检查自己挂掉，调用方拿到的是异常而不是"不健康"。
+            """
+            try:
+                return float(v)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+
+        def _pct(v: object) -> str:
+            fv = _f(v)
+            return "未知" if fv is None else f"{fv:.2%}"
+
+        _cov_a_f = _f(_cov_a)
+        if _exp <= 0 or _cov_a_f is None:
+            # 分母未知 -> **不许**假装知道。新浪 clean pagination 就属这类：
+            # 它能证明"翻页翻完了"，但没有 numeric total，二者不能硬塞成
+            # 同一种 coverage。脏值同样走这里（判"未测量"而非崩溃）。
+            _why = (f"分母未知（{_dk}）" if _exp <= 0
+                    else f"coverage 值不可解析（{_cov_a!r}）")
+            add("universe_coverage", True,
+                f"{_why} —— 无法计算全市场覆盖"
+                f"（跳过不算失败；此时'没有告警'不能解释为'没有异动'）",
+                level="ok")
+        elif _cov_a_f < _f_cov:
+            add("universe_coverage", False,
+                f"全市场覆盖过低：active {_act}/{_exp} = {_pct(_cov_a)}"
+                f"（下限 {_f_cov:.0%}）—— transport {_pct(_cov_t)}、"
+                f"usable {_pct(_cov_u)}；扫描范围缺 {_exp - _act} 只，"
+                f"漏报风险高", level="fail")
+        elif _cov_a_f < _w_cov:
+            add("universe_coverage", True,
+                f"全市场覆盖偏低：active {_act}/{_exp} = {_pct(_cov_a)}"
+                f"（警戒 {_w_cov:.0%}，下限 {_f_cov:.0%}）",
+                level="warn")
+        else:
+            add("universe_coverage", True,
+                f"全市场覆盖 active {_act}/{_exp} = {_pct(_cov_a)}"
+                f"（transport {_pct(_cov_t)}、usable {_pct(_cov_u)}；"
+                f"reported={_raw}/{_use}）", level="ok")
+    else:
+        add("universe_coverage", True,
+            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            level="ok")
+
     total = sum(int(v) for v in by_kind.values())
     add("alerts", True, f"共 {total} 条告警（0 条不算失败：休市时本就无告警）")
 
@@ -1553,14 +1649,19 @@ def _safe_int(v: Any) -> int:
         return 0
 
 
-def _safe_float(v: Any) -> float:
-    """可观测性比率转 float；None/脏值一律 0.0（**不抛**）。"""
+def _safe_float(v: Any, default: float = 0.0) -> float:
+    """可观测性比率转 float；None/脏值一律回落到 ``default``（**不抛**）。
+
+    ``default`` 存在的理由：阈值字段的"缺省"不能是 0.0 —— 那会把
+    ``coverage_active_fail`` 变成"任何覆盖都算 fail"。所以调用方必须显式给出
+    有意义的兜底值（见 ``UNIVERSE_COV_FAIL`` / ``UNIVERSE_COV_WARN``）。
+    """
     if isinstance(v, bool) or v is None:
-        return 0.0
+        return float(default)
     try:
         return float(v)
     except (TypeError, ValueError):
-        return 0.0
+        return float(default)
 
 
 def _round_observation_fields(row: dict) -> set[str]:
@@ -2178,8 +2279,25 @@ def run(args: argparse.Namespace) -> int:
     codes = list(getattr(engine, "_codes", []) or [])
     watch = list(getattr(engine, "watchlist", []) or [])
     fell_back = bool(codes) and len(codes) <= len(watch)
+    # R-12 / WP01：把股票池**真相**（含分母）取出来。必须在 refresh 之后 ——
+    # 分母来自 provider 最近一次 universe()，refresh 前还是上一轮的。
+    universe_truth: dict | None = None
+    try:
+        _ut = getattr(engine, "universe_truth", None)
+        if callable(_ut):
+            _got = _ut()
+            universe_truth = _got if isinstance(_got, dict) else None
+    except Exception as exc:                         # noqa: BLE001
+        print(f"      [!] 股票池真相读取失败：{type(exc).__name__}: {exc}")
     print(f"      股票池：{len(codes)} 只（刷新 {refresh_s:.1f}s）"
           + ("  [!] 已降级为仅自选股" if fell_back else ""))
+    if isinstance(universe_truth, dict):
+        _dk = universe_truth.get("denominator_kind")
+        _exp = universe_truth.get("expected_total")
+        _ca = universe_truth.get("coverage_active")
+        print(f"      股票池真相：分母={_exp or '未知'}（{_dk}），"
+              f"active coverage="
+              + ("未知" if _ca is None else f"{float(_ca):.2%}"))
     if not codes:
         print("      [!] 股票池为空且自选股也没配 -> 本轮不会产生任何行情/告警")
 
@@ -2291,6 +2409,10 @@ def run(args: argparse.Namespace) -> int:
                "universe_refresh_s": round(refresh_s, 3),
                "universe_size": universe_size,
                "fell_back_to_watchlist": fell_back,
+               # R-12 / WP01：**分母**。`_universe_meta` 此前零出口，
+               # health 只能看绝对只数，回答不了 "4500 / ? = ?"。
+               # 取不到就 None —— 消费方据此判"未测量"，**不猜**。
+               "universe_truth": universe_truth,
                "sse_stall_after_s": max(8.0, 3.0 * float(cfg.get("sse_interval") or 2.0))
                if cfg else None},
     )
