@@ -1,5 +1,81 @@
 # 最新审计
 
+## 2026-09-22 09:49:38 JST 云端独立审计（新增：`R-12` 修好了"分母已知"那一半，但新判决项在"分母随数据一起丢失"时仍判绿）
+
+[2026-09-22_09-49-38_JST.md](2026-09-22_09-49-38_JST.md)
+
+- `reviewed_source_sha` = **`369b13f0d6f20fc22198abf51469ee14e49c84dc`**
+  （`fix(universe): R-12 分母进入事实链 + 空轮账本对账（WP01 / WP04）`）。
+  **该产品提交此前未被任何报告审过** —— 已提交的 `2026-09-22_09-00-00_JST.md` 自述
+  `reviewed_source_sha = 2406d81`，即它审的是 05:00 那版。
+- 测试真数（我在 `git archive` 导出的 scratch 双树内实跑，**未**在活仓库跑）：
+  BASE `2406d818` → **1720 passed in 105.36s**；FIX `369b13f0` → **1745 passed in 93.49s**（+25 = 新增测试文件）。
+  活仓库 `git status --porcelain` = **0 行**。
+- **验牙成立**：新测试跑在 **BASE 源码** 上 → **exit 1，15 failed / 10 passed，0 个 ImportError**（全行为级 RED）；
+  同测试跑在 FIX 上 → **25 passed**。
+
+### ✅ `R-12` 的"分母已知"那一半：**已经修复**（我独立复现）
+用仓库自带绿基线 `_healthy_metrics()`，只改 `universe_truth`：
+`4500/5913 = 76.10%` 由 `healthy=True/exit=0/fail=[]` → **`healthy=False/exit=1/fail=['universe_coverage']`**；
+`4100/4200 = 97.62%` 仍绿 —— 同一绝对数、不同分母**判得不一样**了。修前两者取值完全相同。
+
+### 🔴 `IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001`〔**已确认错误·P1**〕
+`tools/live_session.py:1419-1478` 新增的 `universe_coverage` 判决块**只**读
+`denominator_kind/expected_total/active_scan_codes` 与三个 coverage。
+我在 `evaluate_health` 函数体（`1044..1550`）内实测：
+**`transport_complete` 出现 0 次、`shortfall` 0 次、`denominator_known` 0 次** ——
+尽管 `Engine.universe_truth()`（`src/arad/engine.py:967`）**已经算出**它们。
+于是 `:1449 if _exp <= 0 or _cov_a_f is None:` 把"provider **明确承认**没给全"
+与"翻页翻完但无总数"归成同一支，判 `level="ok"`。
+**实跑**（真实 `Engine` + 假 provider）：截断到 5000 只且 provider 报 `transport_complete=False`
+→ `healthy=True exit=0 fail=[]`，`universe_coverage level=ok`。4600 只同样绿。
+⇒ provider **主动告知、不需要分母**就能判定的硬事实被降级成"未测量"。
+**边界**：`:1417-1418` 注释与上一轮报告 §6 想法 2 **明确**把"分母未知→ok/未测量"写成故意设计决定，
+故这是**设计选择的代价**，不是笔误。
+**修复**：该分支增加先于 `_exp <= 0` 的判断 —— `transport_complete is False` → `fail`。
+**验收**：喂入 `{"denominator_kind":"unknown","expected_total":0,"active_scan_codes":5000,
+"coverage_active":None,"transport_complete":False}`，断言 `healthy is False`。当前实测 `True`，测试会红。
+
+### 🔴 `IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001`〔**已确认错误·P1**〕
+`src/arad/engine.py:1138-1140`：`refresh_universe()` 全源失败时 `return 0`，**不重置 `_universe_meta`**；
+只有成功路径（`:1114` / `:1133`）写它。`universe_truth()` 读它且**无任何新鲜度字段**。
+**实跑**（注入假源，`fake calls` 计数证明未走网络）：健康刷新后令 provider 全部抛异常 →
+`refresh_universe() -> 0`，但 `universe_truth()` 仍报
+`denominator_kind='provider_declared_total' expected_total=5913 active=5913 coverage_active=1.0`
+（与断供前**逐字段相同**），`evaluate_health` 打印 **"全市场覆盖 5913/5913 = 100.00%"** 且 `healthy=True exit=0`。
+**影响面（精确）**：`src/arad/store.py:310-316` 的 `status()['universe_truth']` 是**每次调用实时**取值，
+故**实时状态出口**在断供期间会显示 100.00%。
+**边界**：会话**末尾**的 health 用的是 `live_session.py:2284-2289` 的**循环前快照**，
+故本条**不**直接污染最终判决，只污染实时出口 —— 不夸大。
+与 h=20 轮修掉的"判决层读旧账本"**同一 bug 类**，换了对象。
+**修复**：全失败分支清空或标注 `_universe_meta`（如 `_universe_meta_stale_at`），
+`universe_truth()` 输出 `stale`/`age_s`。顺带让 `engine.py:976` 那三个**死键**有真实 producer。
+
+### ⚠ 与上一轮自查**一致**、故**不计为新发现**
+三个恢复时钟 `last_attempt_at/last_applied_at/last_complete_at` 在全仓只出现 **2 处**
+（`engine.py:976` 的**读**循环 + 我的探针），两个 producer（`engine.py:1030-1048`、
+`eastmoney.py:479-503`）**都不写**它们 ⇒ 循环体从不执行，实测恒为 `None`。
+**上一轮 §7 已自行披露**此事，我按纪律**降级而非删除**，仅作为上方修复建议的落点。
+
+### ⏳ `IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001`〔**待验证风险·P2**〕
+`universe_truth` 仅在 `live_session.py:2284-2289`（进 soak 循环**前**）取一次快照，
+而循环内 `poll_once(force=True)`（`:2130`）会按 TTL(=`config/settings.yaml:22` 的 1800s)
+经 `engine.py:1244` 重刷。故判决用的是**起始时刻**的覆盖。**我未跑真实多轮 soak 量化**，故只列待验证。
+
+### 未复现 / 已降级
+`IT-P1-UNIVERSE-REFRESH-STORM-001`：我只证明 TTL 到期会重刷，**未**测得风暴式调用频率 → **未复现，降级**。
+
+### 三轴与分类
+`execution_status`：审 `369b13f0`；双树全量 pytest ×2、定向 ×2、判决矩阵 ×1、真实 Engine 断供 ×1；**活仓库零改动**。
+`research_verdict`：`R12_KNOWN_DENOMINATOR_FIX_CONFIRMED` / `...TRUNCATION_BLIND` / `...META_STALE` / `...PRELOOP`。
+`evidence_status`：`VERIFIED` / `VERIFIED_STATIC_ONLY`（P2）/ `NOT_REPRODUCED_AND_DOWNGRADED`。
+`evidence_type`：**软件样本**（1720/1745/15 RED/0 ImportError）；**实股结果：无新增**，真实
+Precision/Recall/漏报率/收益 = `unavailable`；本轮 Engine 实验全用**假 provider**，非实股证据。
+**程序修复 2 条（未实施）／任务定义变更 1 条建议／真实模型增益 0**。
+**边界**：该仓库**无** `docs/audits/validate_latest.py`（实测不存在），故**不声称**通过验证器门禁。
+`report_created_commit_sha`: `PENDING_READBACK`。
+
+
 **最新本地 Agent 产品轮**：[`2026-09-22_09-00-00_JST.md`](./2026-09-22_09-00-00_JST.md)  
 **最新云端独立审计**：[`2026-09-22_08-08-19_JST.md`](./2026-09-22_08-08-19_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_08-08-19_JST_AGENT_TASK.md`](./2026-09-22_08-08-19_JST_AGENT_TASK.md)  
