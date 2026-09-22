@@ -740,6 +740,12 @@ class Engine:
         # 让离线测试变成依赖网络、且结果随机。
         self._codes_pinned = False
         self._universe_refreshed_at: float = 0.0
+        #: IT-P2-UNIVERSE-FALLBACK-FRESHNESS-RESET-001：**全市场**最后成功
+        #: 刷新时刻。与 `_universe_refreshed_at`（active scope 切换时刻）
+        #: **语义不同、不得合并** —— 降级到自选股会更新前者，但绝不能把
+        #: "全市场已 2 小时没拿到"改写成"0s 未更新"（fail 会降成 warn，
+        #: 且 detail 句子为假）。
+        self._universe_full_market_at: float = 0.0
         #: 最近一次成功刷新股票池的完整性元数据（IT-P1-006）。
         self._universe_meta: dict[str, Any] = {}
         #: IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001：**最近一次刷新尝试**
@@ -935,9 +941,22 @@ class Engine:
 
         # 分母来源判定：有 numeric total 才算 provider_declared_total；
         # 否则看 transport 是否"翻页翻完"（complete=True 且非数字总数）。
-        transport_complete = meta.get("transport_complete")
-        if transport_complete is None:
-            transport_complete = meta.get("complete")
+        #
+        # IT-P1-UNIVERSE-TRANSPORT-TRISTATE-R1（16:13 轮 / 13:55 附刊 B1）：
+        # ``transport_complete`` 必须是**三态**，绝不能过 `bool()`：
+        #   True  = provider/传输明确完整
+        #   False = provider/传输明确不完整
+        #   None  = **没测到/没声明**（冷启动、钉池、回放、尚未刷新过）
+        # 修前 `bool(meta.get("transport_complete") or meta.get("complete"))`
+        # 在 `_universe_meta == {}` 时把 None 压成 **False** ——
+        # 于是判决层把"我没测"渲染成"**provider 明确声明股票池被截断**"，
+        # 退出码 1 并把排障指向数据源。这是本次要修的"把不知道当没问题"的
+        # **镜像错误**：把不知道当成了**有罪**。两者都源于**三态被压成两态**。
+        _transport_raw = meta.get("transport_complete")
+        if _transport_raw is None:
+            _transport_raw = meta.get("complete")
+        transport_complete = (None if _transport_raw is None
+                              else bool(_transport_raw))
         if exp_n > 0:
             denom_kind = "provider_declared_total"
         elif transport_complete is True:
@@ -972,7 +991,9 @@ class Engine:
                               if isinstance(usable, (int, float)) else None),
             #: 引擎**实际安排轮询**的成员数（这才是 active membership）
             "active_scan_codes": active_n,
-            "transport_complete": bool(transport_complete),
+            # 三态直传：None = 未测量。**不要** bool() —— 见上面 TRISTATE 注释。
+            "transport_complete": transport_complete,
+            "transport_measured": transport_complete is not None,
             "shortfall": int(meta.get("shortfall") or 0),
             # ---- 四个 coverage，全部分开 ----
             "coverage_transport": _ratio(raw_unique, exp_n),
@@ -1003,13 +1024,25 @@ class Engine:
         # 也**不"失败就完全不动"**（那就是现在这个缺陷）。
         now_ep = time.time()
         _refreshed_at = float(getattr(self, "_universe_refreshed_at", 0.0) or 0.0)
+        # IT-P2-UNIVERSE-FALLBACK-FRESHNESS-RESET-001（13:55 附刊 B3 / 16:13 §8）：
+        # **两个时钟语义不同，绝不能合并**：
+        #   active_scope_applied_at     = 当前扫描集是什么时候变成现在这样的
+        #   last_full_market_complete_at = **最后一次成功拿到全市场**是什么时候
+        # 降级到自选股时前者**应该**更新（扫描集确实变了），
+        # 但后者**绝不能**改成"现在" —— 否则"全市场已经 2 小时没拿到"
+        # 会被改写成"0s 未更新"，fail 降级成 warn，且 detail 句子是**假的**。
+        _full_at = float(getattr(self, "_universe_full_market_at", 0.0) or 0.0)
         out["active_snapshot"] = {
             "refresh_id": int(meta.get("refresh_id") or 0),
             "source": meta.get("source"),
+            # 兼容旧名：applied_at 现在明确等价于 active scope 切换时间
             "applied_at": _refreshed_at or None,
+            "active_scope_applied_at": _refreshed_at or None,
+            "last_full_market_complete_at": _full_at or None,
             "active_scan_codes": active_n,
             "expected_total": exp_n,
-            "transport_complete": bool(transport_complete),
+            # 三态直传（见上面 TRISTATE 注释）
+            "transport_complete": transport_complete,
             "coverage_active": out["coverage_active"],
             "age_s": (round(now_ep - _refreshed_at, 3)
                       if _refreshed_at else None),
@@ -1022,18 +1055,33 @@ class Engine:
         out["attempt_status"] = str(attempt.get("status") or "")
         out["last_attempt_at"] = attempt.get("attempt_at")
         out["active_age_s"] = out["active_snapshot"]["age_s"]
+        # **全市场**口径的年龄（判决新鲜度应当用它，不是 active scope 年龄）
+        out["full_market_age_s"] = (round(now_ep - _full_at, 3)
+                                    if _full_at else None)
 
-        # freshness：把"多久没成功刷新"变成一个可判决的数。
+        # freshness：把"多久没成功拿到全市场"变成一个可判决的数。
+        #
+        # IT-P2-UNIVERSE-FRESHNESS-CONFIG-KEY-001（13:55 B5 / 16:13 §7）：
+        # 修前读 `universe.refresh_seconds` —— 该键**在 settings.yaml 里不存在**，
+        # `Settings.get()` 是严格 dotted lookup ⇒ 永远 None ⇒ 回硬编码默认。
+        # 真实键是 `poll.universe_refresh_seconds`（settings.yaml:22 / config.py:46），
+        # 也是 `_maybe_refresh_universe()` 真正用的那个。
+        # 后果：运维改真键**改变了真实刷新 TTL，却改不了判决阈值** ——
+        # 行为时钟与健康时钟漂移。现在两者从**同一个**正式配置源导出。
         warn_s = 1800.0
-        fail_s = 3600.0
         try:
             cfg = getattr(self, "settings", None)
             if cfg is not None:
-                warn_s = float(cfg.get("universe.refresh_seconds") or warn_s)
-                fail_s = warn_s * 2.0
+                warn_s = float(cfg.get("poll.universe_refresh_seconds")
+                               or warn_s)
         except Exception:  # noqa: BLE001
             pass
-        age = out["active_snapshot"]["age_s"]
+        fail_s = warn_s * 2.0
+        # 新鲜度看的是**最后一次拿到全市场**，不是"active scope 何时切换"。
+        # 回退到 active_age_s 只为兼容从未写过 _universe_full_market_at 的路径。
+        age = out["full_market_age_s"]
+        if age is None:
+            age = out["active_age_s"]
         if age is None:
             state = "unknown"
         elif age > fail_s:
@@ -1048,6 +1096,7 @@ class Engine:
             "warn_s": warn_s,
             "fail_s": fail_s,
             "last_applied_at": _refreshed_at or None,
+            "last_full_market_complete_at": _full_at or None,
             "attempt_status": out["attempt_status"],
             # **只有**"最近一次尝试成功应用"且"池子不陈旧"才算 fresh。
             # 用 `applied` 而不是 `status == 'applied'` 是为了把
@@ -1177,86 +1226,112 @@ class Engine:
                                   else str(getattr(source, "name", source)))
             self._universe_attempt = dict(_attempt)
 
-        for src in self._universe_sources():
-            name = getattr(src, "name", src)
-            try:
-                quotes = (src.call("universe", route=ROUTE_UNIVERSE)
-                          if isinstance(src, SourceManager)
-                          else src.universe())
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                self.log.warning("股票池来源 %s 失败: %s", name, exc)
-                continue
-            if not quotes:
-                continue
-            meta = self._universe_meta_of(src, quotes)
-            if not meta.get("complete", True):
-                # 候选比较阶段用**纯函数**，不写 state.universe —— 部分结果
-                # 可能因「比现有池更小」而被拒绝，拒绝后不该留下任何痕迹。
-                cand = self._extract_codes(quotes)
-                if not cand:
+        # IT-P2-UNIVERSE-ATTEMPT-EXCEPTION-EXIT-001（13:55 附刊 B2 / 16:13 §1.2）：
+        # **异常出口不是 `return`** —— 数 return 语句枚举不了出口。
+        # 修前 `for src in self._universe_sources():` 在**任何 try 之外**
+        # （只有 `src.universe()` 被 try 包住）。一旦循环头/循环体抛出，
+        # `refresh_id` **已经自增**（上面 :1160）而台账**停在上一轮** ——
+        # id 与台账不自洽，且 `universe_truth()` 完全看不出失败过。
+        # 这正是 META-STALE-AFTER-FAILED-REFRESH-001 要消灭的形态，只是换了触发点。
+        #
+        # **严重度纪律（16:13 轮 §1.2）**：13:55 附刊把本项列为 P0，
+        # 但当时**没有生产可达触发证据**（`build_source` / 普通网络异常 /
+        # `Settings.get` 都已各自被 catch）。按生产可达性只算 **P2 robustness**。
+        # 我保留外层 finalizer，但**不**把它写成 P0。
+        try:
+            for src in self._universe_sources():
+                name = getattr(src, "name", src)
+                try:
+                    quotes = (src.call("universe", route=ROUTE_UNIVERSE)
+                              if isinstance(src, SourceManager)
+                              else src.universe())
+                except Exception as exc:  # noqa: BLE001
+                    last_exc = exc
+                    self.log.warning("股票池来源 %s 失败: %s", name, exc)
                     continue
-                self.log.warning(
-                    "股票池来源 %s 只拿到部分数据（%d 只，%s），继续尝试后续来源",
-                    name, len(cand), meta.get("reason") or "未知原因")
-                # 兜底候选取最大者，避免被更小的部分结果挤掉。
-                if partial is None or len(cand) > partial[0]:
-                    partial = (len(cand), quotes, meta, src)
-                continue
-            codes = self._record_universe(quotes)
-            if not codes:
-                continue
-            # 直接写底层字段：这里拿到的是**真·全市场**，必须保持"未 pin"，
-            # 否则 TTL 到期后不会再有下一次刷新（_codes 的 setter 会 pin）。
-            self._codes_raw = codes
-            self._codes_pinned = False
-            self._universe_refreshed_at = time.time()
-            meta = dict(meta)
-            meta["refresh_id"] = _rid
-            meta["source"] = str(name)
-            self._universe_meta = meta
-            _finish_attempt("applied", source=src, applied=True,
-                            reason=str(meta.get("reason") or "完整结果"))
-            self.log.info("股票池已刷新: %d 只（来源 %s）", len(codes), name)
-            return len(codes)
+                if not quotes:
+                    continue
+                meta = self._universe_meta_of(src, quotes)
+                if not meta.get("complete", True):
+                    # 候选比较阶段用**纯函数**，不写 state.universe —— 部分结果
+                    # 可能因「比现有池更小」而被拒绝，拒绝后不该留下任何痕迹。
+                    cand = self._extract_codes(quotes)
+                    if not cand:
+                        continue
+                    self.log.warning(
+                        "股票池来源 %s 只拿到部分数据（%d 只，%s），继续尝试后续来源",
+                        name, len(cand), meta.get("reason") or "未知原因")
+                    # 兜底候选取最大者，避免被更小的部分结果挤掉。
+                    if partial is None or len(cand) > partial[0]:
+                        partial = (len(cand), quotes, meta, src)
+                    continue
+                codes = self._record_universe(quotes)
+                if not codes:
+                    continue
+                # 直接写底层字段：这里拿到的是**真·全市场**，必须保持"未 pin"，
+                # 否则 TTL 到期后不会再有下一次刷新（_codes 的 setter 会 pin）。
+                self._codes_raw = codes
+                self._codes_pinned = False
+                self._universe_refreshed_at = time.time()
+                # **真·全市场**到手 -> 两个时钟一起推进（唯一允许推进后者的地方）。
+                self._universe_full_market_at = self._universe_refreshed_at
+                meta = dict(meta)
+                meta["refresh_id"] = _rid
+                meta["source"] = str(name)
+                self._universe_meta = meta
+                _finish_attempt("applied", source=src, applied=True,
+                                reason=str(meta.get("reason") or "完整结果"))
+                self.log.info("股票池已刷新: %d 只（来源 %s）", len(codes), name)
+                return len(codes)
 
-        if partial is not None:
-            n, pquotes, meta, src = partial
-            name = getattr(src, "name", src)
-            prev = len(self._codes_raw)
-            if prev and n < prev:
-                # 关键保护：不完整的部分池比现有池更小 -> 拒绝覆盖，保留现有池。
-                # 否则 5563 只会被 3000 只静默替换，且记为「刷新成功」。
-                self.log.warning(
-                    "所有来源都只给出部分股票池；%s 仅 %d 只 < 现有 %d 只，"
-                    "保留现有股票池以免缩小扫描范围", name, n, prev)
-                # 被拒**也要落账**：active pool 保留（对），
-                # 但消费者必须能看出"最近一次尝试没生效"。
-                _finish_attempt("rejected_smaller", source=src, applied=False,
-                                reason=f"部分池 {n} 只 < 现有 {prev} 只")
-                return 0
-            codes = self._record_universe(pquotes)
-            self._codes_raw = codes
-            self._codes_pinned = False
-            self._universe_refreshed_at = time.time()
-            meta = dict(meta)
-            meta["refresh_id"] = _rid
-            meta["source"] = str(name)
-            self._universe_meta = meta
-            _finish_attempt("applied_partial", source=src, applied=True,
-                            reason=str(meta.get("reason") or "部分结果"))
-            self.log.warning("股票池已用**部分**结果刷新: %d 只（来源 %s，%s）",
-                             len(codes), name, meta.get("reason") or "未知原因")
-            return len(codes)
+            if partial is not None:
+                n, pquotes, meta, src = partial
+                name = getattr(src, "name", src)
+                prev = len(self._codes_raw)
+                if prev and n < prev:
+                    # 关键保护：不完整的部分池比现有池更小 -> 拒绝覆盖，保留现有池。
+                    # 否则 5563 只会被 3000 只静默替换，且记为「刷新成功」。
+                    self.log.warning(
+                        "所有来源都只给出部分股票池；%s 仅 %d 只 < 现有 %d 只，"
+                        "保留现有股票池以免缩小扫描范围", name, n, prev)
+                    # 被拒**也要落账**：active pool 保留（对），
+                    # 但消费者必须能看出"最近一次尝试没生效"。
+                    _finish_attempt("rejected_smaller", source=src,
+                                    applied=False,
+                                    reason=f"部分池 {n} 只 < 现有 {prev} 只")
+                    return 0
+                codes = self._record_universe(pquotes)
+                self._codes_raw = codes
+                self._codes_pinned = False
+                self._universe_refreshed_at = time.time()
+                # **部分**结果：active scope 更新，但**不**推进"全市场"时钟。
+                meta = dict(meta)
+                meta["refresh_id"] = _rid
+                meta["source"] = str(name)
+                self._universe_meta = meta
+                _finish_attempt("applied_partial", source=src, applied=True,
+                                reason=str(meta.get("reason") or "部分结果"))
+                self.log.warning("股票池已用**部分**结果刷新: %d 只（来源 %s，%s）",
+                                 len(codes), name,
+                                 meta.get("reason") or "未知原因")
+                return len(codes)
 
-        if last_exc is not None:
-            self.log.warning("所有股票池来源都失败，保留原股票池: %s", last_exc)
-            _finish_attempt("all_failed", applied=False,
-                            reason=f"{type(last_exc).__name__}: {last_exc}")
-        else:
-            # 没抛异常但也没拿到任何可用结果（全空）。
-            _finish_attempt("empty", applied=False, reason="所有来源返回空")
-        return 0
+            if last_exc is not None:
+                self.log.warning("所有股票池来源都失败，保留原股票池: %s", last_exc)
+                _finish_attempt("all_failed", applied=False,
+                                reason=f"{type(last_exc).__name__}: {last_exc}")
+            else:
+                # 没抛异常但也没拿到任何可用结果（全空）。
+                _finish_attempt("empty", applied=False, reason="所有来源返回空")
+            return 0
+        except BaseException as exc:  # noqa: BLE001 - 落账后**必须**原样抛出
+            # 外层 finalizer：任何未被上面 catch 的异常（含 `_universe_sources()`
+            # 本身抛出、`_record_universe` 抛出）都在这里落一行 `crashed`，
+            # 使 refresh_id 与台账**重新自洽**，然后原样抛出 ——
+            # **绝不吞掉异常**（调用方仍须看到失败）。
+            _finish_attempt("crashed", applied=False,
+                            reason=f"{type(exc).__name__}: {exc}")
+            raise
 
     def _record_universe(self, quotes: list[Any]) -> list[str]:
         """记录股票池：填 ``state.universe`` / ``filters.list_dates``，返回代码列表。
@@ -1326,6 +1401,11 @@ class Engine:
                 "股票池为空，降级为仅监控自选股 %d 只（全市场扫描暂不可用）",
                 len(self.watchlist))
             self._codes_raw = list(self.watchlist)
+            # IT-P2-UNIVERSE-FALLBACK-FRESHNESS-RESET-001：这里更新的是
+            # **active scope 切换时刻**（扫描集确实变了）。
+            # **绝不能**同时更新 `_universe_full_market_at` —— 那会把
+            # "全市场已经 7200s 没拿到"改写成"0s 未更新"，
+            # 让 universe_freshness 从 fail 降级成 warn，且 detail 句子为假。
             self._universe_refreshed_at = time.time()
             # 明确保持未 pin：降级是**临时**的，TTL 到期后要重新尝试全市场。
             self._codes_pinned = False

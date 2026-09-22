@@ -444,9 +444,22 @@ def make_round_sample(
             universe_truth.get("attempt_status")
             or _attempt.get("status") or "")
         out["universe_fresh_state"] = str(_fresh.get("state") or "unknown")
-        out["universe_age_s"] = _safe_float(_fresh.get("age_s"))
-        out["universe_transport_complete"] = bool(
+        # IT-P1-UNIVERSE-TRANSPORT-TRISTATE-R1：**三态必须端到端保留**。
+        # 修前这里写 `bool(universe_truth.get("transport_complete"))` ——
+        # 即便 Engine 已把 None 修成"未测量"，这一层又会把它压回 False，
+        # 于是 session 聚合把"未测量"误计为"被截断"。
+        # 修一个假绿会立刻造出一个**新的假红** —— 所以顺序必须是
+        # 先修 tri-state 贯穿，再真正消费 `_ti`。
+        out["universe_transport_complete"] = _optional_bool(
             universe_truth.get("transport_complete"))
+        # 年龄同理：`_safe_float(None)` 会给 0.0，而 0.0 是"最年轻"——
+        # "年龄未知"绝不能变成数值上最年轻。
+        _age_raw = _fresh.get("age_s")
+        if _age_raw is None:
+            _age_raw = universe_truth.get("full_market_age_s")
+        if _age_raw is None:
+            _age_raw = universe_truth.get("active_age_s")
+        out["universe_age_s"] = _optional_float(_age_raw)
         out["universe_refresh_id"] = _safe_int(_attempt.get("refresh_id"))
         out["universe_truth_fields"] = sorted(str(k) for k in universe_truth)
     return out
@@ -494,8 +507,16 @@ def _universe_session(rows: Sequence[dict]) -> dict:
     ages: list[float] = []
     not_applied = 0
     transport_incomplete = 0
+    transport_measured = 0
     ids: list[int] = []
+    watch_only = 0
+    watch_seen = 0
     for r in rows:
+        if (r.get("watchlist_only") is not None
+                and ("quotes" in r or "universe" in r)):
+            watch_seen += 1
+            if r.get("watchlist_only"):
+                watch_only += 1
         if "universe_fresh_state" not in r and "universe_attempt_status" not in r:
             continue
         st = str(r.get("universe_fresh_state") or "unknown")
@@ -505,16 +526,35 @@ def _universe_session(rows: Sequence[dict]) -> dict:
             statuses[at] = statuses.get(at, 0) + 1
             if at not in ("applied", "applied_partial"):
                 not_applied += 1
-        if r.get("universe_transport_complete") is False:
+        # 三态：只有**明确 False** 才算被截断；None（未测量）不计入。
+        # 修前是 `is False` 但上游已用 bool() 把 None 压成 False，
+        # 所以这里必须配合上游 tri-state 修复才有意义。
+        _tc = r.get("universe_transport_complete")
+        if _tc is None:
+            pass
+        elif _tc is False:
             transport_incomplete += 1
+            transport_measured += 1
+        else:
+            transport_measured += 1
         age = r.get("universe_age_s")
         if isinstance(age, (int, float)) and not isinstance(age, bool):
             ages.append(float(age))
         rid = r.get("universe_refresh_id")
         if isinstance(rid, int) and not isinstance(rid, bool) and rid > 0:
             ids.append(rid)
+    # watchlist 比例是**独立事实**，即使没有任何 universe 新鲜度样本也要给出。
+    # IT-P1-UNIVERSE-WATCHLIST-FALLBACK-SESSION-BLIND-001：只看
+    # `fell_back_to_watchlist`（只有 30/30 轮才为 True）会漏掉 29/30，
+    # 所以必须保留 round count / ratio / ever 三个事实。
+    watch_facts = {
+        "watchlist_only_rounds": watch_only,
+        "watchlist_only_ratio": (round(watch_only / watch_seen, 4)
+                                 if watch_seen else None),
+        "ever_watchlist_only": bool(watch_only),
+    }
     if not states and not statuses:
-        return {"measured": False}
+        return {"measured": False, **watch_facts}
     worst = max(states, key=lambda k: _order.get(k, 0)) if states else "unknown"
     return {
         "measured": True,
@@ -524,12 +564,17 @@ def _universe_session(rows: Sequence[dict]) -> dict:
         "attempt_statuses": statuses,
         "rounds_not_applied": not_applied,
         "rounds_transport_incomplete": transport_incomplete,
+        #: 有多少轮的 transport 是**真的测到了**（True/False 都算）。
+        #: `rounds_transport_incomplete > 0` 与 `transport_measured == 0`
+        #: 是两件不同的事，必须能分开读。
+        "rounds_transport_measured": transport_measured,
         # 最新 = 最后一轮观测到的；最坏 = 全程最坏。判决读 worst。
         "last_state": (str(rows[-1].get("universe_fresh_state") or "unknown")
                        if rows else "unknown"),
         "max_age_s": (round(max(ages), 3) if ages else None),
         "last_age_s": (round(ages[-1], 3) if ages else None),
         "refresh_ids_seen": len(set(ids)),
+        **watch_facts,
     }
 
 
@@ -1390,6 +1435,16 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         cap_level = "ok"
         if all_blocked:
             cap_level = "fail"          # 唯一站得住的"整类没评估"证据
+        elif (ev_fail_cov is not None and ev_fail_cov > 0 and worst_sig
+              and worst_sig[0][0] < ev_fail_cov):
+            # IT-P1-EVAL-FAIL-COVERAGE-SILENT-001（13:32 §1 / 16:13 §9.1）：
+            # 修前 `ev_fail_cov` **取出来从未被读取** —— 一个**说谎的旋钮**：
+            # 运维把 `evaluability_fail_coverage: 0.5` 写进配置 **静默无效**。
+            #
+            # 现在真的消费它：低于该线的 signal 判 fail。
+            # **默认值是 0.0**，所以"只有全部阻断才 fail"的既有行为
+            # **逐字节不变**（`ev_fail_cov > 0` 才启用这条更严的判据）。
+            cap_level = "fail"
         elif (ev_warn_cov is not None and worst_sig
               and worst_sig[0][0] < ev_warn_cov):
             # 有 signal 掉到 warn 线以下：黄，但**不判死**。
@@ -1490,6 +1545,51 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     #   * 规模低于绝对下限以上但明显偏小 -> **warn**（不改退出码）
     #   * 旧报告没有 setup / `universe_size == 0` -> **ok**（跳过，不算失败）
     _setup = m.get("setup")
+    # IT-P1-HEALTH-SESSION-WITHOUT-T0-001（16:13 §5）：会话事实**独立**于
+    # t0 快照存在。修前 session 消费被嵌在 `if isinstance(_ut, dict) and _ut:`
+    # 里 —— setup 缺 `universe_truth` 时，**整段会话判决被跳过**，
+    # 实测 `worst_state=stale / rounds_transport_incomplete=99` 仍 `healthy=True`。
+    # 所以这里在**任何 t0 条件之外**先取出会话事实。
+    _sess = (m.get("universe_session")
+             if isinstance(m.get("universe_session"), dict) else {})
+    _sess_measured = bool(_sess.get("measured"))
+
+    # --- IT-P1-UNIVERSE-WATCHLIST-FALLBACK-SESSION-BLIND-001 --------------
+    #
+    # 为什么独立成项：`universe` 项读的是 **t0** 的 `fell_back_to_watchlist`，
+    # 而该布尔只在 **30/30 轮**全降级时才为 True
+    # （`summarize_rounds`: `watch_only_rounds >= len(rows)`）。
+    # 于是 soak 中途降级 —— 哪怕 **29/30 轮**都只盯自选股 —— 判决层**看不见**。
+    #
+    # 云端 16:13 §2 明确：不要只加 `setup OR 顶层 fell_back` 布尔，
+    # **29/30 仍然会漏**。必须保留 round count / ratio / ever 三个事实。
+    _w_rounds = _safe_int(_sess.get("watchlist_only_rounds"))
+    _w_ratio = _sess.get("watchlist_only_ratio")
+    _w_ever = _sess.get("ever_watchlist_only")
+    # 显式 run mode 例外：`--watch-only` 是**用户指定只盯自选股**，
+    # 不是故障。只能靠显式标记识别，绝不能靠"股票数很少"猜意图。
+    _watch_only_mode = bool(_setup.get("watch_only")) if isinstance(_setup, dict) else False
+    if _watch_only_mode:
+        add("universe_scope", True,
+            "本次以**显式 `--watch-only` 模式**运行：只盯自选股是预期行为，"
+            "不判失败", level="ok")
+    elif _w_ever is None:
+        add("universe_scope", True,
+            "无会话级扫描范围记录（旧报告/未采集），无法判定（跳过不算失败）",
+            level="ok")
+    elif _w_ever:
+        _ratio_s = (f"{float(_w_ratio):.1%}"
+                    if isinstance(_w_ratio, (int, float))
+                    and not isinstance(_w_ratio, bool) else "未知")
+        # 只要**曾经**降级过，对"全市场事件"就是硬缺口 —— 该轮扫描面窄得多，
+        # 那段时间没有告警**不能**解释为没有异动。
+        add("universe_scope", False,
+            f"会话期间有 {_w_rounds} 轮**降级为仅自选股**（占比 {_ratio_s}）"
+            f"—— 这些轮次对全市场事件是硬缺口，此期间的'没有告警'"
+            f"不能解释为'没有异动'", level="fail")
+    else:
+        add("universe_scope", True,
+            "会话期间未降级为仅自选股（全程全市场扫描）", level="ok")
     if isinstance(_setup, dict) and _setup:
         _u_size = _safe_int(_setup.get("universe_size"))
         _u_fell = bool(_setup.get("fell_back_to_watchlist"))
@@ -1553,8 +1653,11 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         _w_cov = _safe_float(tol.get("coverage_active_warn"), UNIVERSE_COV_WARN)
         # IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001（云端 09:49 / 12:03）：
         # `transport_complete` 是**不需要分母**就能知道的硬事实。
+        # 注意：**三态**（True/False/None）。`None` = 未测量。
+        # 14:00 轮曾在此写 `_t_known = isinstance(_t_complete, bool)`，
+        # 改成三态后该变量失去读者 —— 已删除（**不要说"这个变量有人读"**，
+        # 本轮的主题正是"赋值 ≠ 消费"）。
         _t_complete = _ut.get("transport_complete")
-        _t_known = isinstance(_t_complete, bool)
 
         def _f(v: object) -> float | None:
             """脏值安全转 float —— **判决层绝不许因为脏值抛异常**。
@@ -1623,23 +1726,28 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         # 所以拆成独立项：`universe_coverage` 管"比例算不算得出"，
         # `universe_transport` 管"provider 说全不全"。二者证据来源不同，
         # 不能合并 —— 合并就会让其中一个被另一个的"未测量"掩盖。
-        if not _t_known:
-            add("universe_transport", True,
-                "无 transport_complete 字段，无法判定（跳过不算失败）",
-                level="ok")
-        elif _t_complete:
-            add("universe_transport", True,
+        #
+        # IT-P2-UNIVERSE-FRESHNESS-UNKNOWN-SEMANTIC-001 / TRISTATE：
+        # `_t_complete` 是三态。`None` = **没测到**（冷启动/钉池/回放），
+        # 绝不能说成"provider 声明被截断" —— 那是把"不知道"当成"有罪"，
+        # 是本次要修的假绿的**镜像**。把 t0 的 tri-state 留给下面的
+        # 统一判决块（会话优先），此处不重复 add 同名项。
+        _t0_known = _t_complete is not None
+        if _t0_known and _t_complete:
+            _t0_transport_detail = (
                 f"provider 声明传输完整（reported={_raw}/{_use}，"
-                f"分母{'已知' if _exp > 0 else '未知'}）", level="ok")
-        else:
+                f"分母{'已知' if _exp > 0 else '未知'}）")
+        elif _t0_known:
             _short = _safe_int(_ut.get("shortfall"))
             _reason = str(_ut.get("reason") or "")
-            add("universe_transport", False,
+            _t0_transport_detail = (
                 f"**provider 声明本次股票池被截断**（transport_complete=False"
                 + (f"，缺口 {_short} 只" if _short else "")
                 + (f"，原因：{_reason}" if _reason else "")
                 + "）—— 这是**不需要分母**就能确定的硬事实；"
-                  "此期间'没有告警'不能解释为'没有异动'", level="fail")
+                  "此期间'没有告警'不能解释为'没有异动'")
+        else:
+            _t0_transport_detail = ""
 
         # --- IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001 --------------
         #
@@ -1651,75 +1759,130 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         # 保留 active pool 是**对的**（不能因为一次刷新失败就把扫描集抹掉），
         # 但消费者**无从知道**这份 "coverage_active=93.85%" 是多久以前的。
         # 陈旧度必须可判 —— 否则"上次成功"会被读成"现在健康"。
-        _age = _f(_ut.get("active_age_s"))
+        _age = _f(_ut.get("full_market_age_s"))
+        if _age is None:
+            _age = _f(_ut.get("active_age_s"))
         _att = str(_ut.get("attempt_status") or "")
+        # IT-P2-UNIVERSE-FRESHNESS-CONFIG-KEY-001（续）：Engine 已经按
+        # `poll.universe_refresh_seconds` 导出了 `warn_s`/`fail_s`，
+        # 但判决层此前**只用自己的硬编码常量** —— 生产者有出口、消费者不读，
+        # 于是"运维改了 TTL"仍然影响不到判决。**优先**读 Engine 导出的阈值，
+        # 没有时才退回本地常量（旧报告 / 未采集）。
+        _frs = _ut.get("freshness")
+        _frs = _frs if isinstance(_frs, dict) else {}
+        _age_fail = _safe_float(tol.get("universe_age_fail_s"),
+                                _safe_float(_frs.get("fail_s"),
+                                            UNIVERSE_AGE_FAIL_S))
+        _age_warn = _safe_float(tol.get("universe_age_warn_s"),
+                                _safe_float(_frs.get("warn_s"),
+                                            UNIVERSE_AGE_WARN_S))
+    else:
+        _ut = {}
+        _t0_known = False
+        _t0_transport_detail = ""
+        _age = None
+        _att = ""
         _age_fail = _safe_float(tol.get("universe_age_fail_s"),
                                 UNIVERSE_AGE_FAIL_S)
         _age_warn = _safe_float(tol.get("universe_age_warn_s"),
                                 UNIVERSE_AGE_WARN_S)
-        # WP02 / IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001：`setup` 的
-        # universe_truth 只是 **t0 快照**。soak 中途发生的刷新失败必须也能
-        # 进入判决 —— 否则"跑着跑着股票池全刷不出来了"仍会拿到绿灯。
-        # 会话级聚合取**最坏**：中途曾坏过，不能被"最后又好了"抹掉。
-        _sess = (metrics.get("universe_session")
-                 if isinstance(metrics.get("universe_session"), dict) else {})
-        if _sess.get("measured"):
-            _worst = str(_sess.get("worst_state") or "unknown")
-            _na = _safe_int(_sess.get("rounds_not_applied"))
-            _ti = _safe_int(_sess.get("rounds_transport_incomplete"))
-            # 会话级事实**优先**：它是整场 soak 的实况，t0 快照只是起点。
-            if _worst == "stale":
-                add("universe_freshness", False,
-                    f"会话期间活跃股票池曾陈旧（最坏 {_worst}，"
-                    f"最长 {_sess.get('max_age_s')}s；"
-                    f"{_na} 轮刷新未生效）", level="fail")
-            elif _worst == "aging":
-                add("universe_freshness", True,
-                    f"会话期间活跃股票池曾偏旧（最坏 {_worst}，"
-                    f"最长 {_sess.get('max_age_s')}s）", level="warn")
-            elif _na > 0:
-                add("universe_freshness", True,
-                    f"会话期间有 {_na} 轮股票池刷新**未生效**"
-                    f"（状态：{_sess.get('attempt_statuses')}）—— "
-                    f"活跃池已偏离全市场但尚未超时", level="warn")
-            else:
-                add("universe_freshness", True,
-                    f"会话期间股票池新鲜（{_sess.get('states')}）", level="ok")
-        elif _age is None and not _att:
-            add("universe_freshness", True,
-                "无活跃快照时间/刷新尝试信息，无法判定（跳过不算失败）",
-                level="ok")
-        elif _att and _att != "applied":
-            # 最近一次尝试**没有**被采用（all_failed / rejected_smaller）。
-            _lvl = "warn" if (_age is not None and _age < _age_warn) else "fail"
-            add("universe_freshness", _lvl != "fail",
-                f"最近一次股票池刷新**未生效**（attempt_status={_att}）"
-                + (f"，当前活跃池已 {_age:.0f}s 未更新"
-                   if _age is not None else "")
-                + " —— 扫描范围可能已不反映全市场", level=_lvl)
-        elif _age is not None and _age > _age_fail:
-            add("universe_freshness", False,
-                f"活跃股票池已 {_age:.0f}s 未成功刷新"
-                f"（上限 {_age_fail:.0f}s）—— 区间可能已大幅变化",
-                level="fail")
-        elif _age is not None and _age > _age_warn:
-            add("universe_freshness", True,
-                f"活跃股票池已 {_age:.0f}s 未成功刷新"
-                f"（警戒 {_age_warn:.0f}s，上限 {_age_fail:.0f}s）",
-                level="warn")
-        else:
-            add("universe_freshness", True,
-                f"活跃股票池新鲜（{'未提供 age' if _age is None else f'{_age:.0f}s'}）",
-                level="ok")
-    else:
         add("universe_coverage", True,
             "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
             level="ok")
+
+    # --- 统一消费块：会话事实 **优先于** t0 快照 ------------------------
+    #
+    # IT-P1-UNIVERSE-TRANSPORT-SESSION-BLIND-001（13:32 / 16:13 §3）：
+    # `_universe_session` 早就算出 `rounds_transport_incomplete`，但
+    # `evaluate_health` 里 **只赋值、零消费** —— 实测把该值从 0 改成 12，
+    # **完整 verdict 签名逐字节相同**。这是"数据算了、判决层零读者"的
+    # 第 6 次（16:13 轮 §9 的依据）。
+    #
+    # IT-P1-HEALTH-SESSION-WITHOUT-T0-001：本块**不依赖** t0 是否存在。
+    # 修前整段被嵌在 `if isinstance(_ut, dict) and _ut:` 里，
+    # setup 缺 universe_truth 时会话事实被**整体跳过**。
+    _sess_measured = bool(_sess.get("measured"))
+    _worst = str(_sess.get("worst_state") or "unknown")
+    _na = _safe_int(_sess.get("rounds_not_applied"))
+    _ti = _safe_int(_sess.get("rounds_transport_incomplete"))
+    _tmeas = _safe_int(_sess.get("rounds_transport_measured"))
+
+    if _sess_measured and _ti > 0:
+        # 会话期间**确凿**有轮次被 provider 声明截断 —— 硬缺口，判 fail。
+        # 注意：只有 tri-state 修好之后这里才成立；否则"未测量"也会被计进
+        # `_ti`，修掉一个假绿会立刻造出一个**新的假红**。
+        add("universe_transport", False,
+            f"会话期间有 {_ti} 轮 **provider 明确声明股票池被截断**"
+            f"（transport_complete=False，共测到 {_tmeas} 轮）——"
+            f"这些轮次对全市场事件是硬缺口，此期间的'没有告警'"
+            f"不能解释为'没有异动'", level="fail")
+    elif _sess_measured and _ti == 0 and _tmeas > 0:
         add("universe_transport", True,
-            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            f"会话期间 {_tmeas} 轮 transport 均为完整（无截断）", level="ok")
+    elif _t0_known and _t0_transport_detail:
+        add("universe_transport", _t_complete is True,
+            _t0_transport_detail, level="ok" if _t_complete else "fail")
+    else:
+        # 三态里的 None：**没测到**。既不判红（诬告 provider），
+        # 也不说成"新鲜/完整" —— 保持 epistemic state 正确。
+        add("universe_transport", True,
+            "transport 完整性**未测量**（无 transport_complete 字段 / "
+            "冷启动未声明 / 旧报告）—— 跳过不算失败，但也不代表完整",
             level="ok")
+
+    # --- 新鲜度：同样会话优先 ---------------------------------------------
+    if _sess_measured:
+        if _worst == "stale":
+            add("universe_freshness", False,
+                f"会话期间活跃股票池曾陈旧（最坏 {_worst}，"
+                f"最长 {_sess.get('max_age_s')}s；"
+                f"{_na} 轮刷新未生效）", level="fail")
+        elif _worst == "aging":
+            add("universe_freshness", True,
+                f"会话期间活跃股票池曾偏旧（最坏 {_worst}，"
+                f"最长 {_sess.get('max_age_s')}s）", level="warn")
+        elif _na > 0:
+            add("universe_freshness", True,
+                f"会话期间有 {_na} 轮股票池刷新**未生效**"
+                f"（状态：{_sess.get('attempt_statuses')}）—— "
+                f"活跃池已偏离全市场但尚未超时", level="warn")
+        elif _worst == "unknown":
+            # IT-P2-UNIVERSE-FRESHNESS-UNKNOWN-SEMANTIC-001（13:55 B4 / 16:13 §6）：
+            # `unknown` = **压根没测到**（age 为 None）。修前它落进 else
+            # 被渲染成「会话期间股票池新鲜」/ ok —— 与真实语义**相反**。
+            # 不判红（缺证据不等于坏），但**必须**说"未测量"。
+            add("universe_freshness", True,
+                f"会话期间股票池新鲜度**未测量**"
+                f"（states={_sess.get('states')}；缺年龄证据）"
+                f"—— 跳过不算失败，但也不代表新鲜", level="ok")
+        else:
+            add("universe_freshness", True,
+                f"会话期间股票池新鲜（{_sess.get('states')}）", level="ok")
+    elif _age is None and not _att:
         add("universe_freshness", True,
-            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            "无活跃快照时间/刷新尝试信息，无法判定（跳过不算失败）",
+            level="ok")
+    elif _att and _att not in ("applied", "applied_partial", "unknown", ""):
+        # 最近一次尝试**没有**被采用（all_failed / rejected_smaller / crashed）。
+        _lvl = "warn" if (_age is not None and _age < _age_warn) else "fail"
+        add("universe_freshness", _lvl != "fail",
+            f"最近一次股票池刷新**未生效**（attempt_status={_att}）"
+            + (f"，当前活跃池已 {_age:.0f}s 未更新"
+               if _age is not None else "")
+            + " —— 扫描范围可能已不反映全市场", level=_lvl)
+    elif _age is not None and _age > _age_fail:
+        add("universe_freshness", False,
+            f"活跃股票池已 {_age:.0f}s 未成功刷新"
+            f"（上限 {_age_fail:.0f}s）—— 区间可能已大幅变化",
+            level="fail")
+    elif _age is not None and _age > _age_warn:
+        add("universe_freshness", True,
+            f"活跃股票池已 {_age:.0f}s 未成功刷新"
+            f"（警戒 {_age_warn:.0f}s，上限 {_age_fail:.0f}s）",
+            level="warn")
+    else:
+        add("universe_freshness", True,
+            f"活跃股票池新鲜（{'未提供 age' if _age is None else f'{_age:.0f}s'}）",
             level="ok")
 
     total = sum(int(v) for v in by_kind.values())
@@ -1907,6 +2070,48 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except (TypeError, ValueError):
         return float(default)
+
+
+def _optional_bool(v: Any) -> bool | None:
+    """三态布尔：``True`` / ``False`` / ``None``（**未测量**）。
+
+    IT-P1-UNIVERSE-TRANSPORT-TRISTATE-R1（16:13 §4）：修"把不知道当没问题"
+    时最容易引入的**镜像错误**是"把不知道当成有罪并归罪于数据源"。
+    两者同源：**三态被压成两态**。
+
+    所以凡是要表达"provider 明确声明了没有"的字段，一律走这里，
+    **不得**用 ``bool(x)`` —— ``bool(None) is False`` 会把"没测到"
+    渲染成"测出来是坏的"。
+    """
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        low = v.strip().lower()
+        if low in ("true", "1", "yes"):
+            return True
+        if low in ("false", "0", "no"):
+            return False
+    return None
+
+
+def _optional_float(v: Any) -> float | None:
+    """可缺省 float：``None``/脏值 -> ``None``（**绝不回落 0.0**）。
+
+    为什么不能用 ``_safe_float``：``universe_age_s = _safe_float(None)``
+    得到 ``0.0``，而 0.0 在新鲜度语义里是**最年轻** ——
+    于是"年龄未知"被读成"刚刚刷新过"。缺数据必须是缺数据。
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if _finite(f) else None
 
 
 def _round_observation_fields(row: dict) -> set[str]:
@@ -2657,6 +2862,8 @@ def run(args: argparse.Namespace) -> int:
                "universe_refresh_s": round(refresh_s, 3),
                "universe_size": universe_size,
                "fell_back_to_watchlist": fell_back,
+               # 显式 run mode（见 parse_args 的 --watch-only 说明）。
+               "watch_only": bool(getattr(args, "watch_only", False)),
                # R-12 / WP01：**分母**。`_universe_meta` 此前零出口，
                # health 只能看绝对只数，回答不了 "4500 / ? = ?"。
                # 取不到就 None —— 消费方据此判"未测量"，**不猜**。
@@ -2822,6 +3029,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
                     help="额外用 Playwright 打开看板，收集 pageerror/console.error")
     ap.add_argument("--verbose", action="store_true",
                     help="打印引擎 INFO 日志与每轮告警明细")
+    # IT-P1-UNIVERSE-WATCHLIST-FALLBACK-SESSION-BLIND-001：**显式 run mode**。
+    # 只盯自选股有两种来源：用户**故意**这么跑（不是故障），
+    # 或者全市场拿不到而降级（是故障）。二者在轮样本里长得一样，
+    # 判决层**不能靠"股票数很少"猜意图** —— 必须有显式标记。
+    ap.add_argument("--watch-only", action="store_true",
+                    dest="watch_only",
+                    help="显式声明只盯自选股（不判失败）；不加则降级一律判失败")
     args = ap.parse_args(list(argv) if argv is not None else None)
     if args.minutes <= 0 and not args.rounds:
         ap.error("--minutes 必须 > 0，或者用 --rounds 指定轮数")

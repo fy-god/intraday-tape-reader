@@ -334,9 +334,13 @@ def test_universe_session_aggregates_worst_state():
 
 
 def test_universe_session_skips_old_samples():
-    """老轮样本没有这些键 -> measured=False，消费方跳过（不判红）。"""
+    """老轮样本没有这些键 -> measured=False，消费方跳过（不判红）。
+
+    `measured` 之外的 watchlist 事实是**独立轴**（16:13 §2），
+    即使没有任何 universe 新鲜度样本也要给出，所以这里只断言 `measured`。
+    """
     fn = getattr(_ls(), "_universe_session")
-    assert fn([]) == {"measured": False}
+    assert fn([])["measured"] is False
     assert fn([{"quotes": 1}, {"quotes": 2}])["measured"] is False
 
 
