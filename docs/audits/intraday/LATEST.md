@@ -72,3 +72,4 @@ current snapshot availability
 membership 独立 diff → unknown-total pagination → reconcile → SourceManager [] → Timezone → ObservationInterval → provenance → research。
 
 模型训练：0；真实 Precision/Recall/漏事件率/收益 unavailable。
+- **2026-09-23_05-35-00_JST JST** — [盘中预警独立审计 2026-09-23_05-35-00_JST](./2026-09-23_05-35-00_JST.md) — peer 的 membership P1 主张经我**实测确认**（5913→5553，丢 370，10/10 新股进入，套件 1802 passed 全绿）；**【新增】终止页被丢弃**（`eastmoney.py:434` 的 break 先于 `:436` 的 append）；**【新增·实股】停牌率量化**（p95 11.61%、max 50.15%、30.3% 交易日超过 peer 的合成 6.26%）；并把本线回归基线经实测更正（3 项已修 / 3 项仍开放）。`real_market_fit_count = 0`。
