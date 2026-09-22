@@ -42,7 +42,7 @@
 `evidence_type`：**软件样本**（1745 passed / 14 探针 / 变异计数）；**实股结果无新增**，
 真实 Precision/Recall/漏报率/收益 = `unavailable`。
 **程序修复 0 条新增（本文件是核对）／任务定义变更 0／真实模型增益 0**。
-`report_created_commit_sha`: `PENDING_READBACK`。
+`report_created_commit_sha`: `a4737377ef1f839b357bc5388a364d37bf5d6a7d`。
 
 
 ## 2026-09-22 09:49:38 JST 云端独立审计（新增：`R-12` 修好了"分母已知"那一半，但新判决项在"分母随数据一起丢失"时仍判绿）
