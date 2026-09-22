@@ -1,75 +1,61 @@
 # 最新审计
 
-**最新云端独立审计**：[`2026-09-23_04-05-42_JST.md`](./2026-09-23_04-05-42_JST.md)  
-**最新云端 Agent 任务书**：[`2026-09-23_04-05-42_JST_AGENT_TASK.md`](./2026-09-23_04-05-42_JST_AGENT_TASK.md)  
+**最新云端独立审计**：[`2026-09-23_08-05-58_JST.md`](./2026-09-23_08-05-58_JST.md)  
+**最新云端 Agent 任务书**：[`2026-09-23_08-05-58_JST_AGENT_TASK.md`](./2026-09-23_08-05-58_JST_AGENT_TASK.md)  
+**最新独立实测审计**：[`2026-09-23_05-35-00_JST.md`](./2026-09-23_05-35-00_JST.md)  
 **最新本地 Agent 产品轮**：[`2026-09-22_21-00-00_JST.md`](./2026-09-22_21-00-00_JST.md)  
 **最新产品提交 / reviewed_source_sha**：`bf0b83bf212f169c720ca8a1c5108405c18a9712`  
-**本轮审计开始 docs HEAD**：`1d0ab19727c24dada1373931e79baa5712c99c75`  
-**report_commit_sha**：`6afb3a6dcff3a6673f32ca50389361ccdc893ee0`  
-**agent_task_commit_sha**：`ef4ea0b79345461eeeb0d830897eb19a6509bf7e`  
+**本轮审计开始 docs HEAD**：`55ee49a222e1e598e9845d98e4e5f472d894e174`  
+**report_commit_sha**：`022d322efe120ffff7c69ea28330bbc77b397e22`  
+**agent_task_commit_sha**：`57839464acd5707277984047913b0a620630451b`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/1d0ab19727c24dada1373931e79baa5712c99c75/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/55ee49a222e1e598e9845d98e4e5f472d894e174/docs/audits/intraday/LATEST.md
 
-> `bf0b83b..1d0ab197` 只有 docs 变化；历史报告文件均保留。本文件只移动当前接续指针。
+> `bf0b83b..55ee49a222e1e598e9845d98e4e5f472d894e174` 只有 docs 变化；历史报告文件均保留。本文件只移动当前接续指针。
 
-## 2026-09-23 04:05:42 JST
+## 2026-09-23 08:05:58 JST
 
-主实验：`EXP-IT-MEMBERSHIP-007`
+主实验：`EXP-IT-MEMBERSHIP-FIX-008`
 
-### 本轮最高优先
+### 当前最高优先
 
 `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001`
 
-仓库现成停牌 fixture：
+05:35 独立 checkout 已真实确认：
 
 ```text
-base members = 5913
-new codes = 10
-raw_unique / expected = 5923
-invalid-price old members = 370
-usable quotes = 5553
-transport_complete = True
+before active = 5913
+raw/expected  = 5923
+usable Quote  = 5553
+after active  = 5553
+370 old members lost
+10/10 new members enter
+full suite = 1802 passed
 ```
 
-固定产品当前调用链仍是：
+本轮新增结论：两个直觉修法都不能作为最终实现：
+- complete-path shrink guard 会保旧池但挡住10个新成员；
+- union(prev, usable) 会无法删除真实退市/移除成员。
 
-```text
-Eastmoney universe -> usable Quote[]
-Engine _record_universe(quotes) -> active codes
-```
+最终合同必须：
+**transport membership replacement**，且 Member 必须带 `code/name/board/list_date/source`；不能只存 code，也不能造 fake zero-price Quote。
 
-所以这个 fixture 中可以出现：
+### Pagination P2
 
-```text
-10/10 new codes enter
-但 370 old market members 离开 active scan
-active = 5553 / 5923 = 93.75%
-```
+05:35 已真实确认：unknown-total 分支 `break` 在 `pages.append` 前；一页 raw code 存在但 usable Quote=0 时：
+- 终止页 raw members 自己被丢；
+- 后续页不请求。
 
-现有 `test_new_listings_enter_pool` 只断言新 code 进入，并未断言旧 suspended/raw members 留在 `_codes`。
+只移动 append 不够；终止语义必须基于 raw transport emptiness。
 
-### 主改造
+### 历史真实数据上下文
 
-**Universe Membership Truth Contract v1**
+05:35 本地 Agent 的历史面板测量（本轮未重跑）：p50 0.81%、p95 11.61%、p99 17.58%、max 50.15%，956/3157=30.3% 交易日停牌率 >= synthetic 6.26%。它只支持优先级，不是当前实时停牌率、Alert Recall 或漏报率。
 
-分开：
-
-```text
-transport membership
-quote usability
-active scan membership
-current snapshot availability
-```
-
-禁止用假 zero-price Quote 保 membership。
-
-### 新 P2
-
-`IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001`：无 numeric total 时分页当前以 `page.quotes` 空作为到底；raw members 存在但全不可用时可能提前停止。需真实 repo RED 后再决定是否升级。
-
-### 下一轮
-
-membership 独立 diff → unknown-total pagination → reconcile → SourceManager [] → Timezone → ObservationInterval → provenance → research。
+下一轮：Membership RED/GREEN/rollback → member metadata → pagination → reconcile → SourceManager [] → Timezone → ObservationInterval → provenance/research。
 
 模型训练：0；真实 Precision/Recall/漏事件率/收益 unavailable。
-- **2026-09-23_05-35-00_JST JST** — [盘中预警独立审计 2026-09-23_05-35-00_JST](./2026-09-23_05-35-00_JST.md) — peer 的 membership P1 主张经我**实测确认**（5913→5553，丢 370，10/10 新股进入，套件 1802 passed 全绿）；**【新增】终止页被丢弃**（`eastmoney.py:434` 的 break 先于 `:436` 的 append）；**【新增·实股】停牌率量化**（p95 11.61%、max 50.15%、30.3% 交易日超过 peer 的合成 6.26%）；并把本线回归基线经实测更正（3 项已修 / 3 项仍开放）。`real_market_fit_count = 0`。
+
+## 历史接续
+
+上一版完整索引与全部历史报告仍保存在不可变 commit `55ee49a222e1e598e9845d98e4e5f472d894e174` 以及本目录历史文件中；本轮不删除历史报告。
