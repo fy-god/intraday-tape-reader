@@ -2,16 +2,40 @@
 
 **最新本地 Agent 产品轮**：[`2026-09-22_13-00-00_JST.md`](./2026-09-22_13-00-00_JST.md)  
 **最新独立审计**：[`2026-09-22_13-32-18_JST.md`](./2026-09-22_13-32-18_JST.md)  
+**最新更正附刊**：[`2026-09-22_13-55-00_JST_ADDENDUM.md`](./2026-09-22_13-55-00_JST_ADDENDUM.md)  
 **最新云端独立审计**：[`2026-09-22_12-03-20_JST.md`](./2026-09-22_12-03-20_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_12-03-20_JST_AGENT_TASK.md`](./2026-09-22_12-03-20_JST_AGENT_TASK.md)  
-**最新被审产品 SHA**：`c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`  
-**审计时间**：2026-09-22 13:32:18 JST  
+**最新被审产品 SHA**：`96e9b796c88942a0feefb59f7d31dab6f26d641a`  
+**审计时间**：2026-09-22 13:55:00 JST  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/96e9b796c88942a0feefb59f7d31dab6f26d641a/docs/audits/intraday/LATEST.md
 
 > 历史报告文件没有删除或覆盖；为避免把 30KB+ 历史索引每轮重复复制并引入冲突，旧索引正文固定保留在上面的不可变 commit 快照中。本文件只移动“当前接续”指针。
 
 ---
+### ⚠️ 更正附刊（2026-09-22 13:55 JST）：上一轮 §4「3 项修复全部成立」**判据不足，已更正为 PARTIAL**
+
+`2026-09-22_13-55-00_JST_ADDENDUM.md`。一条并行只读审计线对**同一 commit** 给出相反裁决；
+我逐条独立复现后确认**对方是对的**（方法论规则 (eee)）。我原 §4 只验了「机制是否存在」，
+**未验边界可达性 / 异常出口 / 新引入的镜像错误**。
+
+| 声称 | 原判 | **更正后** | 漏检维度（均为本轮我实测） |
+|---|---|---|---|
+| `...-TRUNCATION-BLIND-001` | 已修复 | **PARTIAL** | 冷启动 `_universe_meta=={}` → `transport_complete=False` → **诬告 provider「声明截断」**（`engine.py:975` 恒 `bool`；`:1626` 跳过分支**不可达**） |
+| `...-META-STALE-AFTER-FAILED-REFRESH-001` | 已修复 | **PARTIAL** | `engine.py:1180` 循环头在 try 之外 → 抛异常时 `refresh_id` 已自增而台账不写，**`ut1 == ut2`（差异键 `[]`）**；`:1329` 降级重置新鲜度时钟 → `age 7200→0`、**fail 降为 warn**、detail 句子为假 |
+| `...-SNAPSHOT-PRELOOP-001` (WP02) | 已修复 | **PARTIAL** | 传输轴仍是死变量（我 §1.2）；`worst_state="unknown"` 被渲染成「**会话期间股票池新鲜**」/ok |
+
+**新增 P0**：`engine.py:1180` 兜底 try（**唯一**会让 `universe_truth()` 回到「逐字段不变」的路径）。
+**新增 P2**：`engine.py:1032` 读**不存在的** `universe.refresh_seconds`（真实键
+`poll.universe_refresh_seconds`，实测前者 `None`/后者 `1800`）⇒ 阈值恒钉 1800/3600，
+运维改真键**无效**；`check_config_consumed.py`（exit 0）抓不到。
+**新增 P2**：`_universe_session` 的 `unknown` 需单列，措辞用「未测量」而非「新鲜」。
+
+**我原报告其余部分不受影响**：§1.1（`fell_back_to_watchlist` 会话盲）、
+§1.2（`_ti` 死变量）、§2.1（t0 缺 truth 时会话块被跳过）均独立成立；
+§6 实测数字（1764 passed / check 8/8 / selftest exit 0）当轮实测，保留。
+
+
 ## 2026-09-22 13:32 JST 独立审计（判决层仍在读 t0 快照 —— 第 6 次"数据层有了、判决层零读者"）
 
 - 审计 HEAD = `reviewed_source_sha = c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`；
