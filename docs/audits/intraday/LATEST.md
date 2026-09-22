@@ -17,6 +17,30 @@ https://github.com/fy-god/intraday-tape-reader/blob/7b0404a8e8d1a3ea56b1498ad865
 
 ---
 
+## 2026-09-22 22:45 JST 追加 3（本线）：**测到 0 只被当成"没记录"，分母未知时整报告全绿**；且 `full_market` 只问"是否非零"
+
+[2026-09-22_22-45-00_JST_ADDENDUM3.md](./2026-09-22_22-45-00_JST_ADDENDUM3.md)
+
+- `reviewed_source_sha` = `83be99543320dc08de66120eea69782eb7a8d5ad`；父报告 = `99934d61`、`ba025ad3`、`83be9954`。
+- **新 P1（未修）** `live_session.py:1755` + **`:1764-1767`**：`elif _u_size <= 0:`
+  把**实测的 0** 与**没有记录**合并，文案写「**无股票池规模记录（旧报告/未采集），无法判定（跳过不算失败）**」——
+  **反向踩了本仓库自己的「未知 != 0」纪律**（同文件 `:478` 明写）。**用真实归档绿报告做基线**（基线自证 `healthy=True/exit=0/fails=[]`），
+  只替换 t0 快照后实测：`universe_size=0 + active_scan_codes=0 + 分母未知` ⇒ **仍然 `healthy=True / exit_code=0 / fails=[]`（全绿）**；
+  同一注入在**分母已知(6000)** 时被 `universe_coverage` 判 **fail** ⇒ **一次"一只票都没扫"的会话，只要分母拿不到就能全绿**，
+  与真扫全市场**不可区分**。
+- **新 P2（未修）** `live_session.py:541-545`：`full_market` 的**全部判据**是 `active_scan_codes > 0`，
+  **从不与 `expected_total` 比较**（magnitude-blind）。实测 30 轮 `active=400`（自选 100、非降级）、
+  `active=3000`、`active=3001` **均**输出 ok「**全程全市场扫描，30/30 轮有明确扫描范围证据**」；
+  其中 `active=3000`（约为全市场一半）时绝对门禁只给 `warn`、`coverage` 因分母未知算不出 ⇒ 无拦截。
+  与 21:40 的 P1（分母只数有证据轮次）**同族**：只看存在性、不看覆盖度。
+- **我更正自己**：死字段**是 5 个不是 3 个** —— 补 `universe_expected_total`(`:481`)、
+  `universe_active_scan_codes`(`:483`)，二者全树 `*.py` 只有"写入 + 测试断言"（`tests/:525-526`），**零生产读者**。
+- **我撤回**：「`_scope_state_of` 对 NaN 返回 `full_market`」**不可达** —— `engine.py:930`
+  `active_n = len(active)` ⇒ `active_scan_codes` **恒为 int**，实测注入 `nan/inf` 也无法流出。
+  子 agent 称"29/30 轮走 `:546-548` 回退"**机制描述有误**（生产者恒带该键），按我的实测为准。
+- **未复现故不新增主张**：子 agent 给出的 `universe_freshness` 真实 Engine 混合证据复现路径（维持 22:15 原文）。
+- 本仓库**无** `docs/audits/validate_latest.py`，校验器步骤不适用，不声称 gate PASS。
+
 ## 2026-09-22 22:15 JST 追加 2（本线）：同一类假绿**不止一处** —— `universe_freshness` 同型；
 且作者自提的 `_measured` 门禁**抓不到它**
 
