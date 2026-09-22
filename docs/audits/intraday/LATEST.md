@@ -1,5 +1,50 @@
 # 最新审计
 
+## 2026-09-22 10:05:00 JST 云端审计补充（12 个开放项逐项回归：**9 已修 / 3 仍存活**，且旧清单已陈旧）
+
+[2026-09-22_10-05-00_JST.md](2026-09-22_10-05-00_JST.md)
+
+- `reviewed_source_sha` = **`369b13f0d6f20fc22198abf51469ee14e49c84dc`**；`extends` 09:49 报告。
+- 子 agent 在自建 `git archive` scratch 副本内实跑（**237/237 文件** `git hash-object` 逐字节等于 `origin/main`；
+  活仓库 `git status --porcelain` = **0 行**）：全量 `pytest -o addopts= -ra` → **1745 passed in 95.98s，exit 0**；
+  **14 个探针全部 exit 0**；**0 个 NOT_RUN**。
+- 结果：**FIXED 9 / CONFIRMED_STILL_PRESENT 3 / NOT_REPRODUCED 0 / COULD_NOT_TEST 0**。12 个标识符在文档中**全部存在**。
+
+### ⚠ 旧清单陈旧（**本身是一条发现·P2**）
+`2026-09-22_09-00-00_JST.md:287-291` 的"既有未决项全部保留"块仍列
+**`IT-P0-001`**、**`IT-P1-LIMIT-001`** 为开放 —— 但二者**早已修复**，本轮独立复现确认
+（`session.py:46,87,156-160`；`limit_board.py:210-221`）。从该块构建回归清单会**重新打开 2 个已关闭项**。
+
+### 🔴 真正仍存活的 **3** 项（每项都比文档描述的**更窄**）
+| ID | file:line | 真实反例 | 边界 |
+|---|---|---|---|
+| `IT-P0-002` | `src/arad/session.py:214`；`sources/eastmoney.py:149` | 同一真实时刻：CST 宿主 → `phase=morning`，UTC 宿主 → `phase=closed`。`git grep zoneinfo src/` = **rc1/0 命中**；`app.timezone` **0 读者** | **仅剩时区分句**；window≤now 与 write-ahead admission **已修**。降为 **P1**，非 P0 |
+| `IT-P1-SOURCE-EMPTY-001` | `src/arad/engine.py:547-589` | 主源返回 `[]` **且不抛异常** → `backup.calls=0`、`fails=stocks`；**正对照**：抛异常 → `backup.calls=1` | 故障转移**只由异常驱动**（`:567`）。**已不再是假绿**（轮次记账会暴露缺口） |
+| `IT-P1-WINDOW-001` | `src/arad/engine.py:313`；`rules/tick_surge.py:198` | 13 条"新鲜但价格不变"观测**塌缩成 2 点**；`_covered(60s)=True` 而同刻 `price_change(60s)=None`（真实 +3.0%） | history 仍 change-only；`ObservationInterval` **在 `src/` 零实现** |
+
+### ✅ 已修 9 项（独立复现，非引用仓库自测）
+`IT-P0-002-R2`（`engine.py:316-318`；**变异测试**：改回旧写法 → **7 failed/5 passed**，还原 → **12 passed**，文件逐字节复原）、
+`IT-P0-001`、`IT-P1-LIMIT-001`、`IT-P2-OBS-001`、`IT-P1-UNIVERSE-DENOMINATOR-001`(R-12，矩阵逐行复现：76.10% → **fail**)、
+`IT-P2-OBS-EMPTY-ROUND-R1`（`index_requested` 幻影消失，`poll_count=[1..6]` 单调）、
+`IT-P2-UNIVERSE-STATUS-CACHE-001`、`IT-P1-UNIVERSE-HEALTH-GATE-001`(R-21)、
+`IT-P1-SOAK-CUMULATIVE-QUOTES-001`（`no_data_rounds=5`，原为完整假绿）、`IT-P1-ACK-TRIM-ORDER-001`（`_acked` 改 dict）。
+
+### 我修正了子 agent 的一处措辞错误
+它称 `ObservationInterval` **"genuinely absent（`git grep` exit 1）"**。我复核：
+`git grep -n ObservationInterval origin/main` → **rc=0，58 处命中**，但**全部在 `docs/audits/` 散文**，
+`-- src/` → **rc=1，0 命中**。⇒ 实质结论成立，措辞不准确。**已改用**："在 `src/` 零实现，仅作为 58 处前瞻性设计散文存在"。
+**方法学教训**：报"某符号不存在"**必须写明搜索路径**，限定与不限定会得出相反结论。
+
+### 三轴与分级
+`execution_status`：14 探针 exit 0 + pytest exit 0 + 变异 exit1/exit0；活仓库零改动。
+`research_verdict`：`9_OPEN_ITEMS_FIXED` / `3_STILL_PRESENT_AND_NARROWER` / `PREVIOUS_OPEN_ITEM_LIST_IS_STALE` / `OBSERVATIONINTERVAL_ABSENT_FROM_SRC_NOT_FROM_REPO`。
+`evidence_status`：`VERIFIED_BY_INDEPENDENT_AGENT_AND_RECOMPUTED_BY_MAIN_AGENT`。
+`evidence_type`：**软件样本**（1745 passed / 14 探针 / 变异计数）；**实股结果无新增**，
+真实 Precision/Recall/漏报率/收益 = `unavailable`。
+**程序修复 0 条新增（本文件是核对）／任务定义变更 0／真实模型增益 0**。
+`report_created_commit_sha`: `PENDING_READBACK`。
+
+
 ## 2026-09-22 09:49:38 JST 云端独立审计（新增：`R-12` 修好了"分母已知"那一半，但新判决项在"分母随数据一起丢失"时仍判绿）
 
 [2026-09-22_09-49-38_JST.md](2026-09-22_09-49-38_JST.md)
