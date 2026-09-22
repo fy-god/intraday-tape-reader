@@ -178,18 +178,59 @@ def test_cold_start_verdict_does_not_accuse_provider():
 
 
 def test_explicit_incomplete_still_fails():
-    """负控制：**真的** False 仍必须 fail（三态修完不能把真截断放走）。"""
-    m = _base()
-    t = _green_t0()
-    t["transport_complete"] = False
-    t["denominator_kind"] = "unknown"
-    t["expected_total"] = 0
-    t["coverage_active"] = None
-    m["setup"] = {"universe_size": 5000, "universe_truth": t}
-    m["universe_session"] = _green_session(rounds_transport_incomplete=0,
-                                           rounds_transport_measured=0)
-    v = _ls().evaluate_health(m)
-    assert _lvl(v, "universe_transport") == "fail"
+    """负控制：**真的** False 仍必须 fail（三态修完不能把真截断放走）。
+
+    ⚠ **本测试曾"以错误的理由通过"**（20:04 §4 / ADDENDUM2 §2 指认，
+    我复算确认）。修前它设 `rounds_transport_measured=0`，使会话肯定分支
+    的条件为假，于是**落到 t0 分支**才判 fail ——
+    它从未在 `rounds_transport_measured > 0` 时试过被测分支：
+
+        t0=False + rounds_transport_measured=0  -> fail   <-- 旧测试走的路径
+        t0=False + rounds_transport_measured=1  -> ok     <-- 一个单位就翻绿！
+        t0=False + rounds_transport_measured=30 -> ok
+
+    **这是"负控制的输入把被测分支绕过去了"的教科书案例。**
+    所以现在参数化覆盖 `measured ∈ {0, 1, 30}`：
+    **无论会话测了几轮，t0 的明确 False 都必须判 fail。**
+    """
+    for tm in (0, 1, 30):
+        m = _base()
+        t = _green_t0()
+        t["transport_complete"] = False
+        t["denominator_kind"] = "unknown"
+        t["expected_total"] = 0
+        t["coverage_active"] = None
+        m["setup"] = {"universe_size": 5000, "universe_truth": t}
+        m["universe_session"] = _green_session(
+            rounds_transport_incomplete=0, rounds_transport_measured=tm)
+        v = _ls().evaluate_health(m)
+        assert _lvl(v, "universe_transport") == "fail", (
+            f"t0 transport_complete=False 必须 fail，"
+            f"但 rounds_transport_measured={tm} 时实得 "
+            f"{_lvl(v, 'universe_transport')} —— 会话的『全完整』"
+            f"不得抹掉 t0 的硬事实")
+
+
+def test_t0_hard_negative_beats_session_all_complete():
+    """`IT-P1-UNIVERSE-TRANSPORT-T0-SUPPRESSED-001`（20:04 §4）。
+
+    **后来的 positive evidence 不能抹掉同一评估窗口内的 explicit hard
+    negative。** 一个评估窗口里出现过"明确坏"，窗口结论就是坏。
+
+    与 `worst_state` 的纪律完全一致（"中途曾坏过"不能被"最后又好了"抹掉），
+    只是对象从新鲜度换成了传输完整性。
+    """
+    for t0_val, want in ((False, "fail"), (True, "ok"), (None, "ok")):
+        m = _base()
+        t = _green_t0()
+        t["transport_complete"] = t0_val
+        m["setup"] = {"universe_size": 5900, "universe_truth": t}
+        m["universe_session"] = _green_session(
+            rounds_transport_incomplete=0, rounds_transport_measured=30)
+        v = _ls().evaluate_health(m)
+        assert _lvl(v, "universe_transport") == want, (
+            f"t0 transport_complete={t0_val!r} + 会话 30 轮全完整 "
+            f"应判 {want}，实得 {_lvl(v, 'universe_transport')}")
 
 
 def test_round_sample_preserves_none_tri_state():
@@ -346,6 +387,221 @@ def test_session_ratio_facts_present_even_without_freshness():
     assert agg["watchlist_only_rounds"] == 1
     assert agg["watchlist_only_ratio"] == 0.5
     assert agg["ever_watchlist_only"] is True
+
+
+# ===========================================================================
+# WP01（21:00 批）—— Session Universe Evidence Contract v1
+# ===========================================================================
+def _asserts_full_market(detail: str) -> bool:
+    """这条 detail 是否**真的在肯定**"全程全市场扫描"。
+
+    不能只用子串判断：新文案里"**不能**据此说'全程全市场扫描'"
+    **也含这个子串**，朴素 `in` 会把**否认**读成**肯定**。
+    （我在探针里就犯过这个错 —— 规则 mmm2：
+    **匹配错了的过滤器什么也证明不了**。）
+    """
+    return ("全程全市场扫描" in detail
+            and "不能" not in detail
+            and "不足" not in detail)
+
+
+def test_zero_evidence_scope_is_not_asserted_as_full_market():
+    """**核心 RED（C1）**：零证据不得被肯定成"全程全市场扫描"。
+
+    `IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`（20:04 §3）：
+
+    修前 `_universe_session([])` 给出
+    `measured=False / ratio=None / ever=False`，consumer 的 `else` 分支
+    输出「会话期间未降级为仅自选股（**全程全市场扫描**）」。
+    **零证据被当成了肯定证据** —— 与"把不知道当没问题"完全同类。
+    """
+    m = _base()
+    m["setup"] = {"universe_size": 5000, "universe_truth": _green_t0()}
+    m["universe_session"] = _ls()._universe_session([])
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_scope")
+    assert not _asserts_full_market(det), f"零证据不得肯定全市场扫描：{det}"
+    assert "不足" in det, f"应说证据不足：{det}"
+
+
+def test_zero_round_report_is_not_asserted_as_full_market():
+    """**核心 RED（C1b）**：`finalize_metrics([])`（**一轮都没跑**）
+    也曾输出"全程全市场扫描"。
+
+    这是最刺眼的一种：报告自己 `fail=['rounds','data','api','sse','memory']`，
+    却在同一份报告的 scope 轴说"全程全市场扫描"。
+    """
+    mm = _ls().finalize_metrics([])
+    assert mm.get("rounds") == 0
+    m = _base()
+    m["setup"] = {"universe_size": 5000, "universe_truth": _green_t0()}
+    m["universe_session"] = mm.get("universe_session") or {}
+    det = _detail(_ls().evaluate_health(m), "universe_scope")
+    assert not _asserts_full_market(det), (
+        f"零轮报告不得肯定全市场扫描：{det}")
+
+
+def test_empty_scan_is_distinguished_from_full_market():
+    """**核心 RED（C1 变体）**：**空扫描**与"全市场"必须可区分。
+
+    股票池被清空（`active_scan_codes == 0`）时，`state.quotes` 可能
+    还留着旧缓存，所以 `quotes` 看起来正常。旧口径下两者**都是
+    `watchlist_only=False`，不可区分** —— 这正是缺陷本体。
+    """
+    rows = [_row_scope(quotes=5000, active=0, expected=6000, universe=0)
+            for _ in range(30)]
+    agg = _ls()._universe_session(rows)
+    assert agg["empty_scan_rounds"] == 30, f"应识别 30 轮空扫描：{agg}"
+    assert agg["full_market_rounds"] == 0
+    m = _base()
+    m["setup"] = {"universe_size": 5000, "universe_truth": _green_t0()}
+    m["universe_session"] = agg
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe_scope") == "fail", (
+        "空扫描（一只票都没扫）必须判 fail，不能被读成'全市场'")
+
+
+def _row_scope(*, quotes, active, expected, universe, watch=False):
+    return _ls().make_round_sample(
+        index=1, latency_ms=1.0, alerts=[], error=False, quotes=quotes,
+        universe=universe, history_points=0, history_codes=0, max_deque=0,
+        history_maxlen=0, watchlist_only=watch, observation={},
+        universe_truth={"attempt_status": "applied",
+                        "transport_complete": True,
+                        "expected_total": expected,
+                        "active_scan_codes": active,
+                        "coverage_active": (active / expected
+                                            if expected else None),
+                        "denominator_kind": "provider_declared_total",
+                        "freshness": {"state": "fresh", "age_s": 1.0}})
+
+
+def test_scope_state_is_four_state_not_bool():
+    """scope 必须是**四态**：`bool` 无法表达 `empty_scan` 与 `unknown`。"""
+    ls = _ls()
+    assert ls.SCOPE_FULL_MARKET != ls.SCOPE_EMPTY_SCAN
+    assert ls.SCOPE_EMPTY_SCAN != ls.SCOPE_UNKNOWN
+    assert ls.SCOPE_WATCHLIST_ONLY != ls.SCOPE_FULL_MARKET
+    assert len({ls.SCOPE_FULL_MARKET, ls.SCOPE_WATCHLIST_ONLY,
+                ls.SCOPE_EMPTY_SCAN, ls.SCOPE_UNKNOWN}) == 4
+    full = _row_scope(quotes=5000, active=5900, expected=6000, universe=5900)
+    empty = _row_scope(quotes=5000, active=0, expected=6000, universe=0)
+    assert full["universe_scope_state"] == ls.SCOPE_FULL_MARKET
+    assert empty["universe_scope_state"] == ls.SCOPE_EMPTY_SCAN
+
+
+def test_full_market_positive_text_requires_measured_evidence():
+    """**只有**测到了、且每轮都有明确扫描范围，才允许肯定句。"""
+    rows = [_row_scope(quotes=5900, active=5900, expected=6000,
+                       universe=5900) for _ in range(30)]
+    agg = _ls()._universe_session(rows)
+    assert agg["scope_measured_rounds"] == 30
+    assert agg["full_market_rounds"] == 30
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = agg
+    det = _detail(_ls().evaluate_health(m), "universe_scope")
+    assert _asserts_full_market(det), f"30/30 有证据时才可以肯定：{det}"
+
+
+def test_mid_session_active_coverage_drop_is_consumed():
+    """**核心 RED（C3）**：会话内活跃覆盖下降必须进判决。
+
+    `IT-P1-UNIVERSE-ACTIVE-COVERAGE-SESSION-BLIND-001`（20:04 §5）：
+
+    修前 per-round 样本**根本不采** `expected_total / active_scan_codes /
+    coverage_active`，`universe_coverage` 只读 t0。于是：
+
+        t0: 5900/6000 = 98.33%  -> ok
+        会话: 4500/6000 = 75%   -> **被完全掩盖**
+
+    实测修前 `universe_coverage = ok`，文案还是 t0 的 98.33%。
+    """
+    rows = [_row_scope(quotes=4500, active=4500, expected=6000,
+                       universe=4500) for _ in range(30)]
+    s = rows[0]
+    assert s.get("universe_coverage_active") == 0.75, (
+        f"轮样本必须采到覆盖率，实得 {s.get('universe_coverage_active')}")
+    assert s.get("universe_expected_total") == 6000
+    assert s.get("universe_active_scan_codes") == 4500
+    agg = _ls()._universe_session(rows)
+    assert agg["coverage_active_measured_rounds"] == 30
+    assert agg["coverage_active_min"] == 0.75
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = agg
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe_coverage") == "fail", (
+        f"会话内 75% 覆盖必须判 fail（t0 98.33% 不得掩盖它），"
+        f"实得 {_lvl(v, 'universe_coverage')}：{_detail(v, 'universe_coverage')}")
+
+
+def test_session_coverage_can_judge_when_t0_denominator_unknown():
+    """会话数值证据**可以**在 t0 分母未知时独立支撑结论。
+
+    修前那种情形只会输出"分母未知 -> 无法计算"，即使会话里已经有
+    30 轮真实覆盖率。**有证据却判未测量**是另一种误判。
+    """
+    rows = [_row_scope(quotes=4500, active=4500, expected=6000,
+                       universe=4500) for _ in range(30)]
+    t = _green_t0()
+    t["denominator_kind"] = "unknown"
+    t["expected_total"] = 0
+    t["active_scan_codes"] = 0
+    t["coverage_active"] = None
+    m = _base()
+    m["setup"] = {"universe_size": 4500, "universe_truth": t}
+    m["universe_session"] = _ls()._universe_session(rows)
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe_coverage") == "fail", (
+        f"t0 无分母但会话有 75% 覆盖时必须判 fail，"
+        f"实得 {_lvl(v, 'universe_coverage')}")
+
+
+def test_session_coverage_unknown_stays_unmeasured():
+    """三态纪律：会话**没采到**覆盖率时不得凭空判红或判绿。"""
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = _green_session()      # 无 coverage_* 键
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe_coverage") == "ok", (
+        "旧报告/未采集 -> 维持 t0 判定，不得因缺数据判红")
+
+
+def test_optional_int_is_tri_state():
+    """`_optional_int`：**未知 != 0**（0 是"测出来是 0"，会变成 0% 覆盖）。"""
+    ls = _ls()
+    fn = getattr(ls, "_optional_int", None)
+    assert fn is not None, "必须有 _optional_int"
+    assert fn(None) is None
+    assert fn(None) != 0
+    assert fn(0) == 0
+    assert fn(True) is None, "bool 必须先于 int 拦掉（isinstance(True,int) 为真）"
+    assert fn("6000") == 6000
+    assert fn("abc") is None
+    assert fn(float("nan")) is None
+
+
+def test_old_archived_reports_take_honest_branch():
+    """**回归护栏（C4）**：`:1576` 的"无法判定"分支是**活代码**。
+
+    ADDENDUM2 §1 撤回"永不可达"：实测真实归档
+    `data/live_session_*.json` **7/7** 都没有 `universe_session` 键。
+
+    **这条测试存在的意义是防止未来有人"清理死代码"时把它删掉** ——
+    删掉它会把唯一的诚实旧报告路径换成肯定句，**那是引入回归**。
+    """
+    agg = _ls()._universe_session([])
+    m = _base()
+    m["setup"] = {"universe_size": 5000, "universe_truth": _green_t0()}
+    # 模拟旧报告：有 setup.universe_size，但**没有** universe_session 键。
+    m.pop("universe_session", None)
+    _ = agg
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_scope")
+    assert "无法判定" in det, (
+        f"旧报告（无 universe_session）必须走诚实的'无法判定'分支：{det}")
+    assert not _asserts_full_market(det)
 
 
 # ===========================================================================

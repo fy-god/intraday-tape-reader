@@ -1,57 +1,71 @@
-# NEXT_STEPS — 2026-09-22 17:00 JST
+# NEXT_STEPS — 2026-09-22 21:00 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> 🔴 **17:00 轮结论（最重要的一句）**：
-> **我 13:00 轮声称"3 项修复全部成立"是错的 —— 我撤回。**
-> 一条并行只读审计线对同一 commit 给出相反裁决；13:55 更正附刊逐条复现后
-> 确认**对方是对的**，三项全部改为 **PARTIAL**。我本轮独立复现，**采纳**。
->
-> **我错在只验了"机制是否存在"**（三条机制**都是真的**），**没验**
-> ①**边界可达性** ②**出口完整性（异常出口不是 `return`）**
-> ③**新引入的镜像错误**。
->
-> **根因：三态被压成两态。**
-> ```python
-> "transport_complete": bool(transport_complete)
-> #   None（我没测）  ->  False（provider 说被截断了）
+> 🔴 **21:00 轮结论（最重要的一句）**：
+> **我 17:00 轮的 tri-state 修复解决了"假红"，但在"证据合并"处造出了两个新假绿。**
+> 我在 17:00 报告里写下的规矩是「**session measured facts > t0 snapshot**」。
+> **方向对，但不够** —— 它让**后来的好消息开始抹掉先前的坏消息**：
+> ```text
+> t0 transport_complete = False   <- provider 明确声明：本次股票池被截断
+> session 30 轮全测、0 轮不完整    <- 会话里确实没再看到截断
+> => universe_transport = ok       <- 硬事实被盖掉
 > ```
-> 冷启动 `_universe_meta == {}` → 判决层输出
-> **"provider 声明本次股票池被截断"**，`exit=1`，**把排障指向数据源**。
-> **provider 什么都没声明。** 这是"把不知道当成**有罪**"——
-> 与我一直在修的"把不知道当**没问题**"（假绿）**同源**。
+> 第二个：**零证据被当成肯定证据** ——
+> `_universe_session([]) -> measured=False, ratio=None, ever=False`
+> 却输出「会话期间未降级为仅自选股（**全程全市场扫描**）」；
+> `finalize_metrics([])`（**一轮都没跑**）也输出同一句。
+> 第三个：**会话内活跃覆盖下降无消费者**（t0 98.33% 掩盖会话 75%）。
 >
-> **✅ 17:00 轮修复 9 条（全部针对我 13:00 轮的代码）**
+> ⚠ **我自己的负控制"以错误的理由通过"**：我在 17:00 轮把它当负控制写进报告，
+> **但它的输入把被测分支绕过去了** ——
+> `t0=False + measured=0 -> fail`（我走的路径），**`measured=1 -> ok`**。
+> **有负控制 ≠ 有有效的负控制。**
+>
+> **✅ 21:00 轮修复 5 条（全部针对我 17:00 轮的代码）**
 > | ID | 级别 | 修复 |
 > |---|---|---|
-> | `...-TRANSPORT-TRISTATE-R1` | P1 | tri-state 端到端，禁 `bool()` |
-> | `...-TRANSPORT-SESSION-BLIND-001` | P1 | 真正消费 `_ti`（第 **6** 次零读者） |
-> | `HEALTH-SESSION-WITHOUT-T0-001` | P1 | session 消费独立于 t0 |
-> | `...-WATCHLIST-FALLBACK-SESSION-BLIND-001` | P1 | count/ratio/ever + 显式 `--watch-only` |
-> | `...-FALLBACK-FRESHNESS-RESET-001` | P2 | 拆两个时钟 |
-> | `...-FRESHNESS-CONFIG-KEY-001` | P2 | 正式键 + **判决消费 Engine 导出阈值** |
-> | `...-FRESHNESS-UNKNOWN-SEMANTIC-001` | P2 | `unknown` → "未测量" |
-> | `...-ATTEMPT-EXCEPTION-EXIT-001` | **P2** | 外层 finalizer（**不**写 P0） |
-> | `EVAL-FAIL-COVERAGE-SILENT-001` | P1 | **说谎的旋钮**接上消费者 |
+> | `...-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001` | P1 | scope 由 `bool` 升为**四态** + 肯定句需 `measured` 门控 |
+> | `...-TRANSPORT-T0-SUPPRESSED-001` | P1 | t0 硬负面**吸收**会话正面 |
+> | **我自己的负控制失效** | — | 参数化 `measured ∈ {0,1,30}` |
+> | `...-ACTIVE-COVERAGE-SESSION-BLIND-001` | P1 | 每轮采**分子+分母**；会话取最坏优先于 t0 |
+> | `...-DROP-CAUSE-COLLAPSED-001` | **P2** | `denominator_kind` 进会话聚合（病因字段仍待搬） |
 >
-> **1791 passed**（+27）/ 8 gate 全绿 / selftest 68-6-8-8 /
-> 回退验牙 **20 条行为级 RED / 0 结构性**。
+> **深层修复 = Session Universe Evidence Contract v1**（WP01）：
+> **根因不是阈值，是"证据合并"没有合同。**
+> scope 四态 + transport join 语义（hard negative 吸收）
+> + active coverage 数值证据（t0 与 session 取最坏）+ 旧报告兼容。
 >
-> **⬇ 本轮下调**：13:55 附刊把 `engine.py:1180` 异常出口列 **P0** →
-> 16:13 §1.2 指出**无生产可达触发证据** → **我采纳，按 P2 robustness**。
+> **1802 passed**（+11）/ 8 gate 全绿 / selftest 68-6-8-8 /
+> 回退验牙 **10 条行为级 RED / 0 结构性**。
 >
-> 🔴 **仍未闭合（连续三轮最高优先）**：
-> `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` —— 16:13 WP06 要求"**单独 diff**，
-> 不和 health consumer 混一起"；本轮正是 health consumer，按纪律**不混**。
+> **⚠ 修法纪律**：ADDENDUM2 §1 **撤回了它自己**"`:1576` 永不可达"的表述 ——
+> 实测 `data/live_session_*.json` **7/7** 无 `universe_session` 键，**全走那一支**。
+> 修法是**给肯定分支加门控**，**不动** `:1576`（并加了回归护栏）。
+>
+> 🔴 **仍未闭合（连续四轮最高优先）**：
+> `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` —— 20:04 WP02 仍标"【独立 diff】"。
+> **下一轮应当专门做它。**
+>
+> **⬇ 本轮下调（我 17:00 轮的声称）**：
+> `...-TRANSPORT-TRISTATE-R1` → **PARTIAL**（优先级定错）；
+> `...-TRANSPORT-SESSION-BLIND-001` → **PARTIAL**（接上了一个会覆盖硬事实的读者）；
+> `...-WATCHLIST-FALLBACK-SESSION-BLIND-001` → **PARTIAL**（零证据仍落进肯定句）；
+> **"我加了负控制"这个动作本身** → **失败**。
+> `...-FRESHNESS-*` 三条与 `...-ATTEMPT-EXCEPTION-EXIT-001` **保持成立**（无新反证）。
+>
+> **✅ 17:00 轮**：撤回 13:00 轮「3 项全部成立」→ 全部 **PARTIAL**
+> （并行只读审计线 + 13:55 更正附刊确认，我采纳）。
 >
 > **✅ 13:00 轮**：修掉 3 条（截断盲区 / 刷新台账 / 会话级新鲜度）——
-> **但 17:00 轮已把这三条改判 PARTIAL**，见上。
+> **17:00 轮已把这三条改判 PARTIAL**。
 >
-> **✅ 21:00 轮：修掉 17:40 本地轮与 20:10 云端轮各自独立指认的 7 条缺陷。**
+> **✅ 2026-09-21 21:00 轮：修掉 17:40 本地轮与 20:10 云端轮各自独立指认的 7 条缺陷。**
 > **归属**：1.1–1.5 由 `17-40-00_JST.md` 轮先发现（§3.5 / §4 / 附录 A.1 / B.1），
 > 20:10 云端轮独立同结论；1.6–1.7 由 `17-40-00_JST.md` §6 / §3.6 发现。
 > **我实现并验证 —— 发现功劳不归我。**
+> （注：这是 **09-21** 的 21:00 轮；与本文件顶部 **09-22** 的 21:00 轮是两次不同的轮次。）
 >
 > | ID | 复核 | 修复 |
 > |---|---|---|
@@ -139,7 +153,7 @@
   把"没做逐 code 统计"伪装成"0% 可评估"。
   测试 `test_auto_creating_eval_rows_would_break_invariants` 钉住。
 
-### D. ✅（21:00）交付账本自洽性 + 不变量**接线到生产**
+### D. ✅（09-21 21:00）交付账本自洽性 + 不变量**接线到生产**
 - **完成情况**（`IT-P1-DELIVERY-FALSE-GREEN-001` + `IT-P1-DELIVERY-INVARIANTS-UNCALLED-001`）
   * `capabilities.py`：新增 `accounting_errors` 计数、
     `delivery_accounting_status()`（`ok`/`not_measured`/`inconsistent`）、
@@ -166,7 +180,7 @@
   **我未独立复核该反例** → 本条**不能照原样实施**，必须先确认映射关系。
 - **可证伪**：若真实运行中两者恒相等，门禁永不触发，说明过虑了。
 
-### F. （`R-18`，**21:00 新增**）`accounting_status` 必须真的显示在用户眼前
+### F. （`R-18`，**09-21 21:00 新增**）`accounting_status` 必须真的显示在用户眼前
 - **现状**：`accounting_status` 目前只有 soak 与测试在读；
   `/api/status` 虽导出该字段，但**看板前端是否显示未核实**。
 - **危害**：若前端不显示，用户界面上仍可能出现"门禁绿而账本坏"的观感 ——
@@ -200,8 +214,8 @@
     且 `evaluate_health` **完全没有 universe 项** ——
     健康判定对 `universe_size ∈ {0, 4100, 5000, 5563}` **逐字节相同**。
     （09:00 后 `universe_coverage` 项已能区分，见 D5 实测表。）
-  * 我 21:00 轮真实回放中 `eastmoney` 报 `RemoteDisconnected`（第 3 次野外观测）。
-- **✅ 悬置疑问已关闭**（我独立复核，21:00）：`page_size=100`、`max_pages=80`、
+* 我 09-21 21:00 轮真实回放中 `eastmoney` 报 `RemoteDisconnected`（第 3 次野外观测）。
+- **✅ 悬置疑问已关闭**（我独立复核，09-21 21:00）：`page_size=100`、`max_pages=80`、
   全市场 5913 → 需 `ceil(5913/100) = 60` 页；`60 > 80` 为 **False**。
   **默认配置下 `max_pages` 截断在算术上不可能** —— 短缺只能来自源端
   `pages_failed`。我此前反复写的"无法区分限流与我方 `max_pages`"
@@ -240,7 +254,7 @@
 ### D1. 判决项必须"带证据来源"（01:00 想法 1）
 - **证据**：同一条线上已出现**至少 4 次**同一失败模式 ——
   "算了/放了字段"被当成"问题解决了"：
-  `_universe_meta` 零出口、`check_delivery_invariants()` 生产零调用（21:00 修）、
+`_universe_meta` 零出口、`check_delivery_invariants()` 生产零调用（09-21 21:00 修）、
   `_scope_note` 死键（`R-22`）、`accounting_status` 判决层不读（01:00 修）。
 - **做法**：门禁 —— 任何被写进 metrics 的
   `*_status` / `*_accounting` / `*_coverage` 类字段，
@@ -426,6 +440,53 @@
   `unknown` → "未测量"；外层 finalizer（**P2**，非 P0）。
 - **仍未做**：`rounds_transport_incomplete` 之外的 session 事实
   （如 `rounds_transport_measured`）尚未各自配 consumer-effect test。
+- **⚠ 21:00 轮更正**：本条的「session 事实独立于 t0」**方向对但不够** ——
+  我把合并语义写成了「**session measured facts > t0 snapshot**」，
+  于是**后来的好消息开始抹掉先前的坏消息**（见 D14）。已改为 join/吸收语义。
+
+### D14. 🔴 **证据合并必须有 join 语义，不能只说"谁优先"**（**21:00 新增，最高优先**）
+- **证据**：我 17:00 轮立的规矩「session measured facts > t0 snapshot」
+  **方向对但不够**。实测两个反例：
+  ```
+  ① t0 transport_complete=False + session 30 轮全完整  -> ok（错，应 fail）
+     硬事实被后来的好消息抹掉
+  ② _universe_session([]) -> measured=False/ratio=None/ever=False
+     -> 「会话期间未降级为仅自选股（全程全市场扫描）」  （零证据 = 肯定证据）
+  ```
+  两条**同源**：合并函数不是**单调**的 —— 加入"明确坏"的证据**可以改善**结论。
+- **做法**：把合并规则从"会话优先"改成**格（lattice）上的 join**：
+  ```
+  fail ⊔ anything  = fail        # explicit hard negative 是**吸收元**
+  ok   只在**所有有证据的来源都 ok** 时成立
+  unknown 是单位元
+  ```
+  **单调性要求**：加入明确坏证据**永远不能**改善结论
+  （20:04 §7 的 288 个 monotonicity property checks 就是这个意思）。
+- **可证伪预测**：若穷举 t0 × session 所有组合后发现"会话优先"
+  与 join 语义**结论一致**，这条规矩无用。
+  —— **反证不成立**：本轮实测 `t0=False + session all-true` 的**全部分支**
+  都被判得更轻。
+- **验收**：`test_t0_hard_negative_beats_session_all_complete`（三档）、
+  `test_zero_evidence_scope_is_not_asserted_as_full_market`。
+  应推广到**所有** t0 × session 合并点（目前只覆盖 transport 与 scope）。
+
+### D15. 🔴 **有负控制 ≠ 有有效的负控制**（**21:00 新增**）
+- **证据**：我在 17:00 轮把 `test_explicit_incomplete_still_fails` 写成负控制
+  并写进报告。**但它的输入恰好把被测分支绕过去了**：
+  ```
+  t0=False + rounds_transport_measured=0   -> fail   <-- 我的测试走的路径
+  t0=False + rounds_transport_measured=1   -> ok     <-- 一个单位就翻绿！
+  t0=False + rounds_transport_measured=30  -> ok
+  ```
+  **它从未在 `measured > 0` 时试过被测分支。**
+- **做法**：负控制必须**显式走过被测分支**。可操作判据：
+  ① 打印/断言被测分支的**入口条件**在本用例下为真；
+  ② 对会"绕过"分支的**哨兵参数**做参数化（本例 `measured ∈ {0,1,30}`）；
+  ③ 配对正控制（本例 `t0=True -> ok` 证明分支真的活着）。
+- **可证伪预测**：若按此三问复查所有负控制后从未发现绕过，规矩无用。
+  —— **反证不成立**：本轮**当场抓到 1 条（我自己的）**。
+- **验收**：`test_explicit_incomplete_still_fails` 已参数化；
+  应复查 **全部** 已有负控制测试。
 
 ### D4（合并版）. 三个 bug 类的**系统性收口**（05:00 起，09:00 扩两类，13:00 +1，17:00 +1）
 - **现状**：该 bug 类（**有界容器/累计缓存的长度被当作完整总量**）已确认 **5 个实例**：

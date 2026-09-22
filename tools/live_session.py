@@ -462,7 +462,91 @@ def make_round_sample(
         out["universe_age_s"] = _optional_float(_age_raw)
         out["universe_refresh_id"] = _safe_int(_attempt.get("refresh_id"))
         out["universe_truth_fields"] = sorted(str(k) for k in universe_truth)
+        # --- Session Universe Evidence Contract v1 / WP01 ------------------
+        #
+        # IT-P1-UNIVERSE-ACTIVE-COVERAGE-SESSION-BLIND-001（20:04 §5）：
+        # `setup['universe_truth']` 是 **t0 快照**。会话中途活跃覆盖从
+        # 5900/6000=98.33% 掉到 4500/6000=75% 时，**没有任何会话级消费者**
+        # —— `universe_coverage` 仍然读 t0 的 98.33%，判 ok。
+        #
+        # `summary_rounds` 算出的 `metrics['universe'].min`（4500）**确实存在**，
+        # 但它没有分母（expected_total），算不出**覆盖率**，也没有判决项读它。
+        #
+        # 所以每轮必须采"**能算覆盖率的两个数**"：分子 + 分母。
+        # 只采分子（universe size）等于采了一个**无法解释**的数字。
+        #
+        # 三态纪律：**未知 != 0**。分母拿不到就写 None，绝不写 0
+        # （0 会让 coverage 变成 0% 或除零，凭空造出一个假红）。
+        _exp_raw = universe_truth.get("expected_total")
+        out["universe_expected_total"] = _optional_int(_exp_raw)
+        _act_raw = universe_truth.get("active_scan_codes")
+        out["universe_active_scan_codes"] = _optional_int(_act_raw)
+        _cov_raw = universe_truth.get("coverage_active")
+        # 人口覆盖率只能在 [0,1]；越界/脏值记 None（读不出），不记假成绩。
+        if isinstance(_cov_raw, bool) or not _finite(_cov_raw):
+            out["universe_coverage_active"] = None
+        else:
+            _c = float(_cov_raw)
+            out["universe_coverage_active"] = (
+                round(_c, 6) if 0.0 <= _c <= 1.0 else None)
+        # 分母**种类**必须一起带走：`provider_declared_total` 与
+        # `unknown` 是两种证据强度完全不同的结论，不能塌缩成一个比率
+        # （ADDENDUM2 §3 `IT-P2-UNIVERSE-DROP-CAUSE-COLLAPSED-001`）。
+        _dk = universe_truth.get("denominator_kind")
+        out["universe_denominator_kind"] = (
+            str(_dk) if isinstance(_dk, str) and _dk else None)
+        # --- Scope 四态（C1：零证据不得被肯定成"全市场"）-------------------
+        #
+        # `IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`（20:04 §3）：
+        # 修前 scope 只有 `watchlist_only` 布尔，于是**零证据**（0 轮）与
+        # **空扫描**（池子被清空）都落进"未降级"的肯定分支，
+        # 输出「会话期间未降级为仅自选股（**全程全市场扫描**）」。
+        # 一轮都没跑的报告也这么说 —— 这是**零证据被当成肯定证据**。
+        #
+        # 清空 vs 全市场在旧口径下**不可区分**，因为两者都是
+        # `watchlist_only=False`。必须显式分开成四态。
+        out["universe_scope_state"] = _scope_state_of(
+            universe_truth, universe=out.get("universe"),
+            watchlist_only=bool(out.get("watchlist_only")))
     return out
+
+
+#: 会话扫描范围四态。**必须四态**：`bool` 的两态无法区分
+#: "空扫描"（池子被清空）与"全程全市场"，两者旧口径都是 `watchlist_only=False`。
+SCOPE_FULL_MARKET = "full_market"
+SCOPE_WATCHLIST_ONLY = "watchlist_only"
+SCOPE_EMPTY_SCAN = "empty_scan"
+SCOPE_UNKNOWN = "unknown"
+
+
+def _scope_state_of(universe_truth: dict | None, *,
+                    universe: Any, watchlist_only: bool) -> str:
+    """本轮扫描范围 -> 四态之一（纯函数）。
+
+    `IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`（20:04 §3）：
+
+    * `empty_scan`：股票池**真的空了**（`active_scan_codes == 0`，
+      或没有 active 数时本轮 `universe` 计数为 0）。
+      **这与"全市场"在旧口径下不可区分，正是缺陷本体。**
+    * `watchlist_only`：显式降级为自选股。
+    * `full_market`：有**肯定证据**（明确 `active_scan_codes > 0`
+      且不是自选股降级）。
+    * `unknown`：**没有任何证据**（旧报告 / 未采集 / 冷启动）。
+      **绝不能归入 `full_market`** —— 那是把"不知道"当"没问题"，
+      正是本轮一直在修的 bug 类。
+    """
+    ut = universe_truth if isinstance(universe_truth, dict) else {}
+    if watchlist_only:
+        return SCOPE_WATCHLIST_ONLY
+    active = ut.get("active_scan_codes")
+    has_active = (isinstance(active, (int, float))
+                  and not isinstance(active, bool))
+    if has_active:
+        return SCOPE_EMPTY_SCAN if float(active) <= 0 else SCOPE_FULL_MARKET
+    # 没有 active 数时退回本轮池计数（`make_round_sample` 的 `universe`）。
+    if isinstance(universe, (int, float)) and not isinstance(universe, bool):
+        return SCOPE_EMPTY_SCAN if float(universe) <= 0 else SCOPE_FULL_MARKET
+    return SCOPE_UNKNOWN
 
 
 def _universe_truth_now(engine: Any) -> dict | None:
@@ -511,12 +595,30 @@ def _universe_session(rows: Sequence[dict]) -> dict:
     ids: list[int] = []
     watch_only = 0
     watch_seen = 0
+    # --- Session Universe Evidence Contract v1（WP01）---------------------
+    # 四态 scope 计数 + per-round active coverage 数值证据。
+    scope_counts: dict[str, int] = {}
+    cov_vals: list[float] = []
+    cov_denoms: dict[str, int] = {}
     for r in rows:
         if (r.get("watchlist_only") is not None
                 and ("quotes" in r or "universe" in r)):
             watch_seen += 1
             if r.get("watchlist_only"):
                 watch_only += 1
+        # scope 四态：老轮样本没有这个键 -> 不计入（未测量，不是 unknown 读数）。
+        _sc = r.get("universe_scope_state")
+        if isinstance(_sc, str) and _sc:
+            scope_counts[_sc] = scope_counts.get(_sc, 0) + 1
+        # 会话内活跃覆盖率：只在**两个数都有**时才算 —— 有分子没分母
+        # 算不出覆盖率，必须留空而不是拿 0 顶上。
+        _cv = r.get("universe_coverage_active")
+        if (isinstance(_cv, (int, float)) and not isinstance(_cv, bool)
+                and 0.0 <= float(_cv) <= 1.0):
+            cov_vals.append(float(_cv))
+            _dk = r.get("universe_denominator_kind")
+            _dk = str(_dk) if isinstance(_dk, str) and _dk else "unknown"
+            cov_denoms[_dk] = cov_denoms.get(_dk, 0) + 1
         if "universe_fresh_state" not in r and "universe_attempt_status" not in r:
             continue
         st = str(r.get("universe_fresh_state") or "unknown")
@@ -553,8 +655,32 @@ def _universe_session(rows: Sequence[dict]) -> dict:
                                  if watch_seen else None),
         "ever_watchlist_only": bool(watch_only),
     }
+    # --- Session Universe Evidence Contract v1：scope / active coverage ----
+    #
+    # `scope_measured_rounds` 是**四态证据的测量计数**，与 `measured`
+    # （新鲜度证据）是**两条独立轴** —— 老轮样本可能一条有一条没有。
+    # 消费者必须能问"scope 到底测了几轮"，否则零证据与全市场不可分（C1）。
+    scope_measured = sum(scope_counts.values())
+    scope_facts = {
+        "scope_counts": scope_counts,
+        "scope_measured_rounds": scope_measured,
+        "full_market_rounds": scope_counts.get(SCOPE_FULL_MARKET, 0),
+        "empty_scan_rounds": scope_counts.get(SCOPE_EMPTY_SCAN, 0),
+        "unknown_scope_rounds": scope_counts.get(SCOPE_UNKNOWN, 0),
+    }
+    # 会话内活跃覆盖率：**最坏值**优先（与 worst_state 同纪律，
+    # "中途掉下去过"不能被"最后又好了"抹掉）。
+    cov_facts = {
+        "coverage_active_measured_rounds": len(cov_vals),
+        "coverage_active_min": (round(min(cov_vals), 6) if cov_vals else None),
+        "coverage_active_p05": (round(percentile(cov_vals, 5), 6)
+                                if cov_vals else None),
+        "coverage_active_last": (round(cov_vals[-1], 6) if cov_vals else None),
+        "coverage_active_denominator_kinds": cov_denoms,
+    }
+    _evidence = {**scope_facts, **cov_facts}
     if not states and not statuses:
-        return {"measured": False, **watch_facts}
+        return {"measured": False, **watch_facts, **_evidence}
     worst = max(states, key=lambda k: _order.get(k, 0)) if states else "unknown"
     return {
         "measured": True,
@@ -575,6 +701,7 @@ def _universe_session(rows: Sequence[dict]) -> dict:
         "last_age_s": (round(ages[-1], 3) if ages else None),
         "refresh_ids_seen": len(set(ids)),
         **watch_facts,
+        **_evidence,
     }
 
 
@@ -1566,6 +1693,12 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     _w_rounds = _safe_int(_sess.get("watchlist_only_rounds"))
     _w_ratio = _sess.get("watchlist_only_ratio")
     _w_ever = _sess.get("ever_watchlist_only")
+    # Session Universe Evidence Contract v1（WP01 / 20:04 §3）：
+    # `IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`。
+    _scope_measured = _safe_int(_sess.get("scope_measured_rounds"))
+    _empty_rounds = _safe_int(_sess.get("empty_scan_rounds"))
+    _full_rounds = _safe_int(_sess.get("full_market_rounds"))
+    _unknown_scope = _safe_int(_sess.get("unknown_scope_rounds"))
     # 显式 run mode 例外：`--watch-only` 是**用户指定只盯自选股**，
     # 不是故障。只能靠显式标记识别，绝不能靠"股票数很少"猜意图。
     _watch_only_mode = bool(_setup.get("watch_only")) if isinstance(_setup, dict) else False
@@ -1574,6 +1707,10 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             "本次以**显式 `--watch-only` 模式**运行：只盯自选股是预期行为，"
             "不判失败", level="ok")
     elif _w_ever is None:
+        # ⚠ **这一支是活代码，绝不能删或合并**（ADDENDUM2 §1 撤回"永不可达"）：
+        # 实测 `data/live_session_*.json` **7/7** 都没有 `universe_session` 键，
+        # 全部走这里输出诚实的"无法判定"。删掉它 = 把唯一的诚实旧报告路径
+        # 换成下面的肯定句 = **引入回归**。
         add("universe_scope", True,
             "无会话级扫描范围记录（旧报告/未采集），无法判定（跳过不算失败）",
             level="ok")
@@ -1587,9 +1724,33 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             f"会话期间有 {_w_rounds} 轮**降级为仅自选股**（占比 {_ratio_s}）"
             f"—— 这些轮次对全市场事件是硬缺口，此期间的'没有告警'"
             f"不能解释为'没有异动'", level="fail")
-    else:
+    elif _empty_rounds > 0:
+        # **空扫描**：股票池被清空（`active_scan_codes == 0`），但 `state.quotes`
+        # 可能还留着旧缓存，于是 `quotes` 看起来正常。
+        # 旧口径下它与"全程全市场"**都是 `watchlist_only=False`，不可区分** ——
+        # 这正是本缺陷的本体：一个空扫描被肯定成"全程全市场扫描"。
+        add("universe_scope", False,
+            f"会话期间有 {_empty_rounds} 轮**活跃股票池为空**"
+            f"（扫描集合 0 只，共测到 {_scope_measured} 轮）—— "
+            f"这些轮次**一只票都没扫**，此期间的'没有告警'"
+            f"不能解释为'没有异动'", level="fail")
+    elif _scope_measured > 0 and _full_rounds == _scope_measured:
+        # **只有**「测到了、且每一轮都是有票的全市场」才允许肯定句。
         add("universe_scope", True,
-            "会话期间未降级为仅自选股（全程全市场扫描）", level="ok")
+            f"会话期间未降级为仅自选股（全程全市场扫描，"
+            f"{_full_rounds}/{_scope_measured} 轮有明确扫描范围证据）",
+            level="ok")
+    else:
+        # 零证据 / 证据不完整：**不得**肯定。
+        # 修前这里写的是「会话期间未降级为仅自选股（全程全市场扫描）」——
+        # `finalize_metrics([])`（**一轮都没跑**）也会走到这里发出这句肯定句。
+        # **零证据被当成了肯定证据**，与"把不知道当没问题"完全同类。
+        _extra = (f"，其中 {_unknown_scope} 轮扫描范围**未知**"
+                  if _unknown_scope > 0 else "")
+        add("universe_scope", True,
+            f"会话级扫描范围证据**不足**（测到 {_scope_measured} 轮{_extra}）"
+            f"—— 跳过不算失败，但**不能**据此说'全程全市场扫描'",
+            level="ok")
     if isinstance(_setup, dict) and _setup:
         _u_size = _safe_int(_setup.get("universe_size"))
         _u_fell = bool(_setup.get("fell_back_to_watchlist"))
@@ -1676,7 +1837,38 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             return "未知" if fv is None else f"{fv:.2%}"
 
         _cov_a_f = _f(_cov_a)
-        if _exp <= 0 or _cov_a_f is None:
+        # --- IT-P1-UNIVERSE-ACTIVE-COVERAGE-SESSION-BLIND-001（20:04 §5）-----
+        #
+        # 修前这里**只读 t0**：`coverage_active` 是 soak 开始前那一份快照。
+        # 会话中途活跃覆盖从 5900/6000=98.33% 掉到 4500/6000=75% 时，
+        # 判决**仍然**输出 t0 的 98.33% 判 ok —— 75% 的覆盖被启动快照掩盖。
+        #
+        # `summarize_rounds` 算出的 `metrics['universe'].min`（4500）确实存在，
+        # 但它**没有分母**，算不出覆盖率，也没有判决项读它 —— 又一个"算了没人读"。
+        #
+        # 合并纪律：**取最坏**（与 `worst_state` 同纪律，中途掉下去过不能被
+        # "最后又好了"抹掉）。并且 session 的数值证据**可以**在 t0 分母未知时
+        # 独立支撑结论 —— 那时旧代码只会输出"分母未知 -> 无法计算"。
+        _s_cov_min = _f(_sess.get("coverage_active_min"))
+        _s_cov_rounds = _safe_int(_sess.get("coverage_active_measured_rounds"))
+        _cov_src = ""
+        if _cov_a_f is None and _s_cov_min is None:
+            _cov_eff = None
+        elif _cov_a_f is None:
+            _cov_eff = _s_cov_min
+            _cov_src = (f"（t0 无可用覆盖，取自会话 "
+                        f"{_s_cov_rounds} 轮最小值）")
+        elif _s_cov_min is None:
+            _cov_eff = _cov_a_f
+        elif _s_cov_min < _cov_a_f:
+            _cov_eff = _s_cov_min
+            _cov_src = (f"（**会话内最差** {_pct(_s_cov_min)} < t0 "
+                        f"{_pct(_cov_a_f)}，取最坏；共 {_s_cov_rounds} 轮）")
+        else:
+            _cov_eff = _cov_a_f
+        _s_txt = (f"；会话内最小 {_pct(_s_cov_min)}（{_s_cov_rounds} 轮）"
+                  if _s_cov_min is not None else "；会话内覆盖未测量")
+        if _cov_eff is None:
             # 分母未知 -> **不许**假装知道。新浪 clean pagination 就属这类：
             # 它能证明"翻页翻完了"，但没有 numeric total，二者不能硬塞成
             # 同一种 coverage。脏值同样走这里（判"未测量"而非崩溃）。
@@ -1686,22 +1878,24 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
                 f"{_why} —— 无法计算全市场覆盖"
                 f"（跳过不算失败；此时'没有告警'不能解释为'没有异动'）",
                 level="ok")
-        elif _cov_a_f < _f_cov:
+        elif _cov_eff < _f_cov:
             add("universe_coverage", False,
                 f"全市场覆盖过低：active {_act}/{_exp} = {_pct(_cov_a)}"
+                f"{_cov_src}"
                 f"（下限 {_f_cov:.0%}）—— transport {_pct(_cov_t)}、"
                 f"usable {_pct(_cov_u)}；扫描范围缺 {_exp - _act} 只，"
-                f"漏报风险高", level="fail")
-        elif _cov_a_f < _w_cov:
+                f"漏报风险高{_s_txt}", level="fail")
+        elif _cov_eff < _w_cov:
             add("universe_coverage", True,
                 f"全市场覆盖偏低：active {_act}/{_exp} = {_pct(_cov_a)}"
-                f"（警戒 {_w_cov:.0%}，下限 {_f_cov:.0%}）",
+                f"{_cov_src}"
+                f"（警戒 {_w_cov:.0%}，下限 {_f_cov:.0%}）{_s_txt}",
                 level="warn")
         else:
             add("universe_coverage", True,
                 f"全市场覆盖 active {_act}/{_exp} = {_pct(_cov_a)}"
                 f"（transport {_pct(_cov_t)}、usable {_pct(_cov_u)}；"
-                f"reported={_raw}/{_use}）", level="ok")
+                f"reported={_raw}/{_use}）{_s_txt}", level="ok")
 
         # --- IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001 ----------------
         #
@@ -1816,6 +2010,27 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             f"（transport_complete=False，共测到 {_tmeas} 轮）——"
             f"这些轮次对全市场事件是硬缺口，此期间的'没有告警'"
             f"不能解释为'没有异动'", level="fail")
+    elif _t0_known and _t_complete is False:
+        # --- IT-P1-UNIVERSE-TRANSPORT-T0-SUPPRESSED-001（20:04 §4）----------
+        #
+        # **t0 的明确 False 必须优先于会话的"全完整"。**
+        #
+        # 修前顺序是「会话全完整 -> ok」排在 t0 之前，于是：
+        #   t0 transport_complete=False + session 30 轮全测、0 轮不完整
+        #   -> universe_transport = ok，文案还说"均为完整（无截断）"
+        # 连 t0=None 都被同一句话盖掉。
+        #
+        # `transport_complete=False` 是「provider 明确声明股票池被截断」，
+        # 是**不需要分母就能确定的硬事实**（本文件 :1645 的注释就这么叫它）。
+        # **后来的 positive evidence 不能抹掉同一评估窗口内的 explicit
+        # hard negative** —— 一个评估窗口里出现过"明确坏"，窗口结论就是坏。
+        # 这与 `worst_state` 的纪律完全一致（"中途曾坏过"不能被"最后又好了"
+        # 抹掉），只是对象从新鲜度换成了传输完整性。
+        add("universe_transport", False,
+            f"启动快照明确声明股票池被截断（transport_complete=False）"
+            f"（会话另测到 {_tmeas} 轮，其中 {_ti} 轮不完整）—— "
+            f"**会话级的'全完整'不能抹掉这个硬事实**："
+            f"此期间的'没有告警'不能解释为'没有异动'", level="fail")
     elif _sess_measured and _ti == 0 and _tmeas > 0:
         add("universe_transport", True,
             f"会话期间 {_tmeas} 轮 transport 均为完整（无截断）", level="ok")
@@ -2112,6 +2327,36 @@ def _optional_float(v: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return f if _finite(f) else None
+
+
+def _optional_int(v: Any) -> int | None:
+    """三态整数：``int`` / ``None``（**未测量**）。
+
+    与 `_optional_bool` / `_optional_float` 同一纪律（WP01
+    Session Universe Evidence Contract v1）：
+
+    * `None` -> `None`（**不得**变成 0：0 是"测出来是 0"，
+      在分母上会直接变成除零 / 0% 覆盖，凭空造出一个假红）；
+    * 脏值（NaN / 字符串 / bool）-> `None`（读不出，不记假成绩）；
+    * `bool` **必须**先于 `int` 拦掉 —— `isinstance(True, int)` 是 True，
+      否则 `True` 会被读成 `1`。
+
+    传 `str` 只接受能无损转成整数的（`"6000"` -> 6000），
+    `"6000.5"` / `"abc"` -> `None`。真实 provider 给的 JSON 数字
+    已经是 int/float，这一条只为兼容手写样本与旧归档。
+    """
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v) if _finite(v) else None
+    if isinstance(v, str):
+        try:
+            return int(v.strip())
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _round_observation_fields(row: dict) -> set[str]:
