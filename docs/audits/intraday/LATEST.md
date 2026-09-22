@@ -4,6 +4,7 @@
 **最新云端独立审计**：[`2026-09-22_16-13-10_JST.md`](./2026-09-22_16-13-10_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_16-13-10_JST_AGENT_TASK.md`](./2026-09-22_16-13-10_JST_AGENT_TASK.md)  
 **最新盘中预警本地审计**：[`2026-09-22_16-20-44_JST.md`](./2026-09-22_16-20-44_JST.md)  
+**最新盘中预警本地审计追加**：[`2026-09-22_16-20-44_JST_ADDENDUM.md`](./2026-09-22_16-20-44_JST_ADDENDUM.md)  
 **最新产品提交 / reviewed_source_sha**：`c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`  
 **本轮审计开始 docs HEAD**：`50047d7c58e4fc75a93ccddf7d0b2eb7299cf8e1`  
 **report_commit_sha**：`c93a80d5679f2927eabbf595b544b6c4bf4008d8`  
@@ -17,6 +18,32 @@ https://github.com/fy-god/intraday-tape-reader/blob/6c8f11e363b3efcd21e410a5af7a
 
 ---
 
+## 2026-09-22 16:20:44 JST 追加（零轮路径的**产物级**证据）
+
+**追加报告**：[`2026-09-22_16-20-44_JST_ADDENDUM.md`](./2026-09-22_16-20-44_JST_ADDENDUM.md)　
+**被测产品提交**：`6c8f11e363b3efcd21e410a5af7a718e08e8564d`
+
+- 一个**只读**子 agent 独立复核本轮 P1 并给出**更强**的触发路径；我按规则 (vvv) 在**提交版**上逐条复算（它测的是提交前副本 3,041 行，提交版 3,051 行，**行号已全部改取提交版**）。
+- **产物级证据（新增）**：`finalize_metrics([])`（**一轮都没跑成**）→
+  `universe_session = {measured: False, watchlist_only_ratio: None, ever_watchlist_only: False}`
+  → `universe_scope = ok`，文案「会话期间未降级为仅自选股（**全程全市场扫描**）」。
+  经真实 `build_report` 序列化后，**该肯定句确实出现在报告 JSON 里**，而同一份判决是
+  `rounds=0`、`healthy=False`、`fail=['rounds','data','api','sse','memory']`。
+  **一份承认自己什么都没跑成的报告，不允许声称自己全程扫了全市场。**
+  触发只需 `create_server` 抛异常或第 1 轮前 Ctrl+C —— 比原报告「真实 Engine 池被清空」更常见。
+- **自相矛盾（两个都是 `ok`，故在 healthy/退出码里不可见）**：同一判决同时给出
+  `universe: ok「无股票池规模记录…无法判定」` 与 `universe_scope: ok「全程全市场扫描」`。
+- **死存储确认（函数归属 AST，提交版）**：`_sess_measured` 在 `L1555` 赋值、`L1804` 覆盖，
+  最早读取在 `L1810`；`universe_scope` 块（`:1568-1592`）**从不读取** `measured`。
+- **对照（未发现同类缺陷）**：零证据输入下 `universe_transport` / `universe_freshness` / `universe_coverage`
+  **都正确地说「未测量 / 无法判定」**；`:1819` 的肯定分支被 `_tmeas > 0` 门控，**不可能**从零证据发出。
+  ⇒ `universe_scope` 缺的正是这个模式。
+- **未采纳/降级**：子 agent 标 `NOT_PROVEN` 的 truthiness 分类问题（`_optional_bool` 已缓解、生产可达未证明）
+  与「t0 截断被会话全完整抑制」**仅记录、不列为缺陷**。
+- `程序修复` 0 / `任务定义变更` 0 / `真实模型增益` 0；**未跑**真实 soak、**未做**训练。
+  归档交叉核对仍不可得（`docs/audits/intraday/` 全部 JSON 均无 `universe_session`）⇒ **不给真实发生率**。
+
+---
 ## 2026-09-22 16:20:44 JST 本地审计轮（Health Consumer Contract 复核）
 
 **报告**：[`2026-09-22_16-20-44_JST.md`](./2026-09-22_16-20-44_JST.md)　**审计起点 HEAD**：`1b73270f83476ad24d09cc9f21d0ff44b2482f00`
