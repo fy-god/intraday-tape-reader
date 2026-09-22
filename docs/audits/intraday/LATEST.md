@@ -73,7 +73,7 @@
 Precision/Recall/漏报率/收益 = `unavailable`；本轮 Engine 实验全用**假 provider**，非实股证据。
 **程序修复 2 条（未实施）／任务定义变更 1 条建议／真实模型增益 0**。
 **边界**：该仓库**无** `docs/audits/validate_latest.py`（实测不存在），故**不声称**通过验证器门禁。
-`report_created_commit_sha`: `PENDING_READBACK`。
+`report_created_commit_sha`: `b4084c93c8497f5ff0688845d0e48d164835b854`。
 
 
 **最新本地 Agent 产品轮**：[`2026-09-22_09-00-00_JST.md`](./2026-09-22_09-00-00_JST.md)  
