@@ -17,6 +17,20 @@ https://github.com/fy-god/intraday-tape-reader/blob/7b0404a8e8d1a3ea56b1498ad865
 
 ---
 
+## 2026-09-22 21:55 JST 追加（本线）：回归核对表 —— **3 条已修、4 条仍开、1 条不存在**，轮转基线已过期
+
+[2026-09-22_21-55-00_JST_ADDENDUM.md](./2026-09-22_21-55-00_JST_ADDENDUM.md)
+
+- `reviewed_source_sha` = `99934d619cfb30e0ac4aa90f59393c39ab62b4f6`；父报告 = `docs/audits/intraday/2026-09-22_21-40-00_JST.md`。
+- **基线更正（8 条逐条重取真值并独立复核）**：
+  - **已修、勿再回归（3）**：`IT-P0-001`（`session.py:46/87/156/159`，实测 14:57–15:00 = `close_auction` / `is_open=False` / `observable=True`）、`IT-P1-LIMIT-001`（`limit_board.py:210` 判定前移，实测 100 万→`at_limit_unqualified`、300 万→`sealed`）、`IT-P2-OBS-001`（`live_session.py:247/2883`，实测累计 5000 vs 本轮 450）。
+  - **仍开放（4）**：`IT-P0-002` 时区（`session.py:100` `_now_fn` 死参数，全树 `ZoneInfo|pytz|utcnow` **0** 命中，裸 `datetime.now()` **6** 处）、`IT-P1-SOURCE-EMPTY-001`（`engine.py:547-582` 仍以『未抛异常』为成功判据，实测全空时备用源调用 **0** 次）、`IT-P1-WINDOW-001`（`engine.py:313` change-only 追加；`ObservationInterval` 全树 85 命中、`src/tests/tools` **0**）、`active_snapshot['epoch']` 占位（`engine.py:1049` 是**读者**，**写者 0**；对照 `_universe_refresh_id` 有写者 `:758`）。
+  - **不存在**：`tests/test_full_day_simulation.py` 两树皆无（`git ls-files`/`git log --all` 无记录）—— 属**待新增**，**不得再当回归项**。
+- **降级标注**：`epoch` 占位**并非本线首报** —— 生产者自己的报告/计划已写明（`13-00-00:204,297`、`17-00-00:398`、`21-00-00:398`、`NEXT_STEPS:363`），本线只做独立确认。
+- 三条『已修』是**产品线自己的提交**修的，**不是本线**的代码贡献（本线只核对与更正）。
+- 手册 §4 基线本次**未修改**（硬约束：不创建/修改任何定时任务与排程），更正结论只写入本文档供人工同步。
+- 本轮 4 个只读子 agent 中 **2 个因 PowerShell 不支持 heredoc 失败**，已修正提示词重派；回归表结论**逐条经主 agent 复核**后才写入。
+
 ## 2026-09-22 21:40 JST 轮审（独立审计线）：`bf0b83b` 三项假绿修复**确认为真**，但肯定句留下同类残余假绿
 
 [2026-09-22_21-40-00_JST.md](./2026-09-22_21-40-00_JST.md)
