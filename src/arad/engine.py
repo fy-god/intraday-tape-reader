@@ -742,6 +742,14 @@ class Engine:
         self._universe_refreshed_at: float = 0.0
         #: 最近一次成功刷新股票池的完整性元数据（IT-P1-006）。
         self._universe_meta: dict[str, Any] = {}
+        #: IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001：**最近一次刷新尝试**
+        #: 的结局（与"当前生效的池"分开记）。云端 09:49 真实复现、我独立复核：
+        #: 全源失败时 `refresh_universe()` 返回 0 但 `_universe_meta` 不变，
+        #: 于是 `universe_truth()` 断供前后**逐字段相同**，消费者无从知道
+        #: 那份覆盖度是多久以前的。保留 active pool 是对的，**但必须能说出
+        #: 这份池子有多旧、上次尝试是成功还是失败**。
+        self._universe_attempt: dict[str, Any] = {}
+        self._universe_refresh_id = 0
         self._poll_count = 0
         self._errors = 0
         self._stop = False
@@ -976,6 +984,76 @@ class Engine:
         for key in ("last_attempt_at", "last_applied_at", "last_complete_at"):
             if key in meta:
                 out[key] = meta[key]
+
+        # --- Universe Refresh Truth v4（云端 09:49 / 12:03，WP01）------------
+        #
+        # 上面那些字段描述的是 **A. 当前生效的 active snapshot**。
+        # 它们**回答不了** **B. 最近一次 refresh attempt 发生了什么**。
+        #
+        # 我 09:00 轮把这两件事压在同一个 `_universe_meta` 上，实测后果
+        # （云端 09:49 真实复现，我独立复核）：
+        #   1. 先成功拿到 full pool；
+        #   2. 再让所有 universe provider 抛异常；
+        #   3. `refresh_universe() -> 0`；
+        #   4. `universe_truth()` **逐字段等于断供前**（两次调用 `==` 为 True）；
+        #   5. status 仍显示 coverage_active=93.85%。
+        # 消费者**无从知道**这个数是刚测的还是两小时前的。
+        #
+        # 所以拆成三块。**不"失败就清 meta"**（那会抹掉仍在生效的 active pool），
+        # 也**不"失败就完全不动"**（那就是现在这个缺陷）。
+        now_ep = time.time()
+        _refreshed_at = float(getattr(self, "_universe_refreshed_at", 0.0) or 0.0)
+        out["active_snapshot"] = {
+            "refresh_id": int(meta.get("refresh_id") or 0),
+            "source": meta.get("source"),
+            "applied_at": _refreshed_at or None,
+            "active_scan_codes": active_n,
+            "expected_total": exp_n,
+            "transport_complete": bool(transport_complete),
+            "coverage_active": out["coverage_active"],
+            "age_s": (round(now_ep - _refreshed_at, 3)
+                      if _refreshed_at else None),
+            "epoch": int(getattr(self, "_universe_epoch", 0) or 0),
+        }
+        attempt = dict(getattr(self, "_universe_attempt", {}) or {})
+        out["latest_attempt"] = attempt
+        # 顶层**扁平**镜像几个关键字段：`live_session.evaluate_health` 只读
+        # 扁平键，嵌套会让判决层"看不见"（那正是本缺陷的形态）。
+        out["attempt_status"] = str(attempt.get("status") or "")
+        out["last_attempt_at"] = attempt.get("attempt_at")
+        out["active_age_s"] = out["active_snapshot"]["age_s"]
+
+        # freshness：把"多久没成功刷新"变成一个可判决的数。
+        warn_s = 1800.0
+        fail_s = 3600.0
+        try:
+            cfg = getattr(self, "settings", None)
+            if cfg is not None:
+                warn_s = float(cfg.get("universe.refresh_seconds") or warn_s)
+                fail_s = warn_s * 2.0
+        except Exception:  # noqa: BLE001
+            pass
+        age = out["active_snapshot"]["age_s"]
+        if age is None:
+            state = "unknown"
+        elif age > fail_s:
+            state = "stale"
+        elif age > warn_s:
+            state = "aging"
+        else:
+            state = "fresh"
+        out["freshness"] = {
+            "state": state,
+            "age_s": age,
+            "warn_s": warn_s,
+            "fail_s": fail_s,
+            "last_applied_at": _refreshed_at or None,
+            "attempt_status": out["attempt_status"],
+            # **只有**"最近一次尝试成功应用"且"池子不陈旧"才算 fresh。
+            # 用 `applied` 而不是 `status == 'applied'` 是为了把
+            # applied_partial 也算作"生效"（它确实换了池子）。
+            "fresh": bool(attempt.get("applied")) and state in ("fresh", "aging"),
+        }
         return out
 
     def _bump_poll_count(self) -> int:
@@ -1077,6 +1155,28 @@ class Engine:
         """
         last_exc: Exception | None = None
         partial: tuple[int, list[Any], dict, Any] | None = None
+        # IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001：本次尝试的台账。
+        # 无论走哪条出口都要落一份 —— 云端 09:49 复现的问题正是"失败时不落账"。
+        self._universe_refresh_id += 1
+        _rid = self._universe_refresh_id
+        _attempt_at = time.time()
+        _attempt: dict[str, Any] = {
+            "refresh_id": _rid,
+            "attempt_at": _attempt_at,
+            "status": "unknown",
+            "source": None,
+            "applied": False,
+            "reason": "",
+        }
+
+        def _finish_attempt(status: str, *, source: object = None,
+                            applied: bool = False, reason: str = "") -> None:
+            _attempt.update({"status": status, "applied": bool(applied),
+                             "reason": reason})
+            _attempt["source"] = (None if source is None
+                                  else str(getattr(source, "name", source)))
+            self._universe_attempt = dict(_attempt)
+
         for src in self._universe_sources():
             name = getattr(src, "name", src)
             try:
@@ -1111,7 +1211,12 @@ class Engine:
             self._codes_raw = codes
             self._codes_pinned = False
             self._universe_refreshed_at = time.time()
+            meta = dict(meta)
+            meta["refresh_id"] = _rid
+            meta["source"] = str(name)
             self._universe_meta = meta
+            _finish_attempt("applied", source=src, applied=True,
+                            reason=str(meta.get("reason") or "完整结果"))
             self.log.info("股票池已刷新: %d 只（来源 %s）", len(codes), name)
             return len(codes)
 
@@ -1125,18 +1230,32 @@ class Engine:
                 self.log.warning(
                     "所有来源都只给出部分股票池；%s 仅 %d 只 < 现有 %d 只，"
                     "保留现有股票池以免缩小扫描范围", name, n, prev)
+                # 被拒**也要落账**：active pool 保留（对），
+                # 但消费者必须能看出"最近一次尝试没生效"。
+                _finish_attempt("rejected_smaller", source=src, applied=False,
+                                reason=f"部分池 {n} 只 < 现有 {prev} 只")
                 return 0
             codes = self._record_universe(pquotes)
             self._codes_raw = codes
             self._codes_pinned = False
             self._universe_refreshed_at = time.time()
+            meta = dict(meta)
+            meta["refresh_id"] = _rid
+            meta["source"] = str(name)
             self._universe_meta = meta
+            _finish_attempt("applied_partial", source=src, applied=True,
+                            reason=str(meta.get("reason") or "部分结果"))
             self.log.warning("股票池已用**部分**结果刷新: %d 只（来源 %s，%s）",
                              len(codes), name, meta.get("reason") or "未知原因")
             return len(codes)
 
         if last_exc is not None:
             self.log.warning("所有股票池来源都失败，保留原股票池: %s", last_exc)
+            _finish_attempt("all_failed", applied=False,
+                            reason=f"{type(last_exc).__name__}: {last_exc}")
+        else:
+            # 没抛异常但也没拿到任何可用结果（全空）。
+            _finish_attempt("empty", applied=False, reason="所有来源返回空")
         return 0
 
     def _record_universe(self, quotes: list[Any]) -> list[str]:

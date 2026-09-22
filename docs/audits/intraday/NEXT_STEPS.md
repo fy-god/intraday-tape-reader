@@ -1,44 +1,42 @@
-# NEXT_STEPS — 2026-09-22 09:00 JST
+# NEXT_STEPS — 2026-09-22 13:00 JST
 
 > 排序原则：**先解锁一批缺陷的公共堵点**，再做单点修复。
 > 每条都标了"为什么现在做这个"和"什么算做完"。
 >
-> 🔴 **09:00 轮结论（最重要的一句）**：
-> **`R-12` 不是"阈值再调一下"，是"分母根本不在事实链上"。** 我追了四轮的
-> 最高优先项，本轮闭合了它的"分母已知"那一半。
-> 云端 08:08 用**固定门禁、只改 provider 声明分母**的实验证明（我独立复现）：
+> 🔴 **13:00 轮结论（最重要的一句）**：
+> **我 09:00 轮加的 `universe_coverage` 判决项自己成了新的假绿来源。**
+> 我当时的约定是"分母未知 → 未测量 → ok"，约定本身没错，但我**漏了
+> "分母未知、事实却明确"的那一格**：
 >
 > ```
-> expected | active | active cov | 修前判决 | 修后判决
->     4200 |   4100 |     97.62% |   warn   |   ok
->     5913 |   4100 |     69.34% |   warn   |  fail
->     5913 |   4500 |     76.10% |  **ok**  |  fail   <-- 缺 24% 反而"更好看"
->     5913 |   5850 |     98.93% |   ok     |   ok
+> provider 自己说 transport_complete = False   <- 本次股票池被截断
 > ```
 >
-> **只要分母未知，`4500/5913 = 76.10%` 判 OK**，与 `4100/4200 = 97.62%`
-> 在 health 层**取值完全相同**。而 provider **早就算好了**分母
-> （Eastmoney `universe_info()`），Engine 也存进 `_universe_meta` ——
-> **但它零出口**（`git grep` 实证：全仓只有写入点与测试读它）。
+> 实测：分母未知 + `transport_complete=False` → 我的 gate 判
+> **`ok` / `healthy=True` / `fail=[]`**。
+> **这不是"无从判断"，是"可判而未判"** —— provider 已经把答案告诉我们了。
 >
-> **✅ 09:00 轮修复 2 条 + 1 处"我自己上一轮新代码的残留"**
+> **这是同一类错误的第 5 次**：21:00 交付账本零读者 → 05:00 累计缓存当逐轮量 →
+> 05:00 `_acked` 哈希序 → 05:00 `status()['universe']` 累计缓存 →
+> **09:00 本轮被指认**。共同形态：**把"我不知道"当成了"没问题"**。
+>
+> **✅ 13:00 轮修复 3 条（全部针对我 09:00 轮的新代码）**
 > | ID | 复核 | 修复 |
 > |---|---|---|
-> | `R-12 / IT-P1-UNIVERSE-DENOMINATOR-001` | **成立**，最高优先 | `universe_truth()` + `status()` 出口 + `universe_coverage` 判决项 |
-> | `IT-P2-OBS-EMPTY-ROUND-R1` / WP04 | **成立**（我上一轮的代码） | `_request_arithmetic()` / `_bump_poll_count()` 收口到唯一入口 |
-> | **测试自身缺陷** | — | 我的测试曾 `del Engine._wants_indices` 污染真实类，已改子类覆盖 |
+> | `IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001`（P1） | **成立** | 拆出独立 `universe_transport` 项，只读 `transport_complete` |
+> | `IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001`（P1） | **成立** | `active_snapshot`/`latest_attempt`/`freshness` 三账分离，四条出口全落账 |
+> | `IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001` / WP02 | **成立** | 每轮采样 + `_universe_session()` 取**最坏**，判决优先读会话级 |
 >
-> **1745 passed**（+25）/ 8 gate 全绿 / selftest 68-6-8-8 /
-> 回退验牙 **15 条行为级 RED / 0 结构性**。
+> **1764 passed**（+19）/ 8 gate 全绿 / selftest 68-6-8-8 /
+> 回退验牙 **14 条行为级 RED / 0 结构性**。
 >
-> 🔴 **仍未闭合（下一轮最高优先）**：`IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` ——
-> `_record_universe` 的 active membership **来源未改**。我本轮只把
-> transport 代码集与 active 集**分别导出**（`raw_unique_codes` vs
-> `active_scan_codes`）。改 membership 本身**会改变实际扫描集合**，风险大，
-> 必须配真实 provider 回放单独一轮做。
+> 🔴 **仍未闭合（下一轮最高优先，连续两轮）**：
+> `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` —— `_record_universe` 的
+> active membership **来源未改**。改它会**改变实际扫描集合**，
+> 必须配真实 provider 回放。
 >
-> **⬇ 本轮下调**：05:00 "让'扫描范围过小'不再被误判为健康" →
-> **那只解决了绝对只数口径；相对覆盖当时仍然全瞎，本轮才补上。**
+> **⬇ 本轮下调**：09:00 "分母未知 → 未测量 → ok" 当成**完备**处理 → **下调**：
+> 它漏了"分母未知但 provider 明说被截断"这一格，而这一格是**可判的**。
 >
 > **✅ 21:00 轮：修掉 17:40 本地轮与 20:10 云端轮各自独立指认的 7 条缺陷。**
 > **归属**：1.1–1.5 由 `17-40-00_JST.md` 轮先发现（§3.5 / §4 / 附录 A.1 / B.1），
@@ -321,7 +319,50 @@
 - **可证伪**：若真实长跑下 `refresh_universe` 调用次数远小于 poll 次数，
   本担心不成立。**我尚未测量这个次数** → 列为待验证。
 
-### D4（合并版）. 两个 bug 类的**系统性收口**（05:00 起，09:00 扩为两类）
+### D8. ✅（**13:00 已完成**）截断盲区 + 刷新尝试台账 + 会话级新鲜度
+- **13:00 轮已修**（详见 `2026-09-22_13-00-00_JST.md` §1）：
+  1. 拆出独立 `universe_transport` 判决项，只读 `transport_complete`
+     —— **不与 `universe_coverage` 合并**（证据来源不同，合并会互相掩盖）；
+  2. `active_snapshot` / `latest_attempt` / `freshness` 三账分离，
+     四条出口（`applied`/`applied_partial`/`rejected_smaller`/`all_failed`/`empty`）全落账；
+  3. 每轮采股票池新鲜度（只取标量）+ `_universe_session()` 聚合取**最坏**，
+     `evaluate_health` 优先读会话级而非 t0 快照。
+- **实测**：`transport_complete=False` → `ok/healthy=True` → **fail**；
+  全源失败后 `attempt_status` **不存在 → `all_failed`**，
+  两次 `universe_truth()` 逐字段相同 **`True → False`**；
+  t0 健康 + 会话 stale → `healthy=True` → **`False`**。
+- **仍未做的部分**：未加 partial refresh retry/backoff（WP06）；
+  `active_snapshot["epoch"]` 是**占位字段**（`_universe_epoch` 不存在，恒 0）。
+
+### D9. 🔴 **"未测量"必须有穷尽的前置条件**（**13:00 新增，最高优先**）
+- **证据（我本人是反例，且是同一错误的第 5 次）**：
+  | # | 轮次 | 形态 |
+  |---|---|---|
+  | 1 | 21:00 | 交付账本数据层有了、判决层零读者 |
+  | 2 | 05:00 | `len(state.quotes)` 累计缓存当逐轮量 → `no_data_rounds` 恒 0 |
+  | 3 | 05:00 | `_acked` 哈希序裁剪丢掉刚 ack 的 |
+  | 4 | 05:00 | `status()['universe']` 用累计缓存 → 看板高报 |
+  | **5** | **09:00（13:00 被指认）** | **新 gate 把"provider 明说被截断"归入"未测量"** |
+  共同形态：**把"我不知道"当成了"没问题"**，而没有先把已知坏情况逐个排除。
+- **做法**：规定每个判 `not_measured` 的分支**必须逐条枚举**它排除了哪些
+  已知坏情况，并各配一条测试；可做成门禁扫描。
+- **可证伪**：若穷举后从未发现遗漏，这条规矩无用。
+  —— 本轮它**当场抓到 1 条**（`transport_complete=False`），**反证不成立**。
+- **验收**：`test_transport_and_coverage_are_separate_evidence`
+  （断言同一输入下两项结论**不同**）已落地。
+
+### D10. 健康判决必须能回答"**这份结论有多旧**"（**13:00 新增**）
+- **证据**：本轮 RED 2 实测 —— 全源失败后 `universe_truth()` **逐字段不变**，
+  消费者看到 `coverage_active=93.85%` 却**不知道**它是刚测的还是两小时前的。
+  更普遍：`exit 0` 的含义是"我检查的 N 件事**此刻**都过了"，
+  **不是**"系统在过去一小时内健康"；而 soak 是**数小时**连续运行，
+  用户读到的显然是后者。
+- **做法**：给每个判决项附 `observed_at`；要求最终结论基于
+  **会话级最坏**而非**起点快照**（本轮已在 universe 轴落地，应推广到全部判决项）。
+- **可证伪**：若真实长跑里 t0 快照与会话最坏**从不**不同，这条规矩无用。
+  —— 本轮已构造出二者不同的情形，**反证不成立**。
+
+### D4（合并版）. 两个 bug 类的**系统性收口**（05:00 起，09:00 扩为两类，13:00 +1）
 - **现状**：该 bug 类（**有界容器/累计缓存的长度被当作完整总量**）已确认 **5 个实例**：
   | # | 位置 | 状态 |
   |---|---|---|

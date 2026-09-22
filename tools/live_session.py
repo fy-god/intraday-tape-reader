@@ -187,6 +187,20 @@ UNIVERSE_WARN_ABS = 4500
 UNIVERSE_COV_FAIL = 0.90
 UNIVERSE_COV_WARN = 0.95
 
+#: IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001（云端 09:49 / 12:03）：
+#: 活跃股票池的**陈旧度**门禁（秒）。
+#:
+#: 为什么需要：全源刷新失败时 `refresh_universe()` 返回 0 但**不更新**
+#: `_universe_meta` —— 保留 active pool 是对的（不能因一次失败就抹掉扫描集），
+#: 但实测 `universe_truth()` 在断供前后**逐字段相同**，
+#: 消费者**无从知道**那份 "coverage_active=93.85%" 是多久以前的。
+#: 没有这两条线，"上次成功"会被读成"现在健康"。
+#:
+#: 上限取 2 倍默认刷新周期（默认 1800s）—— 超过两个周期没成功刷新，
+#: 扫描范围已不足以代表当前全市场。
+UNIVERSE_AGE_WARN_S = 1800.0
+UNIVERSE_AGE_FAIL_S = 3600.0
+
 EXIT_HEALTHY = 0
 EXIT_UNHEALTHY = 1
 EXIT_NO_DATA = 2
@@ -274,6 +288,7 @@ def make_round_sample(
     history_maxlen: int,
     watchlist_only: bool,
     observation: dict | None = None,
+    universe_truth: dict | None = None,
 ) -> dict:
     """把一轮的观测值收敛成一个 plain dict（纯函数，便于离线造样本）。
 
@@ -412,7 +427,110 @@ def make_round_sample(
                 out["coverage"] = None
         out["observation_missing_fields"] = [
             k for k in _OBSERVATION_VALUE_FIELDS if k not in obs]
+    # --- WP02 / IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001 --------------------
+    #
+    # 云端 12:03：`setup` 只在 soak **开始前**取一次 `universe_truth`，
+    # 于是 soak 中途发生的 universe 刷新失败**永远进不了最终判决** ——
+    # final verdict 用的是 t0 快照。
+    #
+    # 所以每轮都采一份**新鲜度**（只取标量，避免无界载荷），
+    # 由 `summarize_rounds` 聚合成"最新/最坏"。
+    if isinstance(universe_truth, dict) and universe_truth:
+        _fresh = universe_truth.get("freshness")
+        _fresh = _fresh if isinstance(_fresh, dict) else {}
+        _attempt = universe_truth.get("latest_attempt")
+        _attempt = _attempt if isinstance(_attempt, dict) else {}
+        out["universe_attempt_status"] = str(
+            universe_truth.get("attempt_status")
+            or _attempt.get("status") or "")
+        out["universe_fresh_state"] = str(_fresh.get("state") or "unknown")
+        out["universe_age_s"] = _safe_float(_fresh.get("age_s"))
+        out["universe_transport_complete"] = bool(
+            universe_truth.get("transport_complete"))
+        out["universe_refresh_id"] = _safe_int(_attempt.get("refresh_id"))
+        out["universe_truth_fields"] = sorted(str(k) for k in universe_truth)
     return out
+
+
+def _universe_truth_now(engine: Any) -> dict | None:
+    """安全取一次 ``engine.universe_truth()``（**绝不抛**）。
+
+    soak 是长时间跑的：可观测性取数失败不能打断主链路，
+    但也不能静默 —— 失败返回 ``None``，由聚合方判"未测量"。
+    """
+    try:
+        fn = getattr(engine, "universe_truth", None)
+        if not callable(fn):
+            return None
+        got = fn()
+        return got if isinstance(got, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _universe_session(rows: Sequence[dict]) -> dict:
+    """逐轮股票池样本 -> 会话级新鲜度（纯函数，WP02）。
+
+    **为什么必须存在**（云端 12:03 的
+    `IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001`）：
+    `setup['universe_truth']` 只在 soak **开始前**取一次。如果 soak 跑到一半
+    universe 刷新开始连续失败，最终判决用的**仍然是 t0 那份快照** ——
+    中途的失效结构上进不了结论。
+
+    这里把每轮采到的（`make_round_sample` 写入）
+    `universe_attempt_status` / `universe_fresh_state` / `universe_age_s` /
+    `universe_transport_complete` 聚合成会话级事实。
+
+    口径纪律：
+    * `worst_state` 取**最坏**（stale > aging > fresh > unknown），
+      判决读它 —— "中途曾坏过"不能被"最后又好了"抹掉。
+    * `rounds_not_applied` 数"最近一次刷新尝试未生效"的轮数；
+      `attempt_statuses` 给出**实际出现过**的状态集合，便于对账。
+    * 老轮样本没有这些键 -> `measured=False`，消费方据此跳过（不判红）。
+    """
+    _order = {"stale": 3, "aging": 2, "fresh": 1, "unknown": 0}
+    states: dict[str, int] = {}
+    statuses: dict[str, int] = {}
+    ages: list[float] = []
+    not_applied = 0
+    transport_incomplete = 0
+    ids: list[int] = []
+    for r in rows:
+        if "universe_fresh_state" not in r and "universe_attempt_status" not in r:
+            continue
+        st = str(r.get("universe_fresh_state") or "unknown")
+        states[st] = states.get(st, 0) + 1
+        at = str(r.get("universe_attempt_status") or "")
+        if at:
+            statuses[at] = statuses.get(at, 0) + 1
+            if at not in ("applied", "applied_partial"):
+                not_applied += 1
+        if r.get("universe_transport_complete") is False:
+            transport_incomplete += 1
+        age = r.get("universe_age_s")
+        if isinstance(age, (int, float)) and not isinstance(age, bool):
+            ages.append(float(age))
+        rid = r.get("universe_refresh_id")
+        if isinstance(rid, int) and not isinstance(rid, bool) and rid > 0:
+            ids.append(rid)
+    if not states and not statuses:
+        return {"measured": False}
+    worst = max(states, key=lambda k: _order.get(k, 0)) if states else "unknown"
+    return {
+        "measured": True,
+        "rounds": len(rows),
+        "states": states,
+        "worst_state": worst,
+        "attempt_statuses": statuses,
+        "rounds_not_applied": not_applied,
+        "rounds_transport_incomplete": transport_incomplete,
+        # 最新 = 最后一轮观测到的；最坏 = 全程最坏。判决读 worst。
+        "last_state": (str(rows[-1].get("universe_fresh_state") or "unknown")
+                       if rows else "unknown"),
+        "max_age_s": (round(max(ages), 3) if ages else None),
+        "last_age_s": (round(ages[-1], 3) if ages else None),
+        "refresh_ids_seen": len(set(ids)),
+    }
 
 
 def summarize_rounds(rounds: Sequence[dict], *,
@@ -732,6 +850,11 @@ def summarize_rounds(rounds: Sequence[dict], *,
         "alerts_by_kind": by_kind,
         "quotes": _edge(quotes),
         "universe": _edge(universe),
+        # --- WP02 / IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001 ---------------
+        # 会话级股票池新鲜度。**必须**有这一层：`setup` 只在 soak 前取一次
+        # universe_truth，中途发生的刷新失败**永远进不了最终判决**。
+        # 这里给出"最新"与"最坏"两口径，判决读最坏的那个。
+        "universe_session": _universe_session(rows),
         "watchlist_only_rounds": watch_only_rounds,
         "fell_back_to_watchlist": bool(rows) and watch_only_rounds >= len(rows),
         "memory_samples": [
@@ -1428,6 +1551,10 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         _cov_u = _ut.get("coverage_usable")
         _f_cov = _safe_float(tol.get("coverage_active_fail"), UNIVERSE_COV_FAIL)
         _w_cov = _safe_float(tol.get("coverage_active_warn"), UNIVERSE_COV_WARN)
+        # IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001（云端 09:49 / 12:03）：
+        # `transport_complete` 是**不需要分母**就能知道的硬事实。
+        _t_complete = _ut.get("transport_complete")
+        _t_known = isinstance(_t_complete, bool)
 
         def _f(v: object) -> float | None:
             """脏值安全转 float —— **判决层绝不许因为脏值抛异常**。
@@ -1472,8 +1599,126 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
                 f"全市场覆盖 active {_act}/{_exp} = {_pct(_cov_a)}"
                 f"（transport {_pct(_cov_t)}、usable {_pct(_cov_u)}；"
                 f"reported={_raw}/{_use}）", level="ok")
+
+        # --- IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001 ----------------
+        #
+        # 为什么必须有**独立**这一项（云端 09:49 发现、12:03 复核）
+        #
+        # 我 09:00 轮加 `universe_coverage` 时，把"分母未知"一律归入
+        # **未测量 -> ok**。这个约定本身是对的（无 numeric total 时确实算不出
+        # 比例），但我**漏了一种"分母未知但事实明确"的情况**：
+        #
+        #   provider 自己说 `transport_complete=False`
+        #   —— 本次 universe **被截断/没翻全**。
+        #
+        # 实测（我独立复现云端场景）：
+        #   denominator_kind='unknown', expected_total=0, coverage_active=None,
+        #   transport_complete=**False**
+        # -> 我的 gate 判 `ok`，`healthy=True / exit=0 / fail=[]`。
+        #
+        # 这**不是**"分母未知所以无从判断"，而是
+        # **provider 已经明确告诉我们结果不完整，health 却把它归入未测量。**
+        # 前者是诚实的无知，后者是**可判而未判** —— 又是一种假绿。
+        #
+        # 所以拆成独立项：`universe_coverage` 管"比例算不算得出"，
+        # `universe_transport` 管"provider 说全不全"。二者证据来源不同，
+        # 不能合并 —— 合并就会让其中一个被另一个的"未测量"掩盖。
+        if not _t_known:
+            add("universe_transport", True,
+                "无 transport_complete 字段，无法判定（跳过不算失败）",
+                level="ok")
+        elif _t_complete:
+            add("universe_transport", True,
+                f"provider 声明传输完整（reported={_raw}/{_use}，"
+                f"分母{'已知' if _exp > 0 else '未知'}）", level="ok")
+        else:
+            _short = _safe_int(_ut.get("shortfall"))
+            _reason = str(_ut.get("reason") or "")
+            add("universe_transport", False,
+                f"**provider 声明本次股票池被截断**（transport_complete=False"
+                + (f"，缺口 {_short} 只" if _short else "")
+                + (f"，原因：{_reason}" if _reason else "")
+                + "）—— 这是**不需要分母**就能确定的硬事实；"
+                  "此期间'没有告警'不能解释为'没有异动'", level="fail")
+
+        # --- IT-P1-UNIVERSE-META-STALE-AFTER-FAILED-REFRESH-001 --------------
+        #
+        # 云端 09:49 真实复现、我独立复核：全源失败时 `refresh_universe()`
+        # 返回 0 但**不更新** `_universe_meta`，于是 `universe_truth()`
+        # **逐字段等于断供前** —— 实测两次调用 `ut1 == ut2` 为 `True`，
+        # 且**没有** `attempt_status` / `last_attempt_at` 字段。
+        #
+        # 保留 active pool 是**对的**（不能因为一次刷新失败就把扫描集抹掉），
+        # 但消费者**无从知道**这份 "coverage_active=93.85%" 是多久以前的。
+        # 陈旧度必须可判 —— 否则"上次成功"会被读成"现在健康"。
+        _age = _f(_ut.get("active_age_s"))
+        _att = str(_ut.get("attempt_status") or "")
+        _age_fail = _safe_float(tol.get("universe_age_fail_s"),
+                                UNIVERSE_AGE_FAIL_S)
+        _age_warn = _safe_float(tol.get("universe_age_warn_s"),
+                                UNIVERSE_AGE_WARN_S)
+        # WP02 / IT-P1-HEALTH-COVERAGE-SNAPSHOT-PRELOOP-001：`setup` 的
+        # universe_truth 只是 **t0 快照**。soak 中途发生的刷新失败必须也能
+        # 进入判决 —— 否则"跑着跑着股票池全刷不出来了"仍会拿到绿灯。
+        # 会话级聚合取**最坏**：中途曾坏过，不能被"最后又好了"抹掉。
+        _sess = (metrics.get("universe_session")
+                 if isinstance(metrics.get("universe_session"), dict) else {})
+        if _sess.get("measured"):
+            _worst = str(_sess.get("worst_state") or "unknown")
+            _na = _safe_int(_sess.get("rounds_not_applied"))
+            _ti = _safe_int(_sess.get("rounds_transport_incomplete"))
+            # 会话级事实**优先**：它是整场 soak 的实况，t0 快照只是起点。
+            if _worst == "stale":
+                add("universe_freshness", False,
+                    f"会话期间活跃股票池曾陈旧（最坏 {_worst}，"
+                    f"最长 {_sess.get('max_age_s')}s；"
+                    f"{_na} 轮刷新未生效）", level="fail")
+            elif _worst == "aging":
+                add("universe_freshness", True,
+                    f"会话期间活跃股票池曾偏旧（最坏 {_worst}，"
+                    f"最长 {_sess.get('max_age_s')}s）", level="warn")
+            elif _na > 0:
+                add("universe_freshness", True,
+                    f"会话期间有 {_na} 轮股票池刷新**未生效**"
+                    f"（状态：{_sess.get('attempt_statuses')}）—— "
+                    f"活跃池已偏离全市场但尚未超时", level="warn")
+            else:
+                add("universe_freshness", True,
+                    f"会话期间股票池新鲜（{_sess.get('states')}）", level="ok")
+        elif _age is None and not _att:
+            add("universe_freshness", True,
+                "无活跃快照时间/刷新尝试信息，无法判定（跳过不算失败）",
+                level="ok")
+        elif _att and _att != "applied":
+            # 最近一次尝试**没有**被采用（all_failed / rejected_smaller）。
+            _lvl = "warn" if (_age is not None and _age < _age_warn) else "fail"
+            add("universe_freshness", _lvl != "fail",
+                f"最近一次股票池刷新**未生效**（attempt_status={_att}）"
+                + (f"，当前活跃池已 {_age:.0f}s 未更新"
+                   if _age is not None else "")
+                + " —— 扫描范围可能已不反映全市场", level=_lvl)
+        elif _age is not None and _age > _age_fail:
+            add("universe_freshness", False,
+                f"活跃股票池已 {_age:.0f}s 未成功刷新"
+                f"（上限 {_age_fail:.0f}s）—— 区间可能已大幅变化",
+                level="fail")
+        elif _age is not None and _age > _age_warn:
+            add("universe_freshness", True,
+                f"活跃股票池已 {_age:.0f}s 未成功刷新"
+                f"（警戒 {_age_warn:.0f}s，上限 {_age_fail:.0f}s）",
+                level="warn")
+        else:
+            add("universe_freshness", True,
+                f"活跃股票池新鲜（{'未提供 age' if _age is None else f'{_age:.0f}s'}）",
+                level="ok")
     else:
         add("universe_coverage", True,
+            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            level="ok")
+        add("universe_transport", True,
+            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            level="ok")
+        add("universe_freshness", True,
             "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
             level="ok")
 
@@ -2193,6 +2438,9 @@ def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
             history_maxlen=maxlen,
             watchlist_only=bool(codes) and len(codes) <= len(watch),
             observation=obs_snapshot,
+            # WP02：每轮采一份股票池**新鲜度**。setup 那份是 t0 快照，
+            # 中途的刷新失败只有靠这里才能进最终判决。
+            universe_truth=_universe_truth_now(engine),
         )
         rounds.append(sample)
 
