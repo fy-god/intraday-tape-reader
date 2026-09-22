@@ -1,67 +1,74 @@
 # 最新审计
 
-**最新云端独立审计**：[`2026-09-23_00-12-42_JST.md`](./2026-09-23_00-12-42_JST.md)  
-**最新云端 Agent 任务书**：[`2026-09-23_00-12-42_JST_AGENT_TASK.md`](./2026-09-23_00-12-42_JST_AGENT_TASK.md)  
+**最新云端独立审计**：[`2026-09-23_04-05-42_JST.md`](./2026-09-23_04-05-42_JST.md)  
+**最新云端 Agent 任务书**：[`2026-09-23_04-05-42_JST_AGENT_TASK.md`](./2026-09-23_04-05-42_JST_AGENT_TASK.md)  
 **最新本地 Agent 产品轮**：[`2026-09-22_21-00-00_JST.md`](./2026-09-22_21-00-00_JST.md)  
 **最新产品提交 / reviewed_source_sha**：`bf0b83bf212f169c720ca8a1c5108405c18a9712`  
-**本轮审计开始 docs HEAD**：`04abd419e74fb5c641f9800886fcdfa58b326f62`  
-**report_commit_sha**：`83841da3e92080d0504177605d758b06d9319568`  
-**agent_task_commit_sha**：`4176f5c86f800afcf7bbfcf6345535ed27bfc3d8`  
+**本轮审计开始 docs HEAD**：`1d0ab19727c24dada1373931e79baa5712c99c75`  
+**report_commit_sha**：`6afb3a6dcff3a6673f32ca50389361ccdc893ee0`  
+**agent_task_commit_sha**：`ef4ea0b79345461eeeb0d830897eb19a6509bf7e`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/04abd419e74fb5c641f9800886fcdfa58b326f62/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/1d0ab19727c24dada1373931e79baa5712c99c75/docs/audits/intraday/LATEST.md
 
-> 产品版本更正：上一版 LATEST 仍写 `6c8f11e...`；当前最新真实产品提交已经是
-> `bf0b83bf212f169c720ca8a1c5108405c18a9712`。`bf0b83b..04abd419` 只有 docs 变化。
-> 历史报告文件均保留；本文件只移动接续指针，上一版完整长索引固定在上面的不可变 commit。
+> `bf0b83b..1d0ab197` 只有 docs 变化；历史报告文件均保留。本文件只移动当前接续指针。
 
-## 2026-09-23 00:12:42 JST
+## 2026-09-23 04:05:42 JST
 
-主实验：`EXP-IT-EVIDENCE-COMPLETENESS-006`
+主实验：`EXP-IT-MEMBERSHIP-007`
 
-当前最高优先：
-1. `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`
-2. `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（本轮新）
-3. `IT-P1-UNIVERSE-COVERAGE-SESSION-WITHOUT-T0-001`（本轮新）
-4. `IT-P2-UNIVERSE-FRESHNESS-POSITIVE-USES-EVIDENCED-SUBSET-001`（按 P1 执行）
-5. `IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`
-6. `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001`
-7. `IT-P1-SOURCE-EMPTY-001`
-8. `IT-P0-002-TZ-R1`（当前严重度 P1）
-9. `IT-P1-WINDOW-001`
+### 本轮最高优先
 
-### 本轮新增机制证据
+`IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001`
 
-- `summarize_rounds()` 已经有 `metrics['universe'].min`，但绝对 `universe` health 只读 t0 `setup.universe_size`：
-  t0=5000、session min=2000、denominator unknown 时，session 绝对缩池缺少 consumer。
-- session active coverage 的 merge 仍位于 `if setup.universe_truth` 分支内：
-  t0 truth 缺失但 session 已测到 75% coverage 时，当前 consumer 仍可能按“未测量”跳过。
-- 22:45 已验证：`universe_size=0` + denominator unknown 可全绿；`active>0` 被 scope 直接命名为 `full_market`，不看 magnitude。
-- 22:15 已验证：1/30 fresh evidence 仍可产生整个 session 的 fresh 肯定句。
+仓库现成停牌 fixture：
+
+```text
+base members = 5913
+new codes = 10
+raw_unique / expected = 5923
+invalid-price old members = 370
+usable quotes = 5553
+transport_complete = True
+```
+
+固定产品当前调用链仍是：
+
+```text
+Eastmoney universe -> usable Quote[]
+Engine _record_universe(quotes) -> active codes
+```
+
+所以这个 fixture 中可以出现：
+
+```text
+10/10 new codes enter
+但 370 old market members 离开 active scan
+active = 5553 / 5923 = 93.75%
+```
+
+现有 `test_new_listings_enter_pool` 只断言新 code 进入，并未断言旧 suspended/raw members 留在 `_codes`。
 
 ### 主改造
 
-**Universe Evidence Completeness Contract v2**：
-- `None != 0`；
-- universal positive wording 必须 `measured_rounds == total_rounds`；
-- `full_market` 必须有 magnitude/coverage 证据；
-- t0 与 session 同轴证据独立解析后取最坏显式证据；
-- session absolute min 与 session numeric coverage 都必须有 consumer。
+**Universe Membership Truth Contract v1**
 
-### 本轮本地软件实验
+分开：
 
-枚举 `scope evidence × freshness evidence × session min active size × denominator` 共 **128** 个 deterministic contract cases；候选合同在其中 62 个格子更严格。**62/128 不是 bug 率、线上故障率或发生概率**，只表示人工枚举状态空间中的判决差异。
+```text
+transport membership
+quote usability
+active scan membership
+current snapshot availability
+```
 
-### 下一轮关键产物
+禁止用假 zero-price Quote 保 membership。
 
-- `universe_evidence_cases.json`
-- `membership_cases.json`
-- `source_empty_cases.json`
-- `timezone_cases.json`
-- `observation_interval_cases.json`
-- `per_code_provenance.json`
-- `full_pytest.log`
-- `check_*.py` logs
-- `RUN_MANIFEST.json`
-- `NEXT_STEPS.md`
+### 新 P2
 
-模型训练：0；真实 Precision/Recall/漏事件率/交易收益仍 `unavailable`。
+`IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001`：无 numeric total 时分页当前以 `page.quotes` 空作为到底；raw members 存在但全不可用时可能提前停止。需真实 repo RED 后再决定是否升级。
+
+### 下一轮
+
+membership 独立 diff → unknown-total pagination → reconcile → SourceManager [] → Timezone → ObservationInterval → provenance → research。
+
+模型训练：0；真实 Precision/Recall/漏事件率/收益 unavailable。
