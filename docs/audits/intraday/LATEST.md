@@ -3,12 +3,13 @@
 **最新本地 Agent 产品轮**：[`2026-09-22_17-00-00_JST.md`](./2026-09-22_17-00-00_JST.md)  
 **最新云端独立审计**：[`2026-09-22_16-13-10_JST.md`](./2026-09-22_16-13-10_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_16-13-10_JST_AGENT_TASK.md`](./2026-09-22_16-13-10_JST_AGENT_TASK.md)  
+**最新盘中预警本地审计**：[`2026-09-22_16-20-44_JST.md`](./2026-09-22_16-20-44_JST.md)  
 **最新产品提交 / reviewed_source_sha**：`c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`  
 **本轮审计开始 docs HEAD**：`50047d7c58e4fc75a93ccddf7d0b2eb7299cf8e1`  
 **report_commit_sha**：`c93a80d5679f2927eabbf595b544b6c4bf4008d8`  
 **agent_task_commit_sha**：`1e74a661f5c46b73270e14c02227e079914df716`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/50047d7c58e4fc75a93ccddf7d0b2eb7299cf8e1/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/6c8f11e363b3efcd21e410a5af7a718e08e8564d/docs/audits/intraday/LATEST.md
 
 > 重要更正：上一版顶部把 docs audit commit `96e9...` 标成“最新被审产品 SHA”。
 > 本轮已经按 `c4f2ce1..50047d7c58e4fc75a93ccddf7d0b2eb7299cf8e1` compare 重新核对：这段只有 docs 变化，
@@ -16,6 +17,55 @@ https://github.com/fy-god/intraday-tape-reader/blob/50047d7c58e4fc75a93ccddf7d0b
 
 ---
 
+## 2026-09-22 16:20:44 JST 本地审计轮（Health Consumer Contract 复核）
+
+**报告**：[`2026-09-22_16-20-44_JST.md`](./2026-09-22_16-20-44_JST.md)　**审计起点 HEAD**：`1b73270f83476ad24d09cc9f21d0ff44b2482f00`
+　**审计终点 HEAD**：`6c8f11e363b3efcd21e410a5af7a718e08e8564d`
+
+**上一版完整 LATEST 历史索引（不可变快照，本轮接续前的版本）**：
+https://github.com/fy-god/intraday-tape-reader/blob/50047d7c58e4fc75a93ccddf7d0b2eb7299cf8e1/docs/audits/intraday/LATEST.md
+
+- `execution_status`: `COMPLETED`　`evidence_status`: `VERIFIED`　`evidence_type`: `SOFTWARE_SAMPLE`。
+- **测试真数**：`1b73270` → **1764 passed**；`6c8f11e` → **1791 passed**（+27），均 `0 failed / 0 skipped`、exit 0。
+- **并发写入如实记录**：我以「未提交工作区改动」为对象完成取证后，作者在审计中途把它提交成 `6c8f11e`，
+  且 `tools/live_session.py` 与 `tests/test_health_consumer_contract.py` **内容又变了**（155,261 B vs 154,570 B；
+  22,847 B vs 20,595 B）⇒ **全部测量已在提交版上重做**，行号均取自 `6c8f11e`。
+
+### ✅ 我在提交版上**独立验证成立**的修复（带负控制）
+
+| 项 | 我的验证 |
+|---|---|
+| `IT-P1-UNIVERSE-TRANSPORT-TRISTATE-R1` | 冷启动 `transport_complete` = **`None`**（修前 `False`）；`make_round_sample` 保住 `None`；`_universe_session` 不计入截断；判决输出「**未测量**」而非「provider 声明截断」；**负控制**：显式 `False` 仍 `FAIL`、`healthy=False` |
+| `IT-P1-UNIVERSE-TRANSPORT-SESSION-BLIND-001` | **变异测试**：`rounds_transport_incomplete` 0→1 使**完整判决签名改变**、`universe_transport` `ok→fail` |
+| `IT-P1-HEALTH-SESSION-WITHOUT-T0-001` | setup 缺 `universe_truth` 时 `healthy=False`、`universe_freshness=fail`（不再整段跳过） |
+| `IT-P1-UNIVERSE-WATCHLIST-FALLBACK-SESSION-BLIND-001` | 矩阵实测 0/30 `ok`、**1/30 `fail`**、29/30 `fail`、30/30 `fail` —— 29/30 那一档确实不再漏 |
+
+### 🔴 本轮**新增**发现（尚未修复）
+
+- **`IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`（P1，已确认错误）**：
+  `tools/live_session.py:1591-1592`。代理 `:2644` `watchlist_only = bool(codes) and len(codes) <= len(watch)`
+  把**空扫描集**（`codes=0`）折叠成「非降级」，消费者于是输出**肯定句**「会话期间未降级为仅自选股（**全程全市场扫描**）」。
+  **真实 Engine 端到端复现**：刷到 5000 只后清空 `_codes`、`state.quotes` 仍留 5000 → 轮样本 `universe=0 / quotes=5000` →
+  `healthy=True`、`fail=[]`。「扫描集整个空了」与「正常全市场」在判决上**不可区分**。
+  这是本轮主题的**第三形态**：修「不知道→有罪」的同时留下「**空→全市场**」。
+- **`IT-P2-UNIVERSE-SCOPE-UNMEASURED-DEAD-GUARD-001`（P2，已确认错误）**：
+  `:552-554` 的 `ever_watchlist_only = bool(watch_only)` **恒为 `bool`**，故 `:1576` 的
+  `elif _w_ever is None:`（「无法判定」）**结构上不可达**；生产者已经算对的 `watchlist_only_ratio is None`
+  （「未测到」）**有出口、零消费者**，被 `ever=False` 顶掉后走 `else` 输出肯定句。
+  这与本仓库反复出现的「判决层零读者」是同一形态的新一例。
+- **`IT-P3-UNIVERSE-WATCHLIST-PROXY-COUNT-001`（P3，待验证风险／`未复现`）**：
+  `:2644` 用**数量比较**猜意图（`len(codes) <= len(watch)`），而作者自己在 `:1570` 写下
+  「绝不能靠"股票数很少"猜意图」。反例实测：`codes=8 / watch=20` → 被判「降级为仅自选股」。
+  **降级理由**：同一输入下 `universe` 项在**修前就**判红、`healthy` 两版皆 `False`，
+  故不是新放行，只是**新增一条措辞错误**的失败原因；且未找到真实生产证据。
+
+### 未做到的取证
+
+`docs/audits/intraday/` 下**全部 11 个已提交 JSON 均不含 `universe_session` 键**、也无可用的
+`rounds` 数组 ⇒ 上述缺陷**无法**在归档真实运行上交叉核对，**不给真实发生率**。
+未跑真实 soak／训练／评估。
+
+---
 ## 2026-09-22 17:00 JST 本地 Agent 产品轮（**撤回我 13:00 轮的"3 项全部成立"**）
 
 - 起点 HEAD `c4f2ce1` → pull 到 `1b73270`（只见审计文档）；
