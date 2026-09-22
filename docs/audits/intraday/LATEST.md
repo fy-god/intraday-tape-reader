@@ -1,16 +1,105 @@
 # 最新审计
 
 **最新本地 Agent 产品轮**：[`2026-09-22_13-00-00_JST.md`](./2026-09-22_13-00-00_JST.md)  
+**最新独立审计**：[`2026-09-22_13-32-18_JST.md`](./2026-09-22_13-32-18_JST.md)  
 **最新云端独立审计**：[`2026-09-22_12-03-20_JST.md`](./2026-09-22_12-03-20_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-22_12-03-20_JST_AGENT_TASK.md`](./2026-09-22_12-03-20_JST_AGENT_TASK.md)  
-**最新被审产品 SHA**：`369b13f0d6f20fc22198abf51469ee14e49c84dc`  
-**审计时间**：2026-09-22 12:03:20 JST  
+**最新被审产品 SHA**：`c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`  
+**审计时间**：2026-09-22 13:32:18 JST  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/bba01b1751ca3c2214dcd09f8321578634bf56a3/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2/docs/audits/intraday/LATEST.md
 
 > 历史报告文件没有删除或覆盖；为避免把 30KB+ 历史索引每轮重复复制并引入冲突，旧索引正文固定保留在上面的不可变 commit 快照中。本文件只移动“当前接续”指针。
 
 ---
+## 2026-09-22 13:32 JST 独立审计（判决层仍在读 t0 快照 —— 第 6 次"数据层有了、判决层零读者"）
+
+- 审计 HEAD = `reviewed_source_sha = c4f2ce107f9c1dafaefbec8310934d8e0fdd2ee2`；
+  `git status --porcelain` 空、`stash` 空（审计前后一致）。
+- 独立实测：**1764 passed in 74.31s**（`exit=0`）；`check_*.py` **8/8 `exit=0`**；
+  `selftest` **`exit=0`**（962 条 / 68 告警 / 6 类型 / 类型级 8-8）。
+- 本仓库**没有** `docs/audits/validate_latest.py`（也无其测试）⇒ 手册 §2 step 5 的
+  gate **N/A**，本轮**不声明任何 gate pass**。
+
+### 🔴 两处会话级事实已算出、判决层零读者
+
+`c4f2ce1` 为**新鲜度**接通了会话级聚合（`worst_state`，真进步），
+但同轮的另两个会话级事实仍是"数据层有了、判决层零读者"：
+
+| # | 会话级事实 | 判决实际读的 | 后果 |
+|---|---|---|---|
+| **1.1** | `fell_back_to_watchlist`（`live_session.py:859`，=`watch_only_rounds >= len(rows)`） | 只读 **`setup` t0 快照**（`:1495`） | **全场退化成仅自选股 = `healthy=True/exit=0`** |
+| **1.2** | `rounds_transport_incomplete`（`:526`） | 只读 t0 的 `transport_complete` | 中途被截断 = 绿灯 |
+
+**1.1 更严重**（实测）：`setup=False` + 顶层 `True`（3/3 轮退化，真实 `make_round_sample`→
+`summarize_rounds` 产出）→ `healthy=True exit=0`，`universe` 还显示"扫描池 5000 只"（t0 数字）；
+对照组让 `setup=True` → `healthy=False exit=1 fail=['universe']`。
+**扫描集合整体消失**被读成健康。
+
+**1.2**：`_ti = _safe_int(_sess.get("rounds_transport_incomplete"))`（`:1669`）在 **2837 行**里
+出现 **1 次**，是 `Store` 不是 `Load`；子 agent 的 `dis()` 反汇编只得一条 `STORE_FAST _ti`，
+**无 `LOAD_FAST`**；**1008 组配置**逐一比较完整判决签名 → **0 组有差异**。
+对照实验（基线先绿）：只改 `rounds_transport_incomplete` 0→12 ⇒ 判决与基线**逐项相同**；
+只改 `worst_state` fresh→stale ⇒ 立刻判红。
+
+### 附带洞：t0 缺 `universe_truth` 时会话事实被整体跳过
+
+`_sess` 消费块嵌在 `if isinstance(_ut, dict) and _ut:`（`:1543`）**内部** ⇒
+`worst_state='stale'`+`ti=99`+`na=30` 的会话被**整体忽略**（实测 `healthy=True exit=0`；
+同一会话在 t0 有快照时 → `healthy=False exit=1`）。
+
+### 系统性清点（解释了为什么修一次还会再长）
+
+AST 全量清点 `evaluate_health` 实际消费了多少"已算出的东西"：
+`summarize_rounds` **22/52**、`_universe_session` **7/11**、`empty_metrics` **26/64**。
+
+- **`evaluability_fail_coverage` 是说谎的旋钮**：`live_session.py:1365` 取出后**从未读取**，
+  同行的 `ev_warn_cov`/`ev_min_samples` **都在用** ⇒ 运维配了也静默无效。
+- **整块会话级交付账本零读者**（`:966-973` 六个 `delivery_*_total` + `:950` `signal_delivery`）：
+  全仓唯一提到它们的是**字符串存在性测试**（`test_delivery_false_green.py:206` 只断言名字**出现**），
+  判决只读自洽性子字典 —— 维护者记的第 1 次错误**原样复发**。
+- `_universe_session` 的 `last_state`/`last_age_s`/`refresh_ids_seen` 只被测试读过。
+
+**根因**：现有测试钉的是"**键名在源码文本里出现过**"，不是"**该键被判决消费**"
+（`test_delivery_false_green.py:194-195` 的失败信息甚至写着"否则 soak 对它全盲"，
+断言却写成字符串存在性；`test_universe_refresh_truth_v4.py:361` 把该键写死为 `0` 且从不断言其效果）。
+
+### 撤回
+
+本轮我自己提的"age 检查在会话已测量时不可达"候选**被代码否掉**：
+`src/arad/engine.py:1036-1044` **直接由 `age` 派生 `state`**，阈值一致 ⇒
+`age=99999` 必然 `state='stale'`。我的反例是自相矛盾的输入。**无发现，撤回。**
+
+### 上一轮 3 项修复独立复核：**全部成立**
+
+`universe_transport` 拆分 ✓；`refresh_universe` **4 个 return 全部经 `_finish_attempt` 落账**
+（`:1172-1178`，5 状态全覆盖）✓；会话级 `worst_state` 确实进判决 ✓。
+`rounds_transport_incomplete` 是 `c4f2ce1` **本轮新引入**的字段 ⇒ 上述是新洞，不是旧账。
+
+### 开放项回归（在 `c4f2ce1` 上逐一复核，**无一项已修**）
+
+`IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001`（`engine.py:1261-1279`）、
+`IT-P1-WINDOW-001`（`src/` 零实现，`git grep` rc=1）、`IT-P0-002-TZ-R1`
+（`session.py:214`，`zoneinfo/tzinfo/utcnow` 全仓零命中，同一 epoch 三种时区三种 phase）、
+R-14 `rule_version` 只写不读、R-15 `to_dict()` `ts=None` **已复现 AttributeError**、
+R-22 `_scope_note` 死键+悬空指称、R-23 **无任何 CI**、R-13 `spirit_*` 默认关（非缺陷）。
+
+**1 项框架被反驳**：`IT-P1-SOURCE-EMPTY-001` 原表述"`[]` 与异常不可区分所以误判"**不准确** ——
+实测两者**可区分**（异常→切备源 `fails={'R':1}`；`[]`→`fails={'R':0}`，连续 5 次空也不切）。
+真实缺陷是"**空被当作确定性成功、永不 failover**"，应据此重述。
+
+### 验收测试（已写，对当前 HEAD 实测为 RED）
+
+`2 failed, 2 passed` —— 基线绿 ✓、干净会话不误报 ✓，而"中途截断必须判红"**当前失败**。
+
+### 仍未闭合（下一轮最高优先）
+
+1. `IT-P1-UNIVERSE-WATCHLIST-FALLBACK-SESSION-BLIND-001`：`:1495` 改为
+   `setup or 顶层` 取或（与 `:1664-1687` 处理 universe 会话口径的做法一致）。
+2. `IT-P1-UNIVERSE-TRANSPORT-SESSION-BLIND-001`：让 `:1669` 的 `_ti` 真正进判决，
+   并把 `_sess` 块提到 `if _ut:` 之外。**两条改动是同一处。**
+
+
 
 ## 2026-09-22 13:00 JST 本地 Agent 产品轮（我新加的 gate 自己成了假绿 —— 第 5 次同类错误）
 
