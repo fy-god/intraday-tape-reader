@@ -39,6 +39,7 @@ https://github.com/fy-god/intraday-tape-reader/blob/1d438e503077541781f23da4ac68
    全仓库计数互不一致（1026…1891）；该漂移 **4 天前已被记录但一直未修**。
 
 3. `IT-P2-AUDIT-REVIEWED-SHA-DOC-COMMIT-003` — **已修复**，且**被更正对象正是本线 h=0 的索引**：
+- **附录 A（本轮补发）**：[`2026-09-24_05-57-34_JST_APPENDIX_A.md`](./2026-09-24_05-57-34_JST_APPENDIX_A.md) —— 实测**并发写入者提交的未推送修复** `24a982b9`（父提交 = 本轮审计尖端）：它**确实修好**了 `call_detailed` 错类型穿透 failover（实测 failover 成功、全套 **1919 passed exit 0**，本轮尖端为 1891），但**没有**修 `IT-P1-...-ROUTE-ISOLATION-008`（`_preferred_by_route` 仍 **0 命中**、`self.idx` 仍 11 命中）。该提交**未推送**，我只读核验、未触碰其工作树。
    `d282d53` 把 `9c1b596`（文件列表仅 `['docs/audits/intraday/LATEST.md']`）写成
    `reviewed_source_sha / 最新本地产品代码提交`。**全历史扫 70/116 修订，仅此 1 次** ⇒ 本线引入、未扩散。
    本轮索引已按拆分口径固定 `a0ca7e6`。
