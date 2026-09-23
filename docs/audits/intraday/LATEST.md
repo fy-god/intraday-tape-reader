@@ -1,5 +1,59 @@
 # 最新审计
 
+**最新云端独立审计**：[`2026-09-23_21-44-55_JST.md`](./2026-09-23_21-44-55_JST.md)  
+**上一轮云端独立审计**：[`2026-09-23_20-09-44_JST.md`](./2026-09-23_20-09-44_JST.md)  
+**上一轮审计开始 docs HEAD**：`014435893a63d02b35ae48c34f3179c9a4fa8845`  
+**本轮审计开始 / 结束 HEAD**：`540d4365b11e47d9dd6633f98f0d287e43863fec`（审计期间由 `a0ca7e6caff972d22b903a80b1731e2b7d5a2f95`
+前进到 `540d4365b11e47d9dd6633f98f0d287e43863fec`，该提交只带 docs：`git diff --stat a0ca7e6 540d436 -- src/ tests/ tools/` 为空）  
+**本轮报告文件**：[`2026-09-23_21-44-55_JST.md`](./2026-09-23_21-44-55_JST.md)  
+
+  > **本轮云端独立审计（2026-09-23 21:44:55 JST）：基线后两个代码提交逐条实机复现 —— 4 条声明成立，1 条新发现（潜伏风险）。**
+  > 提交 `4648b1c`（WP01 三条 RED）+ `a0ca7e6`（WP02 `call_detailed`）。
+  >
+  > **我用自写探针（每条配正/负对照）独立复现，全部成立：**
+  > 1. `IT-P2-SNAPSHOT-OUTCOME-COVERAGE-SEMANTIC-COLLISION-001` —— 双轴已拆；
+  >    `R=3,P=3,Q=1` 下 raw=`1.0` / usable=`0.3333333333333333`，两轴对照确有区别；
+  >    legacy 退化得 `raw_return_coverage=None`（未测量），**没有**伪装成 `1.0`。
+  > 2. `IT-P2-TENCENT-DETAILED-EXPLICIT-STOCK-KEY-AXIS-001` —— **走类级出口**实测：
+  >    普通股 `sh600000` 落裸码 `600000`，真指数 `sh000001` 保留前缀，**两臂身份不同**
+  >    （对照有判别力，故这是有效验证而非空转）。
+  > 3. `IT-P2-SNAPSHOT-MERGE-TERMINAL-OVERLAP-001` —— merged terminal overlap = `[]`，
+  >    `identity_holds()=True`；`unexpected`/`duplicate` 仍按并集（未被误伤）。
+  > 4. WP02 四条声明全部实测成立：legacy 降级 `quote_projection_legacy`（不伪装 exact）、
+  >    内置源 `exact_raw_presence`、来源与 outcome 原子绑定、全失败抛异常（非静默 `None`）。
+  >
+  > **全量测试真数：`1891 passed`，exit `0`**（两次独立跑，118.35 s / 131.5 s，均绿）
+  > —— 与提交声称一致（1881 是 WP01 中间时点，WP02 再 +10 得 1891）。
+  >
+  > **新发现（P2，潜伏）`IT-P2-COVERAGE-ALIAS-REINTRODUCES-COLLISION-ACROSS-WP03-BOUNDARY-002`**：
+  > WP01 保留的**废弃别名** `coverage` 指向**可用轴**，而线上账本
+  > `RoundObservationSet.as_dict()['coverage']` 是**传输轴**（`engine.py:1693` 明写
+  > `returned` = "provider 原始返回的条数"、`:1753` 用 `len(raw_stock)+len(raw_idx)`）。
+  > 两者都是普通 dict，WP03 一合并即**同名静默覆盖**：`R=3,P=3,Q=1` 时
+  > `merged['coverage']` = `0.3333333333333333`，而线上真值应为 `1.0`（误差 `0.666667`）。
+  > **⚠ 别名方向与它自己引用的先例相反**：先例 `eastmoney.py:432`
+  > `meta["complete"] = meta["transport_complete"]`（旧名钉**传输轴**），
+  > WP01 却 `outcome.py:131 return self.usable_coverage`（旧名钉**可用轴**）。
+  > **当前影响 = 0**（我实测 `git grep`：仓库内读该别名的消费者 = 0），
+  > 故记为**待验证风险**而非已确认错误；但 WP03 接线时必然兑现。
+  >
+  > **⚠ 诚实边界**：`IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001` **仍未修** ——
+  > 我实测 `call_detailed` 的**生产调用点 = 0**（AST 调用图），
+  > `poll_once` 走的仍是 `sources.call("snapshots")`（`engine.py:921/1528`），
+  > 故两个提交**都不改变任何线上账本数字**（与其自述一致）。
+  > `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` 连续第 **7** 轮未修。
+  > **模型真实增益 = 0**；真实 Precision/Recall/漏报率/交易收益仍 `unavailable`。
+  >
+  > **我自曝两处自己的探针缺陷**：(a) 首跑 pytest 经 `Select-Object` 管道截断到 38%
+  > 且 `$LASTEXITCODE=1`，我差点误报"测试失败"——完整捕获后真值为 `exit 0 / 1891 passed`；
+  > (b) 我第一版别名探针用了错的 `build_outcome` 签名（缺 `raw_keys`），已按真实签名重测。
+  > 另：审计期间有**并发写者**在写 `docs/audits/intraday/evidence_2026-09-23_21-00-00_JST/`
+  > （0 B -> 15 文件 / 18,302 B），我**只读未动**。
+
+---
+**上一版完整 LATEST 历史索引（不可变快照）**：  
+https://github.com/fy-god/intraday-tape-reader/blob/540d4365b11e47d9dd6633f98f0d287e43863fec/docs/audits/intraday/LATEST.md
+
 **最新云端独立审计**：[`2026-09-23_20-09-44_JST.md`](./2026-09-23_20-09-44_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-23_20-09-44_JST_AGENT_TASK.md`](./2026-09-23_20-09-44_JST_AGENT_TASK.md)  
 **最新本地 Agent 产品轮**：[`2026-09-23_21-00-00_JST.md`](./2026-09-23_21-00-00_JST.md)  
