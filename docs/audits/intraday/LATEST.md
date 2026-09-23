@@ -3,7 +3,7 @@
 **⚠ 新增回归 P0（2026-09-23 18:17:39 JST）**：[`2026-09-23_18-17-39_JST.md`](./2026-09-23_18-17-39_JST.md)  
 **发现**：`IT-P1-REFRESH-FAILED-POOL-RETAINED-READ-AS-MEASURED-ZERO-001`（**假红回归**）  
 **审计时远端 main**：`788810084cd7ca4853707c02be4bc3058e2e390a`  
-**report_commit_sha**：`PENDING_BACKFILL`  
+**report_commit_sha**：`c06b21bd9a921caebdb5eb1ab6147122eb6b9f97`  
 
   > `tools/live_session.py:3263` `int(engine.refresh_universe() or 0)`：**AST 实测生产者 `engine.py:1177-1334` 共 4 个 `return`、无 `return None`**，其中 `:1302`（`rejected_smaller`）与 `:1326`（`all_failed`/`empty`）**均保留现有池子后 `return 0`**。
   > **双臂端到端对照**（同一构造：30 轮、每轮扫 5563 只、`universe_size=0`）：
