@@ -287,8 +287,47 @@ def _depth(fields: list[str], start: int) -> tuple[tuple[float, ...], tuple[floa
 # --------------------------------------------------------------------------
 # 纯解析函数（离线单测入口）
 # --------------------------------------------------------------------------
+def is_index_role(symbol: str, *, index_role: bool,
+                  idx_set: set[str] | None = None) -> bool:
+    """**唯一**的身份判定 —— request / raw / Quote 三处必须都调这一个。
+
+    `IT-P2-TENCENT-DETAILED-KEY-AXIS-001`。本函数是三次返工的产物：
+
+    * **第 1 版**：request 侧判 ``prefix and sym in idx_set``，而类级出口把
+      "调用方显式写了前缀"当成"它是指数"塞进 `idx_set` -> ``sh600000``
+      （浦发银行）被判指数，而 raw 侧按真名判个股 -> **两轴分离**。
+    * **第 2 版（我上一轮）**：把 request 侧改成名称盲
+      ``looks_like_index(sym, "", c)``，raw 侧仍用 provider 真名 ——
+      **同一语义在两个轴上用不同输入各推一次**，于是 7 个只能靠名称
+      认定的指数（``sh000922`` 中证红利指数等）在两轴塌成不同键。
+
+    两次共因都是**两侧各猜**。任务书 §WP02 因此明文禁止::
+
+        request 轴用空名称推断
+        raw 轴用 provider 真名称推断
+
+    修法：角色由**调用方**拥有（caller-owned role）：
+
+    1. ``index_role=True``（调用方在 ``index`` 路由上请求）-> 权威，直接是指数。
+       这覆盖了那 7 个**只能靠名称**认定的指数 —— 调用方既然在指数路由上
+       请求它，parser 就不该再用名称/代码段去二次否决。
+    2. 否则回退到 ``idx_set``（调用方给的 per-symbol 角色元数据）
+       **复合名称盲判据** ``looks_like_index(sym, "", bare)``。
+
+    ⚠ **刻意不接收 `name`**：请求侧天然没有名称。一旦哪一侧能用名称，
+    两轴就永远不可能对齐 —— 这正是第 2 版的错误。
+    名称只用于 ``board``（板块归类），不用于身份键。
+    """
+    if index_role:
+        return True
+    if idx_set and symbol in idx_set:
+        return looks_like_index(symbol, "", symbol[2:])
+    return False
+
+
 def parse_response(text: str, seq: int = 0,
-                   index_codes: set[str] | None = None) -> list[Quote]:
+                   index_codes: set[str] | None = None,
+                   route: str = "stocks") -> list[Quote]:
     """把腾讯 ``v_xxx="..."`` 响应文本解析成 ``Quote`` 列表（纯函数，无副作用）。
 
     * 只认 ``^v_([a-z]{2}\\d{6})="(.*)";?$``；``v_pv_none_match`` / 无匹配行跳过。
@@ -307,6 +346,7 @@ def parse_response(text: str, seq: int = 0,
     """
     out: list[Quote] = []
     idx_set = index_codes or set()
+    index_role = str(route or "stocks").lower() == "index"
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or "pv_none_match" in line:
@@ -328,9 +368,10 @@ def parse_response(text: str, seq: int = 0,
         name = (fields[I_NAME] or "").strip() if len(fields) > I_NAME else ""
 
         # 指数：保留带前缀的 code，否则 000001 会与平安银行共用一个 key。
-        # 双重确认：调用方声明过这个符号 **且** 这行自身看起来确实是指数 ——
-        # 只信声明的话，配置里写错一个 sh600000 就会把个股标成指数。
-        is_index = symbol in idx_set and looks_like_index(symbol, name, code)
+        # ⚠ 判据必须与 request/raw 两轴**同调** `is_index_role`，否则
+        # "requested identity == raw ledger identity == Quote.code" 必然破。
+        is_index = is_index_role(symbol, index_role=index_role,
+                                 idx_set=idx_set)
         out_code = symbol if is_index else code
         board = Board.INDEX if is_index else board_of(code, name)
 
@@ -442,43 +483,57 @@ def parse_response_detailed(text: str, seq: int = 0,
 
     idx_set = index_codes or set()
 
+    # --- 单一 role 来源（任务书 §WP02：caller-owned role）------------------
+    #
+    # 生产合同（云端 2026-09-24_00-05-20 §WP02 原文）::
+    #
+    #     stocks route -> bare 6-digit code
+    #     index  route  -> prefixed exchange symbol
+    #
+    # **这是本函数第三次返工，前两次都是"某一侧在猜身份"**：
+    #
+    # * **第 1 版**：`_req_key` 判 `prefix and sym in idx_set`，而类级出口把
+    #   **任何显式前缀**都塞进 `idx_set` -> `sh600000`（浦发银行）被判指数，
+    #   raw 侧按真名判个股 -> 两轴分离（`IT-P2-...-KEY-AXIS-001`）。
+    # * **第 2 版（我上一轮）**：request 侧改名称盲
+    #   `looks_like_index(sym, "", c)`。修好了 `sh600000`，却**弄坏了 7 个
+    #   只能靠名称认定的指数**（`sh000922` 中证红利指数等，既不在
+    #   `INDEX_CODES` 也不是 `399xxx`）—— request 侧判个股、raw 侧拿
+    #   provider 真名判指数 -> **两轴再次分离，方向相反**。
+    #
+    # 两次的共因：**让两侧各自从字符串/名称去猜**。任务书因此明文禁止::
+    #
+    #     request 轴用空名称推断
+    #     raw 轴用 provider 真名称推断
+    #
+    # 修法：把角色收敛成**唯一一个判定函数**，`request` / `raw` / `Quote`
+    # **三处消费同一份 role**（这正是任务书 §WP02 的要求）。
+    #
+    # 角色来源有两个、且都是**调用方声明**（不是 parser 猜的）：
+    #   1. `route == "index"` —— 调用方明确说"这一批是指数"；
+    #   2. `sym in idx_set` —— 调用方显式给出的 per-symbol 角色元数据
+    #      （任务书允许混合调用时用它传 per-request role）。
+    #
+    # ⚠ **类级出口 `snapshots_detailed` 必须停止从"显式前缀"推导
+    # `idx_set`** —— 那正是第 1 版的病根：把"写了前缀"当成"它是指数"。
+    _role_index = str(route or "stocks").lower() == "index"
+
+    def _is_index(symbol: str) -> bool:
+        """委托给模块级**唯一**判据 `is_index_role`（三轴同源）。"""
+        return is_index_role(symbol, index_role=_role_index, idx_set=idx_set)
+
     def _key(symbol: str, name: str) -> str:
-        """符号 -> 与 ``Quote.code`` 同轴的键（复刻 parse_response 的指数判定）。"""
-        code = symbol[2:]
-        if symbol in idx_set and looks_like_index(symbol, name, code):
-            return symbol
-        return code
+        """符号 -> 身份键。`name` 只为兼容签名，**不参与判定**。"""
+        return symbol if _is_index(symbol) else symbol[2:]
 
     def _req_key(raw: Any) -> str | None:
-        """请求项 -> 与 `_key` 同轴的键（**必须**与 `_key` 的判定一致）。"""
+        """请求项 -> 与 `_key` **同轴**的键（同调 `_is_index`）。"""
         prefix, _ = split_prefix(raw)
         c = normalize_code(raw)
         if not c:
             return None
         sym = (prefix or guess_prefix(c)) + c
-        # ⚠ `IT-P2-TENCENT-DETAILED-EXPLICIT-STOCK-KEY-AXIS-001`
-        #   （云端 2026-09-23 20:09 §4，P2，我实测**确认**）。
-        #
-        #   修前这里只判 `prefix and sym in idx_set` —— 而类级出口
-        #   `snapshots_detailed` 构造的是
-        #       `idx_set = {sym for sym, explicit in norm if explicit}`
-        #   即**任何显式写了前缀的请求**都进 idx_set。
-        #   于是请求 `sh600000`（浦发银行，**不是**指数）时：
-        #       R = {sh600000}（带前缀）   而 raw `_key` = {600000}（裸码）
-        #   交集恒空 -> P=Q=∅ -> 报
-        #       「请求的股票 missing，另外返回了一个未请求代码」
-        #   而 provider 明明**正常返回**了。这正是本文件
-        #   `parse_response_detailed` docstring 里警告过的那个"同轴"易错点，
-        #   我在 raw 侧修对了、在 request 侧漏了。
-        #
-        #   修法：与 raw `_key` 用**同一份**"是否真指数"判据 ——
-        #   `looks_like_index` 只看符号/裸码（请求侧没有 name，
-        #   传空串即走"名称缺失一律按股票"的既有消歧规则，
-        #   与 `board_of` 的注释一致）。
-        #   不要拿"显式写了前缀"当"它是指数"的代理。
-        if prefix and sym in idx_set and looks_like_index(sym, "", c):
-            return sym
-        return c
+        return sym if _is_index(sym) else c
 
     req = normalize_request(requested or (), normalize=_req_key)
 
@@ -503,7 +558,7 @@ def parse_response_detailed(text: str, seq: int = 0,
         source=TencentSource.name,
         normalized_request=req,
         raw_keys=raw_keys,
-        quotes=parse_response(text, seq, index_codes),
+        quotes=parse_response(text, seq, index_codes, route),
         raw_rows=raw_rows,
         raw_presence_known=True,
         provenance=PROVENANCE_EXACT,

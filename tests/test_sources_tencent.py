@@ -692,9 +692,16 @@ def test_public_api_surface():
     assert t.BACKOFF_SECONDS == (0.3, 0.9, 2.0)
     assert t.MIN_FIELDS == 54
     assert t.LINE_RE.match('v_sh600000="a~b";')
-    # parse_response(text, seq=0, index_codes=None)：第三个参数用来声明指数符号，
+    # parse_response(text, seq=0, index_codes=None, route="stocks")：
+    # 第三/四个参数是**调用方声明的身份角色**（任务书 §WP02 caller-owned role），
     # 让 000001 这类歧义码能区分「上证指数」与「平安银行」。
-    assert tencent.parse_response.__defaults__ == (0, None)
+    #
+    # ⚠ `route` 是 2026-09-24 新增的：身份判定曾三次返工 ——
+    #   第 1 版拿"显式前缀"当"它是指数"（`sh600000` 浦发银行被误判指数）；
+    #   第 2 版让 request 侧名称盲推断、raw 侧仍用 provider 真名，
+    #   于是 7 个只能靠名称认定的指数（`sh000922` 中证红利指数等）两轴分离。
+    #   现在 request/raw/Quote 三处**只消费同一份 role**，不再各自猜。
+    assert tencent.parse_response.__defaults__ == (0, None, "stocks")
     src = TencentSource({})
     assert src.retries == 3 and src.timeout == 10.0 and src.workers == 4
     assert src.referer == t.DEFAULT_REFERER

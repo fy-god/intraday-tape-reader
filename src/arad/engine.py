@@ -617,7 +617,7 @@ class SourceManager:
                       决定 ``_fails`` / ``_serving`` 的记账分桶
         :returns: ``SnapshotFetchResult``，其 ``source`` = 实际服务源名
         """
-        from .sources.outcome import build_outcome
+        from .sources.outcome import SnapshotFetchResult, build_outcome
 
         order = [self.idx] + [i for i in range(len(self.sources))
                               if i != self.idx]
@@ -625,6 +625,19 @@ class SourceManager:
         for i in order:
             src = self.sources[i]
             name = str(getattr(src, "name", "?"))
+            # ⚠ **合同校验必须整体放在 `try` 内**（任务书 §WP03）。
+            #
+            # 修前只有 `detailed(...)` 一行在 try 里，`_replace` 在外面 ——
+            # 于是一个返回**裸 list**（错类型）的源会在 `out._replace(...)`
+            # 抛 `AttributeError`，**直接冒出整个 failover 循环**：
+            # 备用源一次都不会被调用（实测 `backup.calls == 0`）。
+            # 后果：任何第三方/手写源写错返回类型，就能让盘中预警**全线停摆** ——
+            # 而这恰恰是"多源热备"存在的唯一理由。
+            #
+            # 现在四件事全在 try 内（任务书原文 1–4）：
+            #   1. 获取结果；2. 类型/合同验证；
+            #   3. actual source 绑定；4. caller route 绑定/验证。
+            # 任何一步不满足 -> 当 **source failure** 处理，继续 failover。
             try:
                 detailed = getattr(src, "snapshots_detailed", None)
                 if callable(detailed):
@@ -639,15 +652,29 @@ class SourceManager:
                         normalized_request=tuple(str(c) for c in codes),
                         raw_keys=(), quotes=quotes,
                         raw_presence_known=False)
+
+                # (2) 类型 / 合同验证
+                if not isinstance(out, SnapshotFetchResult):
+                    raise TypeError(
+                        f"{name}.snapshots_detailed 返回 {type(out).__name__}，"
+                        f"合同要求 SnapshotFetchResult")
+
+                # (3)+(4) 一次性绑定 source 与 route（`_replace` 只调一次）。
+                #
+                # * source：以**实际被调用对象**的 name 为准。源自填的错误
+                #   name 说明它对自己的身份判断不可信；而 Manager 手里这个
+                #   对象就是权威。
+                # * route：**规范化**为 caller 的 route（任务书 §WP03 允许的
+                #   两种策略之一，本实现固定用这个并写测试钉住）。
+                #   不分叉的理由：`_serving`/`_fails` 必然记在 caller route 上，
+                #   若 result 仍写源自报的 route，同一批数据就有了两个归属 ——
+                #   下游按 `result.route` 分账会把它算到另一条链上。
+                if out.source != name or out.route != route:
+                    out = out._replace(source=name, route=route)
             except Exception as exc:  # noqa: BLE001 - 逐个后备源尝试
                 last_exc = exc
                 log.warning("数据源 %s.snapshots_detailed 失败: %s", name, exc)
                 continue
-            # ⚠ 原子绑定：source 以**实际返回数据的源**为准。
-            # 源自己填的 name 与 Manager 看到的是同一个对象，但前者是
-            # "谁产出"，后者是"Manager 以为谁产出" —— 以产出方为准更不易错。
-            if getattr(out, "source", "") != name:
-                out = out._replace(source=name)
             self._serving[route] = i
             if i == self.idx:
                 self._fails[route] = 0
