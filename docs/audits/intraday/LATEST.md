@@ -1,5 +1,22 @@
 # 最新审计
 
+**⚠ 新增回归 P0（2026-09-23 18:17:39 JST）**：[`2026-09-23_18-17-39_JST.md`](./2026-09-23_18-17-39_JST.md)  
+**发现**：`IT-P1-REFRESH-FAILED-POOL-RETAINED-READ-AS-MEASURED-ZERO-001`（**假红回归**）  
+**审计时远端 main**：`788810084cd7ca4853707c02be4bc3058e2e390a`  
+**report_commit_sha**：`PENDING_BACKFILL`  
+
+  > `tools/live_session.py:3263` `int(engine.refresh_universe() or 0)`：**AST 实测生产者 `engine.py:1177-1334` 共 4 个 `return`、无 `return None`**，其中 `:1302`（`rejected_smaller`）与 `:1326`（`all_failed`/`empty`）**均保留现有池子后 `return 0`**。
+  > **双臂端到端对照**（同一构造：30 轮、每轮扫 5563 只、`universe_size=0`）：
+  > - OLD `d8627633`（blob `eb12ef35…`）→ `ok`、**`healthy=True`、`exit=0`、`fail=[]`**
+  > - NEW `9ec40c67`（blob `b2f791f0…`）→ **`fail`、`healthy=False`、`exit=1`**，打印「扫描池为 **0 只**（明确测到，非未采集）—— 本场**一只票都没扫**」
+  > 而会话实测 `universe_abs_min=5563`、`universe_abs_measured_rounds=30` —— **有 30 轮真实证据却判「一只票都没扫」**。
+  > **三态对照**证明消费者能区分：同一会话 `universe_size=None` → **`ok`/`exit=0`**（诚实）；无会话证据 + `0` → 判红（**正确**）。**坏在生产者把信息丢了。**
+  > **无测试覆盖**：`:3263` 在 `def run`（`:3204-3485`）内，全 `tests/` 对 live_session `run` 入口点命中 **0** → 在 `1830 passed / exit 0` 下存活。
+  > §1 **交叉裁定**：子 agent C 与 A 对「5 个死字段接线」互相矛盾，我实测 5×扰动**均不改变任何 level / healthy / exit** → **A 对**，C 把 detail 文本变化当成了判决变化。
+  > 详见 [`2026-09-23_18-17-39_JST.md`](./2026-09-23_18-17-39_JST.md)。
+
+---
+
 **修复后回归验证（2026-09-23 18:13:57 JST）**：[`2026-09-23_18-13-57_JST.md`](./2026-09-23_18-13-57_JST.md)  
 **验证对象**：并发 agent 在工作树里（未提交）对 `2026-09-23_17-58-08_JST.md` §2.1/§2.2 的修复  
 **本轮新增产品提交**：`9ed75efb50c41f9756c3fab2a0255685aea73868`（WP01 Snapshot Outcome Contract v4）  
