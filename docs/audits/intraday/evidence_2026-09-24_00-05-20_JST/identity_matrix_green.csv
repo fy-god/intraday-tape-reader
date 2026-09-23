@@ -1,0 +1,16 @@
+group,symbol,provider_name,bare,declared_role,want,requested,raw_ledger,quote_code,missing,unexpected,admitted,three_axes_agree,phantom_missing
+name_unique_index,sh000922,中证红利指数,000922,index,sh000922,sh000922,sh000922,sh000922,,,1,True,False
+name_unique_index,sh000015,红利指数,000015,index,sh000015,sh000015,sh000015,sh000015,,,1,True,False
+name_unique_index,sh000903,中证100指数,000903,index,sh000903,sh000903,sh000903,sh000903,,,1,True,False
+name_unique_index,sh000904,中证200指数,000904,index,sh000904,sh000904,sh000904,sh000904,,,1,True,False
+name_unique_index,sh000906,中证800指数,000906,index,sh000906,sh000906,sh000906,sh000906,,,1,True,False
+name_unique_index,sh000009,上证380指数,000009,index,sh000009,sh000009,sh000009,sh000009,,,1,True,False
+name_unique_index,sh000133,上证150指数,000133,index,sh000133,sh000133,sh000133,sh000133,,,1,True,False
+safe_index,sh000001,上证指数,000001,index,sh000001,sh000001,sh000001,sh000001,,,1,True,False
+safe_index,sz399001,深证成指,399001,index,sz399001,sz399001,sz399001,sz399001,,,1,True,False
+safe_index,sh000300,沪深300指数,000300,index,sh000300,sh000300,sh000300,sh000300,,,1,True,False
+safe_index,sh000016,上证50指数,000016,index,sh000016,sh000016,sh000016,sh000016,,,1,True,False
+safe_index,sh000688,科创50指数,000688,index,sh000688,sh000688,sh000688,sh000688,,,1,True,False
+safe_index,sz399006,创业板指,399006,index,sz399006,sz399006,sz399006,sz399006,,,1,True,False
+prefixed_stock,sh600000,浦发银行,600000,stocks,600000,600000,600000,600000,,,1,True,False
+prefixed_stock,sz000001,平安银行,000001,stocks,000001,000001,000001,000001,,,1,True,False

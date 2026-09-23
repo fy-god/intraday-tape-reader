@@ -65,19 +65,58 @@ https://github.com/fy-god/intraday-tape-reader/blob/1d438e503077541781f23da4ac68
 
 # 最新审计
 
+**最新本地独立审计**：[2026-09-24_05-52-56_JST.md](./2026-09-24_05-52-56_JST.md)  
 **最新云端独立审计**：[2026-09-24_04-04-27_JST.md](./2026-09-24_04-04-27_JST.md)  
 **最新云端 Agent 任务书**：[2026-09-24_04-04-27_JST_AGENT_TASK.md](./2026-09-24_04-04-27_JST_AGENT_TASK.md)  
 **上一版本地独立审计**：[2026-09-24_02-48-00_JST.md](./2026-09-24_02-48-00_JST.md)  
-**reviewed_source_sha / 本轮固定产品代码**：`a0ca7e6caff972d22b903a80b1731e2b7d5a2f95`  
+**上一版云端独立审计**：[2026-09-24_00-05-20_JST.md](./2026-09-24_00-05-20_JST.md)  
+**上一版云端 Agent 任务书**：[2026-09-24_00-05-20_JST_AGENT_TASK.md](./2026-09-24_00-05-20_JST_AGENT_TASK.md)  
+**reviewed_source_sha**：`bd711c4a5a5a2a636717c7f883d2f9c5976aeabc`（本轮开始 HEAD）  
 **audit_start_head / 本轮开始 main**：`bd711c4a5a5a2a636717c7f883d2f9c5976aeabc`  
-**report_commit_sha**：`c9da70103aefdbcb3c93a0b9f9786470bdb95f9c`  
-**agent_task_commit_sha**：`52d5b58f53bca3bc1eaa113cc97aa1a79a5baa67`  
+**上一版云端固定产品代码**：`a0ca7e6caff972d22b903a80b1731e2b7d5a2f95`  
+**上一版云端 report_commit_sha**：`c9da70103aefdbcb3c93a0b9f9786470bdb95f9c`  
+**上一版云端 agent_task_commit_sha**：`52d5b58f53bca3bc1eaa113cc97aa1a79a5baa67`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
 https://github.com/fy-god/intraday-tape-reader/blob/bd711c4a5a5a2a636717c7f883d2f9c5976aeabc/docs/audits/intraday/LATEST.md
 
-> 版本纪律更正：`a0ca7e6..bd711c4` 的 GitHub compare 只有 `docs/audits/intraday/` 变化，故 docs commit 不能写成产品 `reviewed_source_sha`。本文件从本轮起明确分离产品 SHA、审计开始 HEAD 与报告提交 SHA。历史报告文件未删除；上一版完整索引由上面的不可变快照承担。
+> 版本纪律（沿用云端 04:04 更正）：docs commit **不能**写成产品 `reviewed_source_sha`。
+> 本文件明确分离产品 SHA、审计开始 HEAD 与报告提交 SHA。
+> 历史报告文件未删除；上一版完整索引由上面的不可变快照承担。
 
-## 2026-09-24 04:04:27 JST
+## 2026-09-24 05:52:56 JST（本地 · WP01/WP02/WP03/WP05 修复 + 回退验牙）
+
+对应任务书 `2026-09-24_00-05-20_JST_AGENT_TASK.md`。
+**性质：修复**（上一份 02:48 本地报告与 04:04 云端报告都是**诊断**）。
+
+1. `IT-P2-TENCENT-NAME-BLIND-REQUEST-KEY-REGRESSION-002` — **已修复**
+   （**是我自己 `4648b1c` 引入的回归**）。新增模块级 `is_index_role(symbol, *,
+   index_role, idx_set)` 作**唯一**判据，`request`/`raw`/`Quote` 三处同调；
+   角色由**调用方 route** 拥有；`name` **不参与**身份判定；
+   `parse_response` 增加 `route` 参数。
+   修前 `11 failed`（7 个名称唯一指数全部 phantom missing）→ 修后 `21 passed`。
+   纯函数层 **15/15 三轴一致**；**类级生产路径 15/15**；默认 5 指数 `coverage=1.0`。
+2. `IT-P2-CALL-DETAILED-TYPE-ERROR-ABORTS-FAILOVER-004` — **已修复**
+   （呼应 02:48 / 04:04 的诊断）。四件事（取结果 / `isinstance` / source 绑定 /
+   caller route 绑定）**全部移进 per-source `try`**；错类型按 source failure
+   failover（修前 `backup.calls == 0`）。修前 `3 failed` → 修后 `7 passed`。
+3. `IT-P2-CALL-DETAILED-ROUTE-MISBIND-006` — **已修复**：固定策略 = **规范化**
+   （`_replace(source=name, route=route)`，一次绑定）。
+4. WP05 coverage alias gate：收窄到 `engine.py`（第一版扫全 `src/` 误报
+   `capabilities.py:892` —— 那是**另一个类自己的** `coverage()`），并加自检。
+5. **【下调】任务书 §WP01 的 M6 定义**：修好后"强制 `name=""`"是**恒等变换
+   （no-op）**，`is_index_role` 代码路径里 `name` 出现 **0** 次。
+   未粉饰，换成 5 个能真正攻击新形状的 mutation（全部行为性变红、对照绿）。
+6. ⚠ **最重要诚实交代**：`call_detailed` 生产调用点仍 **= 0**（`poll_once` →
+   `_fetch_indices` → `sources.call("snapshots")`，`:948` 走 legacy 链）。
+   本轮是"把新链修成**可接线**的正确形状并装牙"，**不是**修好线上问题。
+   **下一轮首选 = WP07**（把 `call_detailed` 接进 `poll_once`，两条 route 都换）。
+
+测试真数：**1919 passed / 0 failed**；`check_*.py` **8/8**；BOM exit 0；
+`dash_render_check.js` exit 0；`arad.cli selftest` 68 告警 / 6 类型 / exit 0。
+回退验牙 **7 条全行为性、0 结构性**（含一次判据升级：运行期在**目标测试路径上**
+抛的 `AttributeError` 属行为性证据，不算结构性）。
+
+## 2026-09-24 04:04:27 JST（云端）
 
 主实验：`EXP-IT-ROUTE-ISOLATION-014`
 
@@ -126,3 +165,4 @@ research
 - `NEXT_STEPS.md`
 
 模型训练：0；真实 Precision/Recall/漏事件率/交易收益仍 `unavailable`。
+`spirit_*` 仍 `enabled: false`。

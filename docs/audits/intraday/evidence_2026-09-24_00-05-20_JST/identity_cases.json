@@ -1,0 +1,384 @@
+{
+  "cases": [
+    {
+      "symbol": "sh000922",
+      "provider_name": "中证红利指数",
+      "bare": "000922",
+      "declared_role": "index",
+      "want": "sh000922",
+      "requested": [
+        "sh000922"
+      ],
+      "raw_ledger": [
+        "sh000922"
+      ],
+      "quote_code": [
+        "sh000922"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000015",
+      "provider_name": "红利指数",
+      "bare": "000015",
+      "declared_role": "index",
+      "want": "sh000015",
+      "requested": [
+        "sh000015"
+      ],
+      "raw_ledger": [
+        "sh000015"
+      ],
+      "quote_code": [
+        "sh000015"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000903",
+      "provider_name": "中证100指数",
+      "bare": "000903",
+      "declared_role": "index",
+      "want": "sh000903",
+      "requested": [
+        "sh000903"
+      ],
+      "raw_ledger": [
+        "sh000903"
+      ],
+      "quote_code": [
+        "sh000903"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000904",
+      "provider_name": "中证200指数",
+      "bare": "000904",
+      "declared_role": "index",
+      "want": "sh000904",
+      "requested": [
+        "sh000904"
+      ],
+      "raw_ledger": [
+        "sh000904"
+      ],
+      "quote_code": [
+        "sh000904"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000906",
+      "provider_name": "中证800指数",
+      "bare": "000906",
+      "declared_role": "index",
+      "want": "sh000906",
+      "requested": [
+        "sh000906"
+      ],
+      "raw_ledger": [
+        "sh000906"
+      ],
+      "quote_code": [
+        "sh000906"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000009",
+      "provider_name": "上证380指数",
+      "bare": "000009",
+      "declared_role": "index",
+      "want": "sh000009",
+      "requested": [
+        "sh000009"
+      ],
+      "raw_ledger": [
+        "sh000009"
+      ],
+      "quote_code": [
+        "sh000009"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000133",
+      "provider_name": "上证150指数",
+      "bare": "000133",
+      "declared_role": "index",
+      "want": "sh000133",
+      "requested": [
+        "sh000133"
+      ],
+      "raw_ledger": [
+        "sh000133"
+      ],
+      "quote_code": [
+        "sh000133"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "name_unique_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000001",
+      "provider_name": "上证指数",
+      "bare": "000001",
+      "declared_role": "index",
+      "want": "sh000001",
+      "requested": [
+        "sh000001"
+      ],
+      "raw_ledger": [
+        "sh000001"
+      ],
+      "quote_code": [
+        "sh000001"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": true
+    },
+    {
+      "symbol": "sz399001",
+      "provider_name": "深证成指",
+      "bare": "399001",
+      "declared_role": "index",
+      "want": "sz399001",
+      "requested": [
+        "sz399001"
+      ],
+      "raw_ledger": [
+        "sz399001"
+      ],
+      "quote_code": [
+        "sz399001"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh000300",
+      "provider_name": "沪深300指数",
+      "bare": "000300",
+      "declared_role": "index",
+      "want": "sh000300",
+      "requested": [
+        "sh000300"
+      ],
+      "raw_ledger": [
+        "sh000300"
+      ],
+      "quote_code": [
+        "sh000300"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": true
+    },
+    {
+      "symbol": "sh000016",
+      "provider_name": "上证50指数",
+      "bare": "000016",
+      "declared_role": "index",
+      "want": "sh000016",
+      "requested": [
+        "sh000016"
+      ],
+      "raw_ledger": [
+        "sh000016"
+      ],
+      "quote_code": [
+        "sh000016"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": true
+    },
+    {
+      "symbol": "sh000688",
+      "provider_name": "科创50指数",
+      "bare": "000688",
+      "declared_role": "index",
+      "want": "sh000688",
+      "requested": [
+        "sh000688"
+      ],
+      "raw_ledger": [
+        "sh000688"
+      ],
+      "quote_code": [
+        "sh000688"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": true
+    },
+    {
+      "symbol": "sz399006",
+      "provider_name": "创业板指",
+      "bare": "399006",
+      "declared_role": "index",
+      "want": "sz399006",
+      "requested": [
+        "sz399006"
+      ],
+      "raw_ledger": [
+        "sz399006"
+      ],
+      "quote_code": [
+        "sz399006"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "safe_index",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sh600000",
+      "provider_name": "浦发银行",
+      "bare": "600000",
+      "declared_role": "stocks",
+      "want": "600000",
+      "requested": [
+        "600000"
+      ],
+      "raw_ledger": [
+        "600000"
+      ],
+      "quote_code": [
+        "600000"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "prefixed_stock",
+      "bare_in_INDEX_CODES": false
+    },
+    {
+      "symbol": "sz000001",
+      "provider_name": "平安银行",
+      "bare": "000001",
+      "declared_role": "stocks",
+      "want": "000001",
+      "requested": [
+        "000001"
+      ],
+      "raw_ledger": [
+        "000001"
+      ],
+      "quote_code": [
+        "000001"
+      ],
+      "missing": [],
+      "unexpected": [],
+      "admitted": 1,
+      "raw_return_coverage": 1.0,
+      "usable_coverage": 1.0,
+      "three_axes_agree": true,
+      "phantom_missing": false,
+      "group": "prefixed_stock",
+      "bare_in_INDEX_CODES": true
+    }
+  ],
+  "summary": {
+    "total": 15,
+    "three_axes_agree": 15,
+    "phantom_missing": 0
+  }
+}
