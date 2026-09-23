@@ -36,9 +36,13 @@ import threading
 import time
 import urllib.request
 from datetime import datetime
+from typing import TYPE_CHECKING, Any
 
 from ..models import Board, Quote, board_of, guess_prefix, looks_like_index
 from .base import SourceError
+
+if TYPE_CHECKING:                                      # pragma: no cover
+    from .outcome import SnapshotFetchResult
 
 __all__ = [
     "TencentSource",
@@ -401,6 +405,93 @@ def parse_response(text: str, seq: int = 0,
     return out
 
 
+def parse_response_detailed(text: str, seq: int = 0,
+                            index_codes: set[str] | None = None,
+                            requested: list[str] | None = None,
+                            route: str = "stocks") -> "SnapshotFetchResult":
+    """``parse_response`` 的**精确 raw-presence** 版本（Snapshot Outcome v4）。
+
+    `IT-P1-SNAPSHOT-OUTCOME-SOURCE-SEMANTICS-DRIFT-001`（12:37 §2）：
+    腾讯**已经**保留 ``price<=0`` 的停牌行（见 ``:294`` 的契约注释），
+    所以对腾讯而言引擎侧的 ``rejected_quality`` 本来就对。
+
+    但 parser 里还有**两处 ``continue`` 会丢掉 raw 行**：
+
+    * ``:316`` 字段数 < :data:`MIN_FIELDS`（54）；
+    * ``:321`` ``price`` / ``prev_close`` 无法解析（空串 / 非数字）。
+
+    这两处丢掉的行，在**只交出 ``list[Quote]``** 的旧接口下
+    与"provider 根本没返回这个代码"**不可区分** —— 引擎一律记
+    ``unknown_missing``。**同一个 raw 事实**（provider 明确返回了该行、
+    只是数值不可用）在腾讯与新浪/东财上因此落进**不同的账本桶**。
+
+    本函数在**数值质量校验之前**捕获身份（``:313-314`` 已经解析出
+    ``symbol``），因此**不需要任何额外 HTTP** 就能给出精确的
+    ``raw_present`` / ``rejected_quality`` / ``unknown_missing`` 三分。
+
+    **键轴**：与 ``Quote.code`` **逐字同轴** ——
+    个股用 6 位裸码；被识别为指数的行用带前缀符号
+    （``000001`` 无法区分上证指数与平安银行，见 ``parse_response`` 的说明）。
+
+    ⚠ 这个"同轴"要求是**易错点**：`_norm_specs` 一律返回带前缀符号，
+    而 `Quote.code` 只对**指数**带前缀。若请求集直接用 `_norm_specs` 的
+    ``sym``，则 R 里是 ``sh600000`` 而 raw 键是 ``600000``，
+    交集恒为空 —— 会把**每一次正常取数**报成"全部 missing"。
+    """
+    from .outcome import PROVENANCE_EXACT, build_outcome, normalize_request
+
+    idx_set = index_codes or set()
+
+    def _key(symbol: str, name: str) -> str:
+        """符号 -> 与 ``Quote.code`` 同轴的键（复刻 parse_response 的指数判定）。"""
+        code = symbol[2:]
+        if symbol in idx_set and looks_like_index(symbol, name, code):
+            return symbol
+        return code
+
+    def _req_key(raw: Any) -> str | None:
+        """请求项 -> 与 `_key` 同轴的键（**必须**与 `_key` 的判定一致）。"""
+        prefix, _ = split_prefix(raw)
+        c = normalize_code(raw)
+        if not c:
+            return None
+        sym = (prefix or guess_prefix(c)) + c
+        # 只有**显式**写过前缀、且该符号确实在指数集合里 == 指数；
+        # 其余（含裸 000001 想拉平安银行）都是个股 -> 裸码。
+        if prefix and sym in idx_set:
+            return sym
+        return c
+
+    req = normalize_request(requested or (), normalize=_req_key)
+
+    raw_keys: list[str] = []
+    raw_rows: list[Any] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or "pv_none_match" in line:
+            continue
+        m = LINE_RE.match(line)
+        if not m:
+            continue
+        symbol = m.group(1).lower()
+        fields = m.group(2).split("~")
+        name = (fields[I_NAME] or "").strip() if len(fields) > I_NAME else ""
+        # **身份在数值校验之前捕获** —— 这是本函数存在的全部理由。
+        raw_keys.append(_key(symbol, name))
+        raw_rows.append(line)
+
+    return build_outcome(
+        route=route,
+        source=TencentSource.name,
+        normalized_request=req,
+        raw_keys=raw_keys,
+        quotes=parse_response(text, seq, index_codes),
+        raw_rows=raw_rows,
+        raw_presence_known=True,
+        provenance=PROVENANCE_EXACT,
+    )
+
+
 # --------------------------------------------------------------------------
 # 网络：默认 fetcher（可注入替换）
 # --------------------------------------------------------------------------
@@ -698,6 +789,94 @@ class TencentSource:
             self._stats["requests"] += 1
             if not ok:
                 self._stats["errors"] += 1
+
+    def snapshots_detailed(self, codes: list[str], *,
+                           route: str = "stocks") -> "SnapshotFetchResult":
+        """Snapshot Outcome v4 出口（**精确 raw presence**）。
+
+        与 ``snapshots()`` 抓**同一批**数据（同样按 chunk 并发、
+        同样在批次全败时抛 ``SourceError``），但额外把
+        "provider 返回了这一行、只是 ``price``/``prev_close`` 不可用"
+        与 "provider 根本没返回" 分开。
+
+        腾讯的 ``parse_response`` **保留** ``price<=0`` 的停牌行，
+        但仍会在 ``len(fields) < MIN_FIELDS``（``:316``）和
+        ``price/prev_close is None``（``:321``）两处 ``continue`` ——
+        这两处在旧接口下与"真缺席"不可区分。
+        """
+        from .outcome import PROVENANCE_EXACT, build_outcome, merge_outcomes
+
+        norm = _norm_specs(codes)
+        if not norm:
+            return build_outcome(route=route, source=self.name,
+                                 normalized_request=(), raw_keys=(),
+                                 quotes=(), raw_presence_known=True,
+                                 provenance=PROVENANCE_EXACT)
+        prefixed = [sym for sym, _ in norm]
+        idx_set = {sym for sym, explicit in norm if explicit}
+        size = self.chunk
+        assert 0 < size <= MAX_CHUNK, f"bulk_chunk 越界: {size}"
+        chunks = [prefixed[i:i + size] for i in range(0, len(prefixed), size)]
+
+        seq = self._next_seq()
+        headers = self._headers()
+        with self._lock:
+            self._stats["chunks"] += len(chunks)
+
+        parts: list[SnapshotFetchResult] = []
+        failures: list[Exception] = []
+        workers = max(1, min(self.workers, len(chunks)))
+        with cf.ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="arad-tencent"
+        ) as ex:
+            futs = [ex.submit(self._fetch_chunk_detailed, ch, seq, headers,
+                              idx_set, codes, route) for ch in chunks]
+            for fut in futs:
+                try:
+                    parts.append(fut.result())
+                except Exception as exc:  # noqa: BLE001 - 汇总后统一抛
+                    failures.append(exc)
+
+        if failures:
+            raise SourceError(
+                f"tencent: {len(failures)}/{len(chunks)} 批次失败"
+                f"（首错: {failures[0]}）"
+            ) from failures[0]
+
+        merged = merge_outcomes(parts)
+        with self._lock:
+            for q in merged.quotes:
+                self._cache[q.code] = q
+            self._stats["quotes"] += len(merged.quotes)
+        return merged
+
+    def _fetch_chunk_detailed(self, chunk: list[str], seq: int, headers: dict,
+                              idx_set: set[str], requested: list[str],
+                              route: str) -> "SnapshotFetchResult":
+        """``_fetch_chunk`` 的 v4 版（同样的重试/退避，多交回 raw 身份）。"""
+        url = self._build_url(chunk)
+        attempts = self.retries + 1
+        last_exc: Exception | None = None
+        for attempt in range(attempts):
+            if attempt:
+                delay = BACKOFF_SECONDS[min(attempt - 1, len(BACKOFF_SECONDS) - 1)]
+                with self._lock:
+                    self._stats["retries"] += 1
+                _SLEEP(delay)
+            started = time.perf_counter()
+            try:
+                raw = self._fetcher(url, headers, self.timeout)
+                out = parse_response_detailed(decode_body(raw), seq, idx_set,
+                                              requested=requested, route=route)
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                self._record(started, False, f"{type(exc).__name__}: {exc}")
+                continue
+            self._record(started, True, "")
+            return out
+        raise SourceError(
+            f"tencent: 批次 {len(chunk)} 码在 {attempts} 次尝试后仍失败: {last_exc}"
+        ) from last_exc
 
     def _fetch_chunk(self, codes: list[str], seq: int, headers: dict,
                      index_codes: set[str] | None = None) -> list[Quote]:

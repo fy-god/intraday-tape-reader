@@ -27,10 +27,13 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Callable, Iterable, Mapping, NamedTuple
+from typing import TYPE_CHECKING, Any, Callable, Iterable, Mapping, NamedTuple
 
 from ..models import Quote, board_of, guess_prefix
 from .base import SourceError
+
+if TYPE_CHECKING:                                      # pragma: no cover
+    from .outcome import SnapshotFetchResult
 
 __all__ = [
     "EastmoneySource",
@@ -307,6 +310,45 @@ def parse_clist_page(payload: str | dict, seq: int = 0) -> ClistPage:
 def parse_ulist(payload: str | dict, seq: int = 0) -> list[Quote]:
     """解析 ulist.np（批量快照）响应；字段与 clist 同源，规则一致。"""
     return parse_clist(payload, seq)
+
+
+def parse_ulist_detailed(payload: str | dict, seq: int = 0,
+                         requested: Iterable[str] | None = None,
+                         route: str = "stocks") -> "SnapshotFetchResult":
+    """``parse_ulist`` 的**精确 raw-presence** 版本（Snapshot Outcome v4）。
+
+    `IT-P1-SNAPSHOT-OUTCOME-SOURCE-SEMANTICS-DRIFT-001`（12:37 §2）：
+    东财的 ``_quote_of``（``:196-200``）在 ``f2`` / ``f18`` 为 ``"-"``
+    或 ``<= 0`` 时 ``return None``，而 ``parse_clist_page`` 已经用
+    ``:192 code = _norm_code(row.get("f12"))`` 拿到了身份。
+    旧路径 ``parse_ulist`` 直接扔掉 ``codes``，于是这一行
+    在下游变成 ``unknown_missing`` —— 而**同一事实**在腾讯上是
+    ``rejected_quality``。
+
+    任务书明确：东财 raw-f12-present / ``_quote_of``→None
+    **必须落 quality，不得落 missing**。
+
+    复用既有的双账 ``ClistPage``（``:248``）拿 raw codes，
+    **不重复实现行循环**（本仓库反复出现的 bug 类"同一语义实现两次"）。
+
+    ⚠ **键轴**：与 ``Quote.code`` 同轴 —— 东财的 ``_quote_of`` 用
+    ``_norm_code`` 产出**裸 6 位码**，``parse_clist_page.codes`` 同样用
+    ``_norm_code``，因此请求集也必须走 ``_norm_code`` 归一到裸码。
+    """
+    from .outcome import PROVENANCE_EXACT, build_outcome, normalize_request
+
+    req = normalize_request(requested or (), normalize=_norm_code)
+    page = parse_clist_page(payload, seq)
+    return build_outcome(
+        route=route,
+        source=EastmoneySource.name,
+        normalized_request=req,
+        raw_keys=list(page.codes),
+        quotes=list(page.quotes),
+        raw_rows=list(range(page.raw_rows)),   # 原始行数（内容不透明，保留计数）
+        raw_presence_known=True,
+        provenance=PROVENANCE_EXACT,
+    )
 
 
 def secid_of(code: str) -> str:
@@ -697,6 +739,57 @@ class EastmoneySource:
 
     def _fetch_ulist(self, codes: list[str], seq: int) -> list[Quote]:
         return parse_ulist(self._request_json(self._ulist_url(codes)), seq)
+
+    def snapshots_detailed(self, codes: list[str], *,
+                           route: str = "stocks") -> "SnapshotFetchResult":
+        """Snapshot Outcome v4 出口（**精确 raw presence**）。
+
+        东财的 ``_quote_of``（``:196-200``）在 ``f2``/``f18`` 为 ``"-"``
+        或 ``<= 0`` 时 ``return None``，而这些行的 ``f12`` 身份
+        在 ``parse_clist_page`` 里**已经**被 ``_norm_code`` 取出来了 ——
+        旧 ``snapshots()`` 把它和"provider 没返回"一起压成"不在列表里"。
+
+        与 ``snapshots()`` 抓**同一批**数据、同样的批次失败语义。
+        """
+        from .outcome import PROVENANCE_EXACT, build_outcome, merge_outcomes
+
+        wanted = _norm_codes(codes)
+        if not wanted:
+            return build_outcome(route=route, source=self.name,
+                                 normalized_request=(), raw_keys=(),
+                                 quotes=(), raw_presence_known=True,
+                                 provenance=PROVENANCE_EXACT)
+        seq = self._next_seq()
+        batches = [wanted[i:i + self.bulk_chunk]
+                   for i in range(0, len(wanted), self.bulk_chunk)]
+        parts: list[SnapshotFetchResult] = []
+        errors: list[SourceError] = []
+        if len(batches) == 1:
+            parts.append(self._fetch_ulist_detailed(batches[0], seq, wanted, route))
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(batches))) as ex:
+                futs = {ex.submit(self._fetch_ulist_detailed, b, seq, wanted, route): b
+                        for b in batches}
+                for fut in as_completed(futs):
+                    try:
+                        parts.append(fut.result())
+                    except SourceError as exc:
+                        errors.append(exc)
+        if errors:
+            with self._lock:
+                self._stats["pages_failed"] += len(errors)
+            self._finish(f"ulist {len(errors)}/{len(batches)} 批失败: {errors[0]}")
+            raise SourceError(
+                f"eastmoney ulist {len(errors)}/{len(batches)} 批失败: {errors[0]}")
+        merged = merge_outcomes(parts)
+        self._finish("", merged.quotes)
+        return merged
+
+    def _fetch_ulist_detailed(self, codes: list[str], seq: int,
+                              requested: list[str],
+                              route: str) -> "SnapshotFetchResult":
+        payload = self._request_json(self._ulist_url(codes))
+        return parse_ulist_detailed(payload, seq, requested=requested, route=route)
 
 
 # --------------------------------------------------------------------------

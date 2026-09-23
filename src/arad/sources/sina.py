@@ -33,10 +33,13 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from typing import Any, Callable, Iterable
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from ..models import Board, Quote, board_of, guess_prefix
 from .base import SourceError
+
+if TYPE_CHECKING:                                      # pragma: no cover
+    from .outcome import SnapshotFetchResult
 
 __all__ = [
     "SinaSource",
@@ -570,6 +573,53 @@ class SinaSource:
         url = self._bulk_url(prefixed)
         return parse_response(self._request(url), seq)
 
+    def snapshots_detailed(self, codes: list[str], *,
+                           route: str = "stocks") -> "SnapshotFetchResult":
+        """Snapshot Outcome v4 出口（**精确 raw presence**）。
+
+        与 ``snapshots()`` 抓**同一批**数据，但额外把
+        "provider 返回了这一行、只是数值不可用" 与
+        "provider 根本没返回" 分开 —— 见模块级 ``parse_response_detailed``
+        的说明。旧 ``snapshots()`` 行为**完全不变**。
+        """
+        from .outcome import PROVENANCE_EXACT, build_outcome, merge_outcomes
+
+        wanted = _norm_codes(codes)
+        if not wanted:
+            return build_outcome(route=route, source=self.name,
+                                 normalized_request=(), raw_keys=(),
+                                 quotes=(), raw_presence_known=True,
+                                 provenance=PROVENANCE_EXACT)
+        seq = self._next_seq()
+        batches = [wanted[i:i + self.bulk_chunk]
+                   for i in range(0, len(wanted), self.bulk_chunk)]
+        parts: list[SnapshotFetchResult] = []
+        errors: list[SourceError] = []
+        if len(batches) == 1:
+            parts.append(self._fetch_bulk_detailed(batches[0], seq, wanted, route))
+        else:
+            with ThreadPoolExecutor(max_workers=min(self.workers, len(batches))) as ex:
+                futs = {ex.submit(self._fetch_bulk_detailed, b, seq, wanted, route): b
+                        for b in batches}
+                for fut in as_completed(futs):
+                    try:
+                        parts.append(fut.result())
+                    except SourceError as exc:
+                        errors.append(exc)
+            if errors:
+                raise SourceError(f"sina {len(errors)}/{len(batches)} 批失败: {errors[0]}")
+        with self._lock:
+            self._stats["quotes"] = sum(len(p.quotes) for p in parts)
+        return merge_outcomes(parts)
+
+    def _fetch_bulk_detailed(self, codes: list[str], seq: int,
+                             requested: list[str],
+                             route: str) -> "SnapshotFetchResult":
+        prefixed = [f"{guess_prefix(c)}{c}" for c in codes]
+        url = self._bulk_url(prefixed)
+        return parse_response_detailed(self._request(url), seq,
+                                       requested=requested, route=route)
+
 
 # --------------------------------------------------------------------------
 # 工具
@@ -595,6 +645,74 @@ def _norm_codes(codes: Iterable[str]) -> list[str]:
             seen.add(c)
             out.append(c)
     return out
+
+
+def parse_response_detailed(text: str | bytes, seq: int = 0,
+                            requested: Iterable[str] | None = None,
+                            route: str = "stocks") -> "SnapshotFetchResult":
+    """``parse_response`` 的**精确 raw-presence** 版本（Snapshot Outcome v4）。
+
+    #### 这是本轮最核心的缺陷本体（12:37 §2）
+
+    新浪是**默认兜底源**（``config/settings.yaml`` ``fallback: ["sina"]``），
+    而它的 parser 有**两处会把 raw 行整条丢掉**：
+
+    * ``:192`` 字段数 < :data:`MIN_FIELDS`（32）；
+    * ``:197`` ``if price <= 0 or prev_close <= 0: continue  # 停牌 / 退市 / 无行情``
+
+    第 197 行是**关键词**：provider **明确返回了这一行**
+    （身份在 ``:185-186`` 已经解析出来），只是价格不可用。
+    旧接口把它 ``continue`` 掉，引擎只能看到"这个 code 不在 Quote 列表里"
+    → 记成 ``unknown_missing``。
+
+    **对比腾讯**：同一事实在腾讯侧被保留成 ``Quote(price=0)``，
+    引擎记 ``rejected_quality``。
+
+    于是 **一次 failover（腾讯→新浪）就改变了同一个 raw 事实的账本语义** ——
+    而账本是研究/模型质量标签的来源。审计把这条列为 FAIL 条件：
+    「source failover 会改变同一 raw fact 的 missing/quality 语义 → FAIL」。
+
+    #### 为什么不算"多花一次 HTTP"
+
+    身份在 ``:185-186``（``code = m.group(1)[2:]``）就拿到了，
+    **早于**数值质量门 ``:197``。所以本函数只是把那个已经算出来的
+    身份**留下来**，不增加任何请求。
+
+    #### 与 ``parse_universe`` 的刻意不对称
+
+    ``parse_universe``（``:239``）**保留**停牌行，理由写在 ``:252-253``：
+    "停牌/无成交的行也保留：它们的代码仍需参与后续快照轮询，否则一只票
+    停牌一天就从监控里消失、复牌当天完全收不到信号"。
+    而 bulk parser 丢掉它们 —— 同一个源内部两套相反口径。
+    本函数**不改变**旧 ``parse_response`` 的行为（它被大量测试与
+    ``parse_universe`` 依赖），只把**事实**额外交出来。
+    """
+    from .outcome import PROVENANCE_EXACT, build_outcome, normalize_request
+
+    req = normalize_request(requested or (), normalize=_norm_code)
+
+    s = _as_text(text)
+    raw_keys: list[str] = []
+    raw_rows: list[Any] = []
+    if s.strip():
+        for m in LINE_RE.finditer(s):
+            code = m.group(1)[2:]
+            if not code.isdigit():
+                continue
+            # **身份在数值质量门之前捕获** —— 本函数存在的全部理由。
+            raw_keys.append(code.zfill(6))
+            raw_rows.append(m.group(0))
+
+    return build_outcome(
+        route=route,
+        source=SinaSource.name,
+        normalized_request=req,
+        raw_keys=raw_keys,
+        quotes=parse_response(text, seq),
+        raw_rows=raw_rows,
+        raw_presence_known=True,
+        provenance=PROVENANCE_EXACT,
+    )
 
 
 def _dedupe(quotes: Iterable[Quote]) -> list[Quote]:
