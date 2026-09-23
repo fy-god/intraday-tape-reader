@@ -3131,6 +3131,51 @@ def _check_browser(url: str, *, wait_ms: int = 2500) -> dict:
     return {"ran": True, "skipped": False, "errors": errors[:20], "url": url}
 
 
+def _t0_universe_size(ret: int | None, *, retained_pool: int,
+                      attempt: Any = None, say: Any = None) -> int | None:
+    """t0 股票池刷新结果 -> 判决层用的**三态** `universe_size`。
+
+    `IT-P1-REFRESH-FAILED-POOL-RETAINED-READ-AS-MEASURED-ZERO-001`
+    （云端 18:17 §0，P0 假红回归）。**纯函数**，便于直接测 ——
+    修前这段逻辑内联在 `def run`（约 `:3308`）里，而全 `tests/`
+    对 `run` 入口点命中 **0 次**，所以缺陷能在 `1830 passed` 下存活。
+
+    三种情况**必须分开**（这是本仓库反复出现的
+    "一个 `0` 承载两个语义状态" bug 类）：
+
+    ====================  ==================  ==========================
+    真实情况              返回值              判决层应看到
+    ====================  ==================  ==========================
+    刷新成功且拿到 N 只    N > 0               N（**明确测到**）
+    真的扫到 0 只           0，池子**也空**     0（**明确坏**，判红）
+    刷新失败但池子被保留    0，池子**非空**     ``None``（**未测量**）
+    ====================  ==================  ==========================
+
+    第三行就是被修掉的假红：`engine.refresh_universe()` 的
+    `rejected_smaller` 与 `all_failed` 两条路径都**保留原股票池**
+    却 `return 0`，而 `int(... or 0)` 把它压成了"明确测到 0"。
+
+    :param ret: `refresh_universe()` 的返回值（异常路径传 ``None``）
+    :param retained_pool: 刷新后 `engine._codes` 的长度
+    :param attempt: `engine._universe_attempt`（只用于打印留痕，不参与判定）
+    :param say: 打印函数（默认不打印，便于测试与静默调用）
+    """
+    if ret not in (0, None) and int(ret) > 0:
+        return int(ret)
+    if ret is None:
+        return None                     # 异常 -> 未测量
+    if int(ret) == 0 and retained_pool > 0:
+        # 刷新未生效（保留原池）——**不是**"一只票都没扫"。
+        if say is not None:
+            _att = dict(attempt) if isinstance(attempt, dict) else {}
+            say(f"      [i] 股票池刷新未生效（返回 0，但保留 "
+                f"{retained_pool} 只；attempt="
+                f"{_att.get('status') or _att.get('outcome') or '?'}）"
+                f"—— 记为**未测量**，不判'一只票都没扫'")
+        return None
+    return int(ret)                     # 真的 0 只且池子也空 -> 明确坏
+
+
 def _soak_loop(engine: Any, probe: ApiProbe, *, max_rounds: int | None,
                deadline: float, interval: float, verbose: bool) -> tuple[list[dict], dict]:
     """主 soak 循环：逐轮 poll_once(force=True) + 看板探活。"""
@@ -3305,14 +3350,38 @@ def run(args: argparse.Namespace) -> int:
     # 判决层再想分开也已经没有信息了。
     # 现在：异常 -> `None`（**未测量**，不许判红）；
     # `refresh_universe()` 正常返回 0 -> 真的 0（**明确坏**）。
+    #
+    # ⚠⚠ `IT-P1-REFRESH-FAILED-POOL-RETAINED-READ-AS-MEASURED-ZERO-001`
+    # （云端 18:17 §0，**P0 假红回归 —— 我上一轮引入的**）：
+    # 上面那句注释**漏掉了第三种情况**。我实测 `engine.refresh_universe()`
+    # 的 4 个 return 里，`:1302`（`rejected_smaller`：部分池比现有池小 ->
+    # 拒绝覆盖、**保留现有池**）与 `:1326`（`all_failed`：**保留原股票池**）
+    # **都是 `return 0`**，且这两条路径**不重写** `self._codes_raw` ——
+    # 池子确实还在（实测 5563 只 × 30 轮）。
+    #
+    # 于是 `int(... or 0)` 把「刷新失败但池子保留（非空）」也压成 `0`，
+    # 判决层（`:1942 elif _abs_eff <= 0`）按"明确测到 0"处理，输出
+    # 「扫描池为 **0 只**…本场**一只票都没扫**」——**假红**：
+    # 有 30 轮真实证据却判"一只票都没扫"。
+    #
+    # 假红与假绿同样致命：一次全源抖动就让整场判红，运维学会忽略红，
+    # 此后真假红不再可区分。
+    #
+    # 修法：**按"返回值 + 池子是否被保留"的联合状态**判定，而不是 `or 0`。
+    # `0` 只在**池子也真的空了**时才代表"测到 0"；池子被保留时，
+    # 这次刷新的语义是"**未生效**"，必须落回 `None`（未测量）。
     t0 = time.perf_counter()
     universe_size: int | None = None
     try:
-        universe_size = int(engine.refresh_universe() or 0)
+        _ret = engine.refresh_universe()
+        universe_size = int(_ret or 0)
     except Exception as exc:                         # noqa: BLE001
         print(f"      [!] 股票池刷新异常：{type(exc).__name__}: {exc}")
     refresh_s = time.perf_counter() - t0
     codes = list(getattr(engine, "_codes", []) or [])
+    universe_size = _t0_universe_size(
+        universe_size, retained_pool=len(codes),
+        attempt=getattr(engine, "_universe_attempt", None), say=print)
     watch = list(getattr(engine, "watchlist", []) or [])
     fell_back = bool(codes) and len(codes) <= len(watch)
     # R-12 / WP01：把股票池**真相**（含分母）取出来。必须在 refresh 之后 ——

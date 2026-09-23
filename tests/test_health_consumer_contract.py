@@ -442,6 +442,82 @@ def test_transport_and_freshness_denominators_are_session_total():
 
 
 # ===========================================================================
+# 云端 18:17 §0：IT-P1-REFRESH-FAILED-POOL-RETAINED-READ-AS-MEASURED-ZERO-001
+#   —— **P0 假红回归**（我上一轮 IT-P1-UNIVERSE-T0-MEASURED-ZERO... 的半边）
+# ===========================================================================
+
+def test_refresh_failed_but_pool_retained_is_unmeasured_not_zero():
+    """`0` 返回值 **+ 池子非空** -> `None`（未测量），**不是**"测到 0 只"。
+
+    云端 18:17 §0 实测：`engine.refresh_universe()` 的 4 个 `return` 里，
+    `rejected_smaller`（部分池更小 -> 拒绝覆盖、保留现有池）与
+    `all_failed`（保留原股票池）**都是 `return 0`** 且**不重写**
+    `self._codes_raw`。修前 `int(... or 0)` 把它压成"明确测到 0"，
+    判决层输出「扫描池为 **0 只**…本场**一只票都没扫**」——
+    而会话里明明有 **30 轮、最小 5563 只**的真实证据。
+
+    **假红与假绿同样致命**：一次全源抖动就让整场判红，运维学会忽略红，
+    此后真假红不再可区分。
+    """
+    f = _ls()._t0_universe_size
+    # 失败但保留池 -> **未测量**（这是被修掉的假红）
+    assert f(0, retained_pool=5563) is None
+    assert f(0, retained_pool=4100) is None     # rejected_smaller 的实测形态
+    assert f(0, retained_pool=1) is None
+    # 异常 -> 未测量（上一轮已修，防止回归）
+    assert f(None, retained_pool=5563) is None
+    assert f(None, retained_pool=0) is None
+
+
+def test_refresh_measured_zero_is_still_red():
+    """**阳性对照**：返回值 0 **且池子也空** -> 仍是 `0`（明确坏，判红）。
+
+    没有这条，一个"永远返回 None"的实现也能通过上面那条。
+    """
+    f = _ls()._t0_universe_size
+    assert f(0, retained_pool=0) == 0
+    assert f(0, retained_pool=0) is not None
+
+
+def test_refresh_success_passes_size_through():
+    """**阳性对照**：成功拿到 N 只必须**原样透传**，不得被软化。"""
+    f = _ls()._t0_universe_size
+    assert f(5563, retained_pool=5563) == 5563
+    assert f(1, retained_pool=1) == 1
+    assert f(6000, retained_pool=0) == 6000    # 极端：说 6000 但池子空，仍信返回值
+
+
+def test_refresh_failed_pool_retained_does_not_red_the_verdict():
+    """端到端：失败但保留池时，整场判决**不得**被判红。
+
+    复刻云端 §0.3 的三方对照中的第 2 行（`universe_size=None` -> ok/exit 0）。
+    """
+    m = _green_metrics()
+    m["setup"] = {"universe_size": None, "fell_back_to_watchlist": False,
+                  "universe_truth": _green_t0()}
+    sess = _green_session()
+    sess["rounds_total"] = 30
+    sess["universe_abs_min"] = 5563
+    sess["universe_abs_measured_rounds"] = 30
+    m["universe_session"] = sess
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe")
+    assert _lvl(v, "universe") != "fail", (
+        f"有 30 轮真实证据不得判'一只票都没扫'：{det}")
+    assert "一只票都没扫" not in det, f"不得出现假红文案：{det}"
+    assert v["healthy"] is True, f"exit={v['exit_code']} fail={v['fail']}"
+
+    # **三态对照**：真的测到 0 只（池子也空）时**必须**判红。
+    m2 = _green_metrics()
+    m2["setup"] = {"universe_size": 0, "fell_back_to_watchlist": False,
+                   "universe_truth": _green_t0()}
+    m2["universe_session"] = _green_session()
+    v2 = _ls().evaluate_health(m2)
+    assert _lvl(v2, "universe") == "fail", (
+        "明确测到 0 只必须判红（否则就是假绿）")
+
+
+# ===========================================================================
 # WP01 / RED C：session truth 不依赖 t0
 # ===========================================================================
 def test_session_facts_consumed_without_t0():
