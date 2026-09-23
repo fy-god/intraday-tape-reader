@@ -588,6 +588,86 @@ class SourceManager:
             raise last_exc
         return None
 
+    def call_detailed(self, codes: list[str], *, route: str) -> Any:
+        """WP02：调 ``snapshots_detailed`` 并把结果**原子绑定**到实际服务源。
+
+        `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001` / 云端 2026-09-23_20-09-44 §6.1。
+
+        为什么必须有这个方法（而不是"先 ``call()`` 再 ``serving_of(route)``"）：
+        ``serving_of`` 读的是**最近一次**成功供数的源下标。两次读取之间存在
+        窗口 —— 期间任何一次切换（本方法内部的重试、另一个线程的同路由请求）
+        都会让"这批结果的来源"与"serving_of 的答案"**不是同一件事**。
+        用两个时点的观测拼一个事实，正是本仓库反复出现的
+        "拿子集的结论当全局的结论" bug 类。
+
+        因此本方法把**来源**放进返回值里，与 outcome 同生共死：
+        ``SnapshotFetchResult.source`` 由**实际返回数据的那一个源**填入，
+        调用方**不得**再去问 Manager"刚才是谁"。
+
+        实现要点：
+        * 只对**内置源**（有 ``snapshots_detailed``）走 exact 路径；
+        * legacy 源（没有该方法，例如测试里的 ``FakeSource``/第三方源）
+          退化为"调 ``snapshots`` 再包成 ``raw_presence_known=False`` 的
+          quote_projection outcome" —— **不得**伪装成 exact；
+        * failover 顺序与 ``call`` 完全一致（主源优先，逐个后备）；
+        * 全部失败时抛最后一个异常（与 ``call`` 同语义）。
+
+        :param codes: 请求的代码（个股裸码 / 指数带前缀，与各源约定一致）
+        :param route: 路由名（"stocks" / "index" / "universe"），
+                      决定 ``_fails`` / ``_serving`` 的记账分桶
+        :returns: ``SnapshotFetchResult``，其 ``source`` = 实际服务源名
+        """
+        from .sources.outcome import build_outcome
+
+        order = [self.idx] + [i for i in range(len(self.sources))
+                              if i != self.idx]
+        last_exc: Exception | None = None
+        for i in order:
+            src = self.sources[i]
+            name = str(getattr(src, "name", "?"))
+            try:
+                detailed = getattr(src, "snapshots_detailed", None)
+                if callable(detailed):
+                    out = detailed(codes, route=route)
+                else:
+                    # legacy 源：**没有** raw 证据，只能从 Quote 投影反推。
+                    # `raw_presence_known=False` 让下游必须降级措辞
+                    # （见 outcome.PROVENANCE_LEGACY）。
+                    quotes = list(getattr(src, "snapshots")(codes) or [])
+                    out = build_outcome(
+                        route=route, source=name,
+                        normalized_request=tuple(str(c) for c in codes),
+                        raw_keys=(), quotes=quotes,
+                        raw_presence_known=False)
+            except Exception as exc:  # noqa: BLE001 - 逐个后备源尝试
+                last_exc = exc
+                log.warning("数据源 %s.snapshots_detailed 失败: %s", name, exc)
+                continue
+            # ⚠ 原子绑定：source 以**实际返回数据的源**为准。
+            # 源自己填的 name 与 Manager 看到的是同一个对象，但前者是
+            # "谁产出"，后者是"Manager 以为谁产出" —— 以产出方为准更不易错。
+            if getattr(out, "source", "") != name:
+                out = out._replace(source=name)
+            self._serving[route] = i
+            if i == self.idx:
+                self._fails[route] = 0
+            else:
+                n = self._bump(route)
+                log.info("路由 %s detailed 已由备用源 %s 提供服务（连续 %d/%d）",
+                         route, name, n, self.threshold)
+                if n >= self.threshold:
+                    self.idx = i
+                    self._fails.clear()
+                    log.warning("数据源已正式切换 -> %s", name)
+            return out
+
+        n = self._bump(route)
+        if n >= self.threshold:
+            self._switch()
+        if last_exc:
+            raise last_exc
+        return None
+
     def health(self) -> list[dict]:
         out = []
         for pos, s in enumerate(self.sources):
