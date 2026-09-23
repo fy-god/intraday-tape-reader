@@ -1,0 +1,33 @@
+{
+  "A_direct": {
+    "source": "A",
+    "provenance": "exact_raw_presence",
+    "admitted": [
+      "600002"
+    ],
+    "rejected_quality": [
+      "600001"
+    ],
+    "unknown_missing": [
+      "600003"
+    ],
+    "raw_return_coverage": 0.6666666666666666,
+    "usable_coverage": 0.3333333333333333
+  },
+  "B_failover": {
+    "source": "B",
+    "provenance": "exact_raw_presence",
+    "admitted": [
+      "600002"
+    ],
+    "rejected_quality": [
+      "600001"
+    ],
+    "unknown_missing": [
+      "600003"
+    ],
+    "raw_return_coverage": 0.6666666666666666,
+    "usable_coverage": 0.3333333333333333
+  },
+  "terminals_identical": true
+}

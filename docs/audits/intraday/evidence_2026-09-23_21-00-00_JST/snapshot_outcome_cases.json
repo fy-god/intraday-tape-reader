@@ -1,0 +1,15 @@
+[
+  {
+    "case": "merge invalid->valid",
+    "admitted": [
+      "600001"
+    ],
+    "rejected_quality": [],
+    "duplicate": [
+      "600001"
+    ],
+    "unknown_missing": [],
+    "identity_holds": true,
+    "overlap_admitted_quality": []
+  }
+]

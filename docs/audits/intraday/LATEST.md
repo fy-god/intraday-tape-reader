@@ -2,11 +2,39 @@
 
 **最新云端独立审计**：[`2026-09-23_20-09-44_JST.md`](./2026-09-23_20-09-44_JST.md)  
 **最新云端 Agent 任务书**：[`2026-09-23_20-09-44_JST_AGENT_TASK.md`](./2026-09-23_20-09-44_JST_AGENT_TASK.md)  
-**最新本地 Agent 产品轮**：[`2026-09-23_19-05-00_JST.md`](./2026-09-23_19-05-00_JST.md)  
-**最新产品提交 / reviewed_source_sha**：`ff8fd8f125cd785340c6fd62f3d15db61b02f333`  
+**最新本地 Agent 产品轮**：[`2026-09-23_21-00-00_JST.md`](./2026-09-23_21-00-00_JST.md)  
+**最新产品提交 / reviewed_source_sha**：`a0ca7e6caff972d22b903a80b1731e2b7d5a2f95`  
+**上一版本地轮报告**：[`2026-09-23_19-05-00_JST.md`](./2026-09-23_19-05-00_JST.md)  
 **本轮审计开始 docs HEAD**：`014435893a63d02b35ae48c34f3179c9a4fa8845`  
 **report_commit_sha**：`a0535c494453f992d22e6f8d6d19e8787784abfd`  
 **agent_task_commit_sha**：`59a646760949df09e034e5d1b60f97986b853b7a`  
+
+  > **本轮本地产品轮（21:00 JST）：任务书 WP01 三条 RED 逐条复现 —— 三条全部成立、已全修；WP02 也落地。**
+  > 产品提交 `4648b1c`（WP01）+ `a0ca7e6`（WP02）。
+  >
+  > 1. `IT-P2-SNAPSHOT-OUTCOME-COVERAGE-SEMANTIC-COLLISION-001` —— `coverage`
+  >    一个名字被"传输轴/可用轴"两种语义争用，与 `eastmoney.py:421-439`
+  >    早已写明的纪律矛盾。已拆成 `raw_return_coverage` + `usable_coverage`。
+  > 2. `IT-P2-TENCENT-DETAILED-EXPLICIT-STOCK-KEY-AXIS-001` ——
+  >    **⚠ 我第一版探针写错、误判"不成立"**（`index_codes` 默认 `None` 让
+  >    `idx_set=set()`，把缺陷那一行整个绕开）。按类级出口重测后**缺陷复现**。
+  >    **探针没走进被审分支 = 没测**（本会话第 3 次）。
+  > 3. `IT-P2-SNAPSHOT-MERGE-TERMINAL-OVERLAP-001` —— 逐批次结论当成合并后结论，
+  >    同一码可同时在 `admitted` 与 `rejected_quality`。
+  >
+  > **WP02 `SourceManager.call_detailed`**：来源放进返回值、与 outcome **原子绑定**
+  > （云端 §6.1 明说"不能先 call 再 `serving_of` 去猜"）。同一 raw fact 在
+  > failover 前后 terminal 桶**逐元素相同**。
+  >
+  > 全量 pytest **1891 passed**（修前 1874）；**5 项行为性 RED / 0 结构性 ERROR**。
+  >
+  > **⚠ 诚实边界**：`IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001` **仍未修** ——
+  > `call_detailed` 只是 WP03 的输入接口、**尚未接进 `poll_once`**，
+  > 故**本轮两个提交都不改变任何线上账本数字**。
+  > `IT-P1-UNIVERSE-MEMBERSHIP-QUALITY-001` 连续第 **7** 轮未修（WP07 明说
+  > "仅 WP01-04 绿后启动"，WP03/04 未做）。**模型真实增益 = 0**。
+
+---
 **上一版完整 LATEST 历史索引（不可变快照）**：  
 https://github.com/fy-god/intraday-tape-reader/blob/014435893a63d02b35ae48c34f3179c9a4fa8845/docs/audits/intraday/LATEST.md
 

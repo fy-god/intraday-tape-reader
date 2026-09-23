@@ -1,0 +1,32 @@
+[
+  {
+    "case": "R=3 P=3 Q=1",
+    "requested": 3,
+    "raw_present": 3,
+    "admitted": 1,
+    "raw_return_coverage": 1.0,
+    "usable_coverage": 0.3333333333333333,
+    "coverage_alias": 0.3333333333333333,
+    "identity_holds": true
+  },
+  {
+    "case": "R=3 P=3 Q=3",
+    "requested": 3,
+    "raw_present": 3,
+    "admitted": 3,
+    "raw_return_coverage": 1.0,
+    "usable_coverage": 1.0,
+    "coverage_alias": 1.0,
+    "identity_holds": true
+  },
+  {
+    "case": "R=3 P=0 Q=0",
+    "requested": 3,
+    "raw_present": 0,
+    "admitted": 0,
+    "raw_return_coverage": 0.0,
+    "usable_coverage": 0.0,
+    "coverage_alias": 0.0,
+    "identity_holds": true
+  }
+]
