@@ -622,6 +622,18 @@ def _universe_session(rows: Sequence[dict]) -> dict:
       `attempt_statuses` 给出**实际出现过**的状态集合，便于对账。
     * 老轮样本没有这些键 -> `measured=False`，消费方据此跳过（不判红）。
     """
+    # `IT-P1-FRESHNESS-GATE-COUNTS-RECORDS-NOT-EVIDENCE-001`（云端 18:07 §1.2）
+    # 的**正确**修法在这里**不在**本表：
+    #
+    # 我一开始按云端的建议 (b) 把 `unknown` 提到 4（高于 stale），
+    # **那会造出一个新的镜像错误**：`29 轮 unknown + 1 轮 stale` 时
+    # `max()` 会取 `unknown`，于是会话级结论变成"未测量"，
+    # **把一次真实的陈旧掩盖成"没测到"** —— 用一个假绿换一个假"未测量"。
+    #
+    # 真正的修法是**在生产端**让 `freshness_measured_rounds` 只数
+    # **有年龄证据**的轮（`unknown` 不计），这样消费端 `:2337` 那条
+    # 本来正确的守卫就会正常触发。本表保持原样：
+    # 只回答"最坏的真实状态是什么"，`unknown` 只在**全部轮次**都无证据时胜出。
     _order = {"stale": 3, "aging": 2, "fresh": 1, "unknown": 0}
     states: dict[str, int] = {}
     statuses: dict[str, int] = {}
@@ -733,8 +745,18 @@ def _universe_session(rows: Sequence[dict]) -> dict:
     evidence_facts = {
         #: 会话总轮数 —— 一切"全程/k of N"断言的**唯一**分母。
         "rounds_total": len(rows),
-        #: freshness 轴的测量轮数（与 `measured` 同轴，但显式给出计数）。
-        "freshness_measured_rounds": sum(states.values()),
+        #: freshness 轴的测量轮数。
+        #:
+        #: `IT-P1-FRESHNESS-GATE-COUNTS-RECORDS-NOT-EVIDENCE-001`
+        #: （云端 18:07 §1.2）：这里修前是 `sum(states.values())` ——
+        #: **数的是记录条数，不是证据**。29 轮 `unknown`（压根没测到，
+        #: age 为 None）+ 1 轮 `fresh` 会得出 `measured_rounds=30`，
+        #: 于是消费方 `:2337 elif _fresh_measured < _rounds_total`
+        #: 这道**本来正确的**守卫 `30 < 30` 恒假、**永远不会触发**，
+        #: 产品打出一个新鲜样本代表的"会话级新鲜"。
+        #: 修法：`unknown`（= 无年龄证据）**不计入测量轮数**。
+        "freshness_measured_rounds": sum(
+            v for k, v in states.items() if k != "unknown"),
     }
     # --- `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（09-23 00:12 §3）-----
     #
@@ -2264,6 +2286,13 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     # 这里**不再重复赋值** —— 重复赋值会让"唯一分母"出现两个来源，
     # 正是本文件反复批评的"同一语义实现两次"。
     _fresh_measured = _safe_int(_sess.get("freshness_measured_rounds"))
+    #: 会话总轮数 —— transport / freshness 两条**全称肯定句**的唯一分母。
+    #:
+    #: 刻意**不**复用 scope 块的 `_rounds_total`：那一支在 `<=0` 时会
+    #: 退化成 `_scope_measured`（旧报告缺键时的兼容处理），
+    #: 而"退化成分母=已测子集"正是本 bug 类的本体。
+    #: 这里宁可取 0，让全称门自然不成立。
+    _sess_rounds_total = _safe_int(_sess.get("rounds_total"))
 
     if _sess_measured and _ti > 0:
         # 会话期间**确凿**有轮次被 provider 声明截断 —— 硬缺口，判 fail。
@@ -2295,9 +2324,28 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             f"（会话另测到 {_tmeas} 轮，其中 {_ti} 轮不完整）—— "
             f"**会话级的'全完整'不能抹掉这个硬事实**："
             f"此期间的'没有告警'不能解释为'没有异动'", level="fail")
-    elif _sess_measured and _ti == 0 and _tmeas > 0:
+    elif _sess_measured and _ti == 0 and _tmeas > 0 and _sess_rounds_total > 0 \
+            and _tmeas == _sess_rounds_total:
+        # `IT-P1-TRANSPORT-POSITIVE-USES-EVIDENCED-SUBSET-001`（云端 18:07 §1.1）：
+        #
+        # **全称肯定句的门必须是全称的，分母必须是会话总轮数。**
+        # 修前这里是 `_tmeas > 0` —— **存在量词**，而文案是
+        # 「会话期间 N 轮 transport **均为**完整」—— **全称量词**。
+        # 实测后果：30 轮会话里 29 轮根本没测（`transport_complete=None`）、
+        # 只有 1 轮完整 -> `_tmeas=1`、`_ti=0` -> 判 ok 并打出
+        # 「会话期间 **1** 轮 transport 均为完整」——
+        # **拿证据子集当了自己的分母**，与 scope 轴 `_full_covers_all`
+        # 修掉的是**同一条 bug 类**。
         add("universe_transport", True,
-            f"会话期间 {_tmeas} 轮 transport 均为完整（无截断）", level="ok")
+            f"会话期间 {_tmeas}/{_sess_rounds_total} 轮 transport "
+            f"均为完整（无截断）", level="ok")
+    elif _sess_measured and _ti == 0 and 0 < _tmeas < _sess_rounds_total:
+        # 只测到一部分轮次 -> **不许**说"会话期间均完整"，必须写出 k/N。
+        add("universe_transport", True,
+            f"会话期间**未全程取得 transport 完整性证据**："
+            f"{_tmeas}/{_sess_rounds_total} 轮测到且均完整"
+            f"（其余 {_sess_rounds_total - _tmeas} 轮无 transport 证据）"
+            f"—— 跳过不算失败，但**不能**说'会话期间无截断'", level="ok")
     elif _t0_known and _t0_transport_detail:
         add("universe_transport", _t_complete is True,
             _t0_transport_detail, level="ok" if _t_complete else "fail")

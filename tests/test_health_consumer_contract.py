@@ -297,6 +297,151 @@ def test_green_baseline_is_actually_green():
 
 
 # ===========================================================================
+# 云端 18:07 §1.1 / §1.2：两条**邻轴**上的同一条 bug 类
+#   —— 肯定句的分母/门与它声称的覆盖范围不一致
+# ===========================================================================
+
+def test_transport_positive_never_uses_evidenced_subset():
+    """`IT-P1-TRANSPORT-POSITIVE-USES-EVIDENCED-SUBSET-001`（云端 18:07 §1.1）。
+
+    30 轮会话里 **29 轮根本没测** transport（`transport_complete=None`）、
+    只有 1 轮完整。修前门是 `_tmeas > 0` —— **存在量词**，
+    而文案是「会话期间 N 轮 transport **均为**完整」—— **全称量词**。
+
+    云端实测修前输出：「会话期间 **1** 轮 transport 均为完整（无截断）」，
+    且 `healthy=True / exit=0`。这与 scope 轴 `_full_covers_all` 修掉的
+    是**同一条** bug 类：**拿证据子集当了自己的分母**。
+    """
+    m = _green_metrics()
+    sess = _green_session(rounds_transport_measured=1,
+                          rounds_transport_incomplete=0)
+    sess["rounds_total"] = 30
+    m["universe_session"] = sess
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_transport")
+    # 不许把 1 轮的证据说成"会话期间均完整"。
+    assert "均为完整" not in det or "1/30" in det, (
+        f"1/30 轮不得自称会话期间均完整：{det}")
+    assert "未全程" in det, f"必须显式写出覆盖不足：{det}"
+    assert "1/30" in det, f"必须写出真实 k/N：{det}"
+    # 不是失败（缺证据 != 坏），但**绝不能**是"无截断"的肯定结论。
+    assert "不能" in det or "未全程" in det
+
+
+def test_transport_positive_control_all_measured_still_asserts():
+    """**负控制**：30/30 轮都测到且完整，**必须仍然**肯定。
+
+    没有这条，一个"永远说未全程"的实现也能通过上面那条。
+    """
+    m = _green_metrics()
+    sess = _green_session(rounds_transport_measured=30,
+                          rounds_transport_incomplete=0)
+    sess["rounds_total"] = 30
+    m["universe_session"] = sess
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_transport")
+    assert "均为完整" in det, f"30/30 全完整必须肯定：{det}"
+    assert "未全程" not in det, f"30/30 不该说覆盖不足：{det}"
+    assert _lvl(v, "universe_transport") == "ok"
+
+
+def test_freshness_unknown_records_are_not_evidence():
+    """`IT-P1-FRESHNESS-GATE-COUNTS-RECORDS-NOT-EVIDENCE-001`（18:07 §1.2）。
+
+    **两条机制叠加**造成修前的假绿：
+
+    (a) `:737 freshness_measured_rounds = sum(states.values())`
+        —— **数的是记录条数，不是证据**。29 轮 `unknown`（压根没测到、
+        age 为 None）+ 1 轮 `fresh` 得出 `30`，于是 `:2337`
+        `elif _fresh_measured < _rounds_total` 这道**本来正确的**守卫
+        `30 < 30` 恒假、**永远不会触发**（云端称"永不为真的守卫"）；
+    (b) `_order` 让 `unknown`(0) 被 `fresh`(1) 压过，`worst_state="fresh"`，
+        连 `:2328 elif _worst == "unknown"` 的诚实分支也跳过。
+
+    云端实测修前输出：「会话期间股票池新鲜（30/30 轮，
+    {'unknown': 29, 'fresh': 1}）」，`healthy=True / exit=0 / warn=[]`。
+
+    ⚠ 这条与 `test_freshness_positive_never_uses_evidenced_subset`
+    **不同**：那条是"**轮样本根本没有 freshness 键**"，
+    这条是"**有键但值是 `unknown`**" —— 后者才是把 `measured`
+    计数器旁路掉的那条路径。
+    """
+    rows = []
+    for _ in range(29):
+        rows.append({"universe_fresh_state": "unknown",
+                     "universe_attempt_status": ""})
+    rows.append({"universe_fresh_state": "fresh",
+                 "universe_attempt_status": "applied", "universe_age_s": 5.0})
+    agg = _ls()._universe_session(rows)
+    assert agg["states"] == {"unknown": 29, "fresh": 1}, agg["states"]
+    # **核心**：测量轮数必须只数**有年龄证据**的轮。
+    # 用 `.get(k, sum-of-states)` 退化 —— 那正是缺陷本体，
+    # 于是断言仍然**行为性**失败，而不是抛 `KeyError`。
+    assert agg.get("freshness_measured_rounds", 30) == 1, (
+        f"29 轮无证据不得被算成已测量：{agg.get('freshness_measured_rounds')}")
+    assert agg.get("rounds_total", 0) == 30
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = agg
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_freshness")
+    assert not _asserts_session_fresh(det), (
+        f"1 轮 fresh 不得代表会话级新鲜：{det}")
+    assert "未全程" in det, f"必须写出覆盖不足：{det}"
+    assert "1/30" in det, f"必须写出真实 k/N：{det}"
+    assert _lvl(v, "universe_freshness") != "fail"
+
+
+def test_freshness_unknown_records_positive_control_stale_wins():
+    """**镜像错误控制**：29 `unknown` + 1 `stale` 必须**仍然是 fail**。
+
+    我一度按建议把 `_order` 里 `unknown` 提到 4（高于 stale）——
+    那会让 `max()` 取到 `unknown`，把一次**真实的陈旧**掩盖成"未测量"，
+    等于用一个假绿换一个假"未测量"。这条测试钉住那个反例。
+    """
+    rows = []
+    for _ in range(29):
+        rows.append({"universe_fresh_state": "unknown",
+                     "universe_attempt_status": ""})
+    rows.append({"universe_fresh_state": "stale",
+                 "universe_attempt_status": "applied", "universe_age_s": 9999.0})
+    agg = _ls()._universe_session(rows)
+    assert agg["worst_state"] == "stale", (
+        f"unknown 不得掩盖真实的 stale：worst={agg['worst_state']}")
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = agg
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe_freshness") == "fail", (
+        "真实的陈旧必须判 fail，不能被 unknown 掩盖")
+    assert v["healthy"] is False
+    assert v["exit_code"] == 1
+
+
+def test_transport_and_freshness_denominators_are_session_total():
+    """两条邻轴的**唯一分母**都必须是会话总轮数（同一条不变量的可执行形式）。
+
+    这是云端 §1.3「修一条不等于修一类」的直接对策：
+    不去逐条修，而是断言**这两条**全称肯定句都拿 `rounds_total` 当分母。
+    """
+    m = _green_metrics()
+    sess = _green_session(rounds_transport_measured=7,
+                          rounds_transport_incomplete=0)
+    sess["rounds_total"] = 30
+    sess["states"] = {"fresh": 7, "unknown": 23}
+    sess["worst_state"] = "fresh"
+    sess["freshness_measured_rounds"] = 7
+    m["universe_session"] = sess
+    v = _ls().evaluate_health(m)
+    for axis in ("universe_transport", "universe_freshness"):
+        det = _detail(v, axis)
+        assert "7/30" in det or "未全程" in det, (
+            f"{axis} 必须用会话总轮数 30 当分母：{det}")
+        assert "均为完整" not in det, f"{axis} 不得对 7/30 用全称句：{det}"
+        assert not _asserts_session_fresh(det), f"{axis}: {det}"
+
+
+# ===========================================================================
 # WP01 / RED C：session truth 不依赖 t0
 # ===========================================================================
 def test_session_facts_consumed_without_t0():
