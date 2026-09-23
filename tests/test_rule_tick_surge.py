@@ -537,8 +537,13 @@ def test_window_requires_history_coverage():
 
 
 def test_performance_1000_stocks():
-    """1000 只股票单次 evaluate 应远快于 200ms。"""
-    import time
+    """1000 只股票单次 evaluate 应远快于 200ms。
+
+    `IT-P1-WALLCLOCK-BOUND-IS-A-CORRECTNESS-GATE-001`（云端 §2.1）：
+    改用**中位数**采样，单次环境停顿不再翻转退出码。
+    云端实测此处中位 **5.621ms**、最大 6.913ms，余量 **35.58x**。
+    """
+    from conftest import median_elapsed
 
     st = FakeState()
     quotes = {}
@@ -550,10 +555,9 @@ def test_performance_1000_stocks():
     snap = Snapshot(ts=datetime.fromtimestamp(T0), seq=1, quotes=quotes)
     rule = build({})
     ctx = mk_ctx(st)
-    t0 = time.perf_counter()
-    rule.evaluate(snap, ctx)
-    elapsed = time.perf_counter() - t0
-    assert elapsed < 0.2, f"evaluate 太慢: {elapsed * 1000:.1f}ms"
+    rule.evaluate(snap, ctx)                    # 预热（去掉首次分配开销）
+    elapsed = median_elapsed(lambda: rule.evaluate(snap, ctx), repeat=7)
+    assert elapsed < 0.2, f"evaluate 中位太慢: {elapsed * 1000:.1f}ms"
 
 
 def test_evaluate_with_hits_reports_all_windows():

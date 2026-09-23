@@ -1205,11 +1205,17 @@ def test_performance_1000_stocks():
     build({"max_per_round": 0}).evaluate(snap, ctx)   # 预热（去掉首次分配开销）
 
     rule = build({"max_per_round": 0})     # 全新实例：炸板幂等状态为空，全量求值
-    t0 = time.perf_counter()
     alerts = rule.evaluate(snap, ctx)
-    elapsed = time.perf_counter() - t0
     assert len(alerts) == 800
-    assert elapsed < 0.2, f"evaluate 太慢: {elapsed * 1000:.1f}ms"
+    # `IT-P1-WALLCLOCK-BOUND-IS-A-CORRECTNESS-GATE-001`（云端 §2.1）：
+    # 改用**中位数**采样，单次环境停顿（GC/调度）不再翻转退出码。
+    # 云端实测此处中位 31.566ms、最大 35.060ms，即余量 6.34x；
+    # 上次那个 214.3ms 是约 6.8 倍的环境性停顿，不是薄余量。
+    from conftest import median_elapsed
+
+    elapsed = median_elapsed(
+        lambda: build({"max_per_round": 0}).evaluate(snap, ctx), repeat=7)
+    assert elapsed < 0.2, f"evaluate 中位太慢: {elapsed * 1000:.1f}ms"
 
 
 # ==========================================================================

@@ -476,18 +476,42 @@ def _row_scope(*, quotes, active, expected, universe, watch=False):
                         "freshness": {"state": "fresh", "age_s": 1.0}})
 
 
-def test_scope_state_is_four_state_not_bool():
-    """scope 必须是**四态**：`bool` 无法表达 `empty_scan` 与 `unknown`。"""
+def test_scope_state_is_multi_state_not_bool():
+    """scope 必须是**多态**（当前五态）：`bool` 无法表达 `empty_scan` / `unknown`
+    / `broad_scan_unquantified`。
+
+    `IT-P2-TEST-NAME-CLAIMS-FOUR-STATES-WHILE-CODE-HAS-FIVE-001`（云端
+    `2026-09-23_17-58-08_JST.md` §2.2）指出我这条老测试有两个问题：
+
+    1. 名字/docstring 写"四态"，而 ``live_session.py:529`` 已定义**第五态**
+       ``SCOPE_BROAD_UNQUANTIFIED``；
+    2. **更严重的是它失去了探测力**：``len({四个常量}) == 4`` 在**存在五个
+       状态时依然为真**，所以它对"状态空间塌缩"完全无感。
+
+    修法不是把 4 改成 5（那只是把同一个硬编码问题推后一轮），而是
+    **从模块里枚举 `SCOPE_*` 常量**，断言它们**两两互异**。
+    这样新增状态不需要改测试，而"两个状态被设成同值"会**立刻**变红。
+    """
     ls = _ls()
-    assert ls.SCOPE_FULL_MARKET != ls.SCOPE_EMPTY_SCAN
-    assert ls.SCOPE_EMPTY_SCAN != ls.SCOPE_UNKNOWN
-    assert ls.SCOPE_WATCHLIST_ONLY != ls.SCOPE_FULL_MARKET
-    assert len({ls.SCOPE_FULL_MARKET, ls.SCOPE_WATCHLIST_ONLY,
-                ls.SCOPE_EMPTY_SCAN, ls.SCOPE_UNKNOWN}) == 4
+    # 动态枚举：以后加第六态，这条测试自动覆盖，不需要再改。
+    names = sorted(n for n in dir(ls) if n.startswith("SCOPE_"))
+    assert len(names) >= 5, f"scope 常量少于 5 个：{names}"
+    values = {n: getattr(ls, n) for n in names}
+    distinct = set(values.values())
+    assert len(distinct) == len(values), (
+        "有两个 SCOPE_* 常量取了同一个值 —— 状态空间已塌缩："
+        f"{ {n: v for n, v in values.items()} }")
+    # 具体的五态必须都在（防止有人误删常量而非改值）。
+    for required in ("SCOPE_FULL_MARKET", "SCOPE_WATCHLIST_ONLY",
+                     "SCOPE_EMPTY_SCAN", "SCOPE_UNKNOWN",
+                     "SCOPE_BROAD_UNQUANTIFIED"):
+        assert required in values, f"缺少必需的状态常量 {required}"
+    # 行为面：两个具体输入必须落到两个不同的具体状态。
     full = _row_scope(quotes=5000, active=5900, expected=6000, universe=5900)
     empty = _row_scope(quotes=5000, active=0, expected=6000, universe=0)
     assert full["universe_scope_state"] == ls.SCOPE_FULL_MARKET
     assert empty["universe_scope_state"] == ls.SCOPE_EMPTY_SCAN
+    assert full["universe_scope_state"] != empty["universe_scope_state"]
 
 
 def test_full_market_positive_text_requires_measured_evidence():
