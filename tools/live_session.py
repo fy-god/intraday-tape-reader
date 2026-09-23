@@ -507,7 +507,11 @@ def make_round_sample(
         # `watchlist_only=False`。必须显式分开成四态。
         out["universe_scope_state"] = _scope_state_of(
             universe_truth, universe=out.get("universe"),
-            watchlist_only=bool(out.get("watchlist_only")))
+            watchlist_only=bool(out.get("watchlist_only")),
+            # 量级证据必须显式传进去 —— 否则 `active > 0` 会被当成"全市场"
+            # （`IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`）。
+            expected_total=out.get("universe_expected_total"),
+            coverage_active=out.get("universe_coverage_active"))
     return out
 
 
@@ -517,23 +521,33 @@ SCOPE_FULL_MARKET = "full_market"
 SCOPE_WATCHLIST_ONLY = "watchlist_only"
 SCOPE_EMPTY_SCAN = "empty_scan"
 SCOPE_UNKNOWN = "unknown"
+#: `IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`（09-23 00:12 §6）：
+#: **分母未知时 active>0 只能证明"扫得挺广"，不能证明"全市场"。**
+#: 修前 `_scope_state_of` 只判 `active > 0` 就返回 `full_market`，
+#: 实测 active=400 / 3000 / 3001（分母未知）**全部**叫"全程全市场扫描"。
+#: 量级证据（`expected_total` + `coverage_active`）是"全市场"这个词的**必要条件**。
+SCOPE_BROAD_UNQUANTIFIED = "broad_scan_unquantified"
 
 
-def _scope_state_of(universe_truth: dict | None, *,
-                    universe: Any, watchlist_only: bool) -> str:
-    """本轮扫描范围 -> 四态之一（纯函数）。
+def _scope_state_of(universe_truth: dict | None, *, universe: Any,
+                    watchlist_only: bool, expected_total: Any = None,
+                    coverage_active: Any = None,
+                    cov_ok: float | None = None) -> str:
+    """本轮扫描范围 -> **五态**之一（纯函数）。
 
     `IT-P2-UNIVERSE-EMPTY-SCAN-ASSERTED-AS-FULL-MARKET-001`（20:04 §3）：
-
     * `empty_scan`：股票池**真的空了**（`active_scan_codes == 0`，
       或没有 active 数时本轮 `universe` 计数为 0）。
       **这与"全市场"在旧口径下不可区分，正是缺陷本体。**
     * `watchlist_only`：显式降级为自选股。
-    * `full_market`：有**肯定证据**（明确 `active_scan_codes > 0`
-      且不是自选股降级）。
-    * `unknown`：**没有任何证据**（旧报告 / 未采集 / 冷启动）。
-      **绝不能归入 `full_market`** —— 那是把"不知道"当"没问题"，
-      正是本轮一直在修的 bug 类。
+    * `unknown`：**没有任何证据**。**绝不能归入 `full_market`**。
+
+    `IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`（09-23 00:12 §6）：
+    * `full_market`（**量级已证**）：分母已知 **且** 覆盖率 ≥ 全市场线。
+      **"全市场"是量级断言，不是存在性断言。**
+    * `broad_scan_unquantified`：`active > 0` 但**量级证不出来**
+      （分母未知 / 算不出覆盖率 / 覆盖率低于线）——
+      只能说"有较广的扫描集合"，**不能说全市场**。
     """
     ut = universe_truth if isinstance(universe_truth, dict) else {}
     if watchlist_only:
@@ -542,11 +556,34 @@ def _scope_state_of(universe_truth: dict | None, *,
     has_active = (isinstance(active, (int, float))
                   and not isinstance(active, bool))
     if has_active:
-        return SCOPE_EMPTY_SCAN if float(active) <= 0 else SCOPE_FULL_MARKET
-    # 没有 active 数时退回本轮池计数（`make_round_sample` 的 `universe`）。
-    if isinstance(universe, (int, float)) and not isinstance(universe, bool):
-        return SCOPE_EMPTY_SCAN if float(universe) <= 0 else SCOPE_FULL_MARKET
-    return SCOPE_UNKNOWN
+        if float(active) <= 0:
+            return SCOPE_EMPTY_SCAN
+    else:
+        # 没有 active 数时退回本轮池计数（`make_round_sample` 的 `universe`）。
+        if isinstance(universe, (int, float)) and not isinstance(universe, bool):
+            if float(universe) <= 0:
+                return SCOPE_EMPTY_SCAN
+            active = universe
+        else:
+            return SCOPE_UNKNOWN
+    # --- 到这里 active > 0。现在问：**量级**证得了吗？--------------------
+    _exp = expected_total
+    if _exp is None:
+        _exp = ut.get("expected_total")
+    has_exp = (isinstance(_exp, (int, float)) and not isinstance(_exp, bool)
+               and float(_exp) > 0)
+    if not has_exp:
+        return SCOPE_BROAD_UNQUANTIFIED          # 分母未知 -> 不能说"全市场"
+    _cov = coverage_active
+    if _cov is None:
+        _cov = ut.get("coverage_active")
+    if (isinstance(_cov, (int, float)) and not isinstance(_cov, bool)
+            and _finite(_cov) and 0.0 <= float(_cov) <= 1.0):
+        _line = UNIVERSE_COV_WARN if cov_ok is None else cov_ok
+        return (SCOPE_FULL_MARKET if float(_cov) >= _line
+                else SCOPE_BROAD_UNQUANTIFIED)
+    # 有分母但算不出覆盖率：仍无量级证据。
+    return SCOPE_BROAD_UNQUANTIFIED
 
 
 def _universe_truth_now(engine: Any) -> dict | None:
@@ -667,6 +704,8 @@ def _universe_session(rows: Sequence[dict]) -> dict:
         "full_market_rounds": scope_counts.get(SCOPE_FULL_MARKET, 0),
         "empty_scan_rounds": scope_counts.get(SCOPE_EMPTY_SCAN, 0),
         "unknown_scope_rounds": scope_counts.get(SCOPE_UNKNOWN, 0),
+        "broad_scan_unquantified_rounds": scope_counts.get(
+            SCOPE_BROAD_UNQUANTIFIED, 0),
     }
     # 会话内活跃覆盖率：**最坏值**优先（与 worst_state 同纪律，
     # "中途掉下去过"不能被"最后又好了"抹掉）。
@@ -678,7 +717,52 @@ def _universe_session(rows: Sequence[dict]) -> dict:
         "coverage_active_last": (round(cov_vals[-1], 6) if cov_vals else None),
         "coverage_active_denominator_kinds": cov_denoms,
     }
-    _evidence = {**scope_facts, **cov_facts}
+    # --- Universe Evidence Completeness Contract v2（09-23 00:12 §7）------
+    #
+    # 最近三轮共同暴露的根因不只是"证据合并"，而是：
+    #   **肯定结论的量词和实际证据覆盖范围不一致。**
+    #
+    # 所以 `measured` 是**不够的** —— 它只说明"有证据"，
+    # **不说明"证据覆盖了全部轮次"**。全称肯定句（"全程"/"会话期间…新鲜"）
+    # 要求 `measured_rounds == rounds_total > 0`；只覆盖 k/N 时**必须写出 k/N**。
+    #
+    # 修前实测（我自己的 bf0b83b 留下的残余）：
+    #   `universe_scope` 用 "1/1 轮有明确扫描范围证据" 说出了"全程全市场扫描"
+    #   —— **拿证据子集当了自己的分母**。
+    #   freshness 只测 1/30 轮也输出「会话期间股票池新鲜」。
+    evidence_facts = {
+        #: 会话总轮数 —— 一切"全程/k of N"断言的**唯一**分母。
+        "rounds_total": len(rows),
+        #: freshness 轴的测量轮数（与 `measured` 同轴，但显式给出计数）。
+        "freshness_measured_rounds": sum(states.values()),
+    }
+    # --- `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（09-23 00:12 §3）-----
+    #
+    # `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（09-23 00:12 §3）：
+    # 绝对项只读 t0 的 `setup.universe_size`，会话里池子从 5000 掉到 2000
+    # **没有任何消费者**。这条与 `...-ACTIVE-COVERAGE-SESSION-BLIND-001`
+    # **不同**：后者是 numeric coverage 已知但中途下降（`bf0b83b` 已修）；
+    # 本条是**分母不可得**时仍应拿绝对 session min 做最低限度运行保护。
+    abs_vals: list[int] = []
+    for r in rows:
+        v = r.get("universe")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            abs_vals.append(int(v))
+    evidence_facts["universe_abs_measured_rounds"] = len(abs_vals)
+    evidence_facts["universe_abs_min"] = min(abs_vals) if abs_vals else None
+    # --- 死字段接活 ③：`universe_active_scan_codes` 需要**会话侧配对值** ----
+    #
+    # 轮样本里的 `universe_active_scan_codes` 此前零生产读者。
+    # 单看一轮它只是 t0 `active_scan_codes` 的复读；**与 t0 配对**才有信息量：
+    # 首轮值 ≠ t0 值 => 启动后活跃扫描集变过（分母种类相同也不行）。
+    _act_first = None
+    for r in rows:
+        v0 = r.get("universe_active_scan_codes")
+        if isinstance(v0, (int, float)) and not isinstance(v0, bool):
+            _act_first = int(v0)
+            break
+    evidence_facts["universe_active_scan_codes_first"] = _act_first
+    _evidence = {**scope_facts, **cov_facts, **evidence_facts}
     if not states and not statuses:
         return {"measured": False, **watch_facts, **_evidence}
     worst = max(states, key=lambda k: _order.get(k, 0)) if states else "unknown"
@@ -1306,7 +1390,13 @@ def empty_metrics() -> dict:
                 "status": None, "error": None},
         "logs": {"WARNING": 0, "ERROR": 0, "CRITICAL": 0},
         "browser": {"ran": False, "skipped": True, "errors": []},
-        "setup": {"engine_build_s": None, "universe_refresh_s": None, "universe_size": 0},
+        # `universe_size` 用 **`None`** = 未测量（骨架/空会话 = 没有采集过）。
+        # 写 `0` 会把"骨架/未采集"伪装成"**明确测到 0 只票**"，
+        # 而 0 现在是**明确坏**（一只票都没扫）。
+        # `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001` 的三态纪律：
+        # `None != 0`。
+        "setup": {"engine_build_s": None, "universe_refresh_s": None,
+                  "universe_size": None},
     }
 
 
@@ -1699,6 +1789,37 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     _empty_rounds = _safe_int(_sess.get("empty_scan_rounds"))
     _full_rounds = _safe_int(_sess.get("full_market_rounds"))
     _unknown_scope = _safe_int(_sess.get("unknown_scope_rounds"))
+    _broad_rounds = _safe_int(_sess.get("broad_scan_unquantified_rounds"))
+    # --- 死字段接活 ④：`scope_counts`（ADDENDUM3 §2.1）--------------------
+    #
+    # 它此前只被 `_universe_session` 内部立即拆成上面几个计数，
+    # **作为产物字段零消费者**。接成**自洽性核对**：
+    # 各态计数之和必须等于测量轮数。不等 => 聚合与判据**已经不一致**，
+    # 此时任何基于这些计数的肯定句都不可信（这正是本文件反复强调的
+    # "产物内部自相矛盾"）。
+    _scope_counts_raw = _sess.get("scope_counts")
+    _scope_counts = (_scope_counts_raw if isinstance(_scope_counts_raw, dict)
+                     else {})
+    _sc_sum = sum(v for v in _scope_counts.values()
+                  if isinstance(v, (int, float))
+                  and not isinstance(v, bool))
+    _scope_consistent = (not _scope_counts) or _sc_sum == _scope_measured
+    # `IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`：
+    # **全称肯定句的分母必须是会话总轮数，不是"测到的那几轮"。**
+    #
+    # 修前（我自己的 bf0b83b 留下的残余）我用 `_scope_measured` 当分母：
+    #   1 轮有证据 + 29 轮什么都没有
+    #   -> `_full_rounds == _scope_measured`（1 == 1）成立
+    #   -> 输出「全程全市场扫描，**1/1** 轮有明确扫描范围证据」
+    # **拿证据子集当了自己的分母**，于是"存在至少一轮全市场证据"
+    # 被升级成"全程全市场"。这与 22:15 追加指认的 freshness 同一条 bug 类。
+    _rounds_total = _safe_int(_sess.get("rounds_total"))
+    if _rounds_total <= 0:
+        _rounds_total = _scope_measured          # 老报告没有该键时的退化
+    _full_covers_all = (_scope_measured > 0
+                        and _full_rounds == _scope_measured
+                        and _scope_measured == _rounds_total
+                        and _scope_consistent)
     # 显式 run mode 例外：`--watch-only` 是**用户指定只盯自选股**，
     # 不是故障。只能靠显式标记识别，绝不能靠"股票数很少"猜意图。
     _watch_only_mode = bool(_setup.get("watch_only")) if isinstance(_setup, dict) else False
@@ -1734,11 +1855,28 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             f"（扫描集合 0 只，共测到 {_scope_measured} 轮）—— "
             f"这些轮次**一只票都没扫**，此期间的'没有告警'"
             f"不能解释为'没有异动'", level="fail")
-    elif _scope_measured > 0 and _full_rounds == _scope_measured:
-        # **只有**「测到了、且每一轮都是有票的全市场」才允许肯定句。
+    elif _full_covers_all:
+        # **只有**「测到了**全部**轮次、且每一轮的量级都证得出全市场」
+        # 才允许全称肯定句。
         add("universe_scope", True,
             f"会话期间未降级为仅自选股（全程全市场扫描，"
-            f"{_full_rounds}/{_scope_measured} 轮有明确扫描范围证据）",
+            f"{_full_rounds}/{_rounds_total} 轮有量级证据）",
+            level="ok")
+    elif _full_rounds > 0:
+        # ⚠ **本轮的残余修复**：有全市场轮次、但证据**没有覆盖全部轮次**，
+        # 或部分轮次只够"扫得广"。**必须写出真实的 k/N**，
+        # 不能把"1/30 轮有全市场证据"说成"全程全市场"。
+        _gaps = []
+        if _broad_rounds > 0:
+            _gaps.append(f"{_broad_rounds} 轮量级未证（分母未知/覆盖率算不出）")
+        if _unknown_scope > 0:
+            _gaps.append(f"{_unknown_scope} 轮扫描范围未知")
+        _gap_txt = ("；" + "，".join(_gaps)) if _gaps else ""
+        add("universe_scope", True,
+            f"会话期间**未全程取得全市场证据**："
+            f"{_full_rounds}/{_rounds_total} 轮量级已证为全市场"
+            f"（测到 {_scope_measured}/{_rounds_total} 轮{_gap_txt}）"
+            f"—— 跳过不算失败，但**不能**说'全程全市场扫描'",
             level="ok")
     else:
         # 零证据 / 证据不完整：**不得**肯定。
@@ -1747,35 +1885,78 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         # **零证据被当成了肯定证据**，与"把不知道当没问题"完全同类。
         _extra = (f"，其中 {_unknown_scope} 轮扫描范围**未知**"
                   if _unknown_scope > 0 else "")
+        _extra += (f"，{_broad_rounds} 轮量级未证（分母未知）"
+                   if _broad_rounds > 0 else "")
         add("universe_scope", True,
-            f"会话级扫描范围证据**不足**（测到 {_scope_measured} 轮{_extra}）"
+            f"会话级扫描范围证据**不足**（测到 {_scope_measured}/"
+            f"{_rounds_total} 轮{_extra}）"
             f"—— 跳过不算失败，但**不能**据此说'全程全市场扫描'",
             level="ok")
     if isinstance(_setup, dict) and _setup:
-        _u_size = _safe_int(_setup.get("universe_size"))
+        # --- `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`（09-23 §2）
+        #
+        # 修前用 `_safe_int(_setup.get("universe_size"))`，而
+        # **`_safe_int(None) == _safe_int(0) == 0`** —— 三态被压成两态：
+        #   "没有测到股票池大小"  与  "明确测到 active scan = 0"
+        # 被合并，两者都落到 `elif _u_size <= 0` 的"无法判定 -> ok"。
+        # 实测（22:45 追加，我用同一路径复现）：
+        #   universe_size=0 + active_scan_codes=0 + 分母未知
+        #   -> healthy=True / exit=0 / fail=[]（**整场全绿**）
+        # "测到 0 只票"是**明确坏**，不是"没记录"。
+        _u_size_raw = _setup.get("universe_size")
+        _u_size = _optional_int(_u_size_raw)          # 三态：None 保留
         _u_fell = bool(_setup.get("fell_back_to_watchlist"))
         _u_min = int(tol.get("universe_min") or UNIVERSE_MIN_ABS)
         _u_warn = int(tol.get("universe_warn") or UNIVERSE_WARN_ABS)
+        # --- `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（09-23 §3）--------
+        # 绝对项**必须也读会话内最小值**：t0=5000 + 会话 min=2000
+        # 而分母未知时，旧代码只读 t0，会话的缩水**零消费者**。
+        # 口径与 coverage 轴一致：**同轴取最坏**，并保持 `None != 0`。
+        _abs_min = _optional_int(_sess.get("universe_abs_min"))
+        _abs_meas = _safe_int(_sess.get("universe_abs_measured_rounds"))
+        _abs_eff = None
+        _abs_src = ""
+        if _u_size is None and _abs_min is None:
+            _abs_eff = None
+        elif _u_size is None:
+            _abs_eff = _abs_min
+            _abs_src = f"（t0 未测，取自会话 {_abs_meas} 轮最小值）"
+        elif _abs_min is None:
+            _abs_eff = _u_size
+        elif _abs_min < _u_size:
+            _abs_eff = _abs_min
+            _abs_src = (f"（**会话内最小** {_abs_min} < t0 {_u_size}，"
+                        f"取最坏；共 {_abs_meas} 轮）")
+        else:
+            _abs_eff = _u_size
         if _u_fell:
             add("universe", False,
-                f"股票池**已降级为仅自选股**（规模 {_u_size}）—— "
+                f"股票池**已降级为仅自选股**（规模 {_abs_eff}）—— "
                 f"全市场扫描不可用，此期间'没有告警'不能解释为'没有异动'",
                 level="fail")
-        elif _u_size <= 0:
+        elif _abs_eff is None:
+            # **只有真的没测到**才走这里。`None` = NOT_MEASURED。
             add("universe", True,
                 "无股票池规模记录（旧报告/未采集），无法判定（跳过不算失败）",
                 level="ok")
-        elif _u_size < _u_min:
+        elif _abs_eff <= 0:
+            # **明确测到 0 只** = 一只票都没扫 —— 与"没记录"**必须分开**。
             add("universe", False,
-                f"扫描池仅 {_u_size} 只（下限 {_u_min}）—— "
+                f"扫描池为 **0 只**（明确测到，非未采集）{_abs_src}—— "
+                f"本场**一只票都没扫**，此期间的'没有告警'"
+                f"不能解释为'没有异动'", level="fail")
+        elif _abs_eff < _u_min:
+            add("universe", False,
+                f"扫描池仅 {_abs_eff} 只（下限 {_u_min}）{_abs_src}—— "
                 f"扫描范围过小，漏报风险高", level="fail")
-        elif _u_size < _u_warn:
+        elif _abs_eff < _u_warn:
             add("universe", True,
-                f"扫描池 {_u_size} 只（警戒 {_u_warn}，下限 {_u_min}）—— "
-                f"偏小，建议核对源端限流", level="warn")
+                f"扫描池 {_abs_eff} 只（警戒 {_u_warn}，下限 {_u_min}）"
+                f"{_abs_src}—— 偏小，建议核对源端限流", level="warn")
         else:
             add("universe", True,
-                f"扫描池 {_u_size} 只（下限 {_u_min}）", level="ok")
+                f"扫描池 {_abs_eff} 只（下限 {_u_min}）{_abs_src}",
+                level="ok")
     else:
         add("universe", True,
             "无 setup 字段，无法判定（跳过不算失败）", level="ok")
@@ -1837,65 +2018,8 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
             return "未知" if fv is None else f"{fv:.2%}"
 
         _cov_a_f = _f(_cov_a)
-        # --- IT-P1-UNIVERSE-ACTIVE-COVERAGE-SESSION-BLIND-001（20:04 §5）-----
-        #
-        # 修前这里**只读 t0**：`coverage_active` 是 soak 开始前那一份快照。
-        # 会话中途活跃覆盖从 5900/6000=98.33% 掉到 4500/6000=75% 时，
-        # 判决**仍然**输出 t0 的 98.33% 判 ok —— 75% 的覆盖被启动快照掩盖。
-        #
-        # `summarize_rounds` 算出的 `metrics['universe'].min`（4500）确实存在，
-        # 但它**没有分母**，算不出覆盖率，也没有判决项读它 —— 又一个"算了没人读"。
-        #
-        # 合并纪律：**取最坏**（与 `worst_state` 同纪律，中途掉下去过不能被
-        # "最后又好了"抹掉）。并且 session 的数值证据**可以**在 t0 分母未知时
-        # 独立支撑结论 —— 那时旧代码只会输出"分母未知 -> 无法计算"。
-        _s_cov_min = _f(_sess.get("coverage_active_min"))
-        _s_cov_rounds = _safe_int(_sess.get("coverage_active_measured_rounds"))
-        _cov_src = ""
-        if _cov_a_f is None and _s_cov_min is None:
-            _cov_eff = None
-        elif _cov_a_f is None:
-            _cov_eff = _s_cov_min
-            _cov_src = (f"（t0 无可用覆盖，取自会话 "
-                        f"{_s_cov_rounds} 轮最小值）")
-        elif _s_cov_min is None:
-            _cov_eff = _cov_a_f
-        elif _s_cov_min < _cov_a_f:
-            _cov_eff = _s_cov_min
-            _cov_src = (f"（**会话内最差** {_pct(_s_cov_min)} < t0 "
-                        f"{_pct(_cov_a_f)}，取最坏；共 {_s_cov_rounds} 轮）")
-        else:
-            _cov_eff = _cov_a_f
-        _s_txt = (f"；会话内最小 {_pct(_s_cov_min)}（{_s_cov_rounds} 轮）"
-                  if _s_cov_min is not None else "；会话内覆盖未测量")
-        if _cov_eff is None:
-            # 分母未知 -> **不许**假装知道。新浪 clean pagination 就属这类：
-            # 它能证明"翻页翻完了"，但没有 numeric total，二者不能硬塞成
-            # 同一种 coverage。脏值同样走这里（判"未测量"而非崩溃）。
-            _why = (f"分母未知（{_dk}）" if _exp <= 0
-                    else f"coverage 值不可解析（{_cov_a!r}）")
-            add("universe_coverage", True,
-                f"{_why} —— 无法计算全市场覆盖"
-                f"（跳过不算失败；此时'没有告警'不能解释为'没有异动'）",
-                level="ok")
-        elif _cov_eff < _f_cov:
-            add("universe_coverage", False,
-                f"全市场覆盖过低：active {_act}/{_exp} = {_pct(_cov_a)}"
-                f"{_cov_src}"
-                f"（下限 {_f_cov:.0%}）—— transport {_pct(_cov_t)}、"
-                f"usable {_pct(_cov_u)}；扫描范围缺 {_exp - _act} 只，"
-                f"漏报风险高{_s_txt}", level="fail")
-        elif _cov_eff < _w_cov:
-            add("universe_coverage", True,
-                f"全市场覆盖偏低：active {_act}/{_exp} = {_pct(_cov_a)}"
-                f"{_cov_src}"
-                f"（警戒 {_w_cov:.0%}，下限 {_f_cov:.0%}）{_s_txt}",
-                level="warn")
-        else:
-            add("universe_coverage", True,
-                f"全市场覆盖 active {_act}/{_exp} = {_pct(_cov_a)}"
-                f"（transport {_pct(_cov_t)}、usable {_pct(_cov_u)}；"
-                f"reported={_raw}/{_use}）{_s_txt}", level="ok")
+        # 注：`universe_coverage` 的**判决**已移到下面的统一块（RED C），
+        # 这里只保留 t0 侧的取数与 `_cov_a_f`，供该块与后续项复用。
 
         # --- IT-P1-UNIVERSE-COVERAGE-GATE-TRUNCATION-BLIND-001 ----------------
         #
@@ -1980,9 +2104,143 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
                                 UNIVERSE_AGE_FAIL_S)
         _age_warn = _safe_float(tol.get("universe_age_warn_s"),
                                 UNIVERSE_AGE_WARN_S)
+
+    # --- RED C：`universe_coverage` 的**统一消费块**（不依赖 t0 是否存在）---
+    #
+    # `IT-P1-UNIVERSE-COVERAGE-SESSION-WITHOUT-T0-001`（09-23 00:12 §4）：
+    #
+    # `bf0b83b` 已经实现了"t0 分母未知但 t0 truth dict 存在 -> 会话数值证据
+    # 独立支撑 FAIL"。**但整个 coverage consumer 仍被包在**
+    # `if isinstance(_ut, dict) and _ut:` 之内 —— 于是如果 pre-loop 时
+    # `engine.universe_truth()` 读取异常 / 暂时不可得（`setup.universe_truth = None`），
+    # 而 soak 中途 per-round universe_truth 恢复、会话真有
+    # `coverage_active_min=0.75 / measured_rounds=30`，
+    # 判决**仍然**因为 t0 `_ut` 缺失而走"未测量"。
+    #
+    # 这与 transport / freshness 的"session truth 被 t0 条件包住"是**同一类
+    # 结构问题**，只是 coverage 这条支路当时没一起搬出来。
+    #
+    # 修复原则：t0 与 session **独立解析**，之后按同轴最坏显式证据合并。
+    # **不能让"t0 没读到"否定后续真实测量。**
+    def _cf(v: object) -> float | None:
+        """脏值安全转 float —— 判决层绝不许因脏值抛异常。"""
+        try:
+            return float(v)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return None
+
+    def _cpct(v: object) -> str:
+        fv = _cf(v)
+        return "未知" if fv is None else f"{fv:.2%}"
+
+    _ut_d = _ut if isinstance(_ut, dict) else {}
+    _dk = str(_ut_d.get("denominator_kind") or "unknown")
+    _exp = _safe_int(_ut_d.get("expected_total"))
+    _act = _safe_int(_ut_d.get("active_scan_codes"))
+    # --- 死字段接活 ③：`universe_active_scan_codes`（ADDENDUM3 §2.1）--------
+    #
+    # 轮样本里已经记了 `universe_active_scan_codes`，但**零生产读者**。
+    # 它与 t0 的 `_act` 配对后是**唯一**能发现
+    # "本轮活跃扫描集 ≠ 启动时活跃扫描集"的证据。
+    # 会话聚合（`_universe_session`）已经把首轮值提了出来。
+    _s_act_first = _optional_int(_sess.get("universe_active_scan_codes_first"))
+    _act_shift_txt = ""
+    if (_act > 0 and _s_act_first is not None and _s_act_first != _act):
+        _act_shift_txt = (f"；⚠ 活跃扫描集与启动时**不一致**"
+                          f"（t0 {_act} -> 会话首轮 {_s_act_first}）"
+                          f"—— 分母种类相同也不代表是同一个集合")
+    _raw = _ut_d.get("raw_unique_codes")
+    _use = _ut_d.get("usable_quotes")
+    _cov_a = _ut_d.get("coverage_active")
+    _cov_t = _ut_d.get("coverage_transport")
+    _cov_u = _ut_d.get("coverage_usable")
+    _f_cov = _safe_float(tol.get("coverage_active_fail"), UNIVERSE_COV_FAIL)
+    _w_cov = _safe_float(tol.get("coverage_active_warn"), UNIVERSE_COV_WARN)
+    _cov_a_f = _cf(_cov_a)
+    _s_cov_min = _cf(_sess.get("coverage_active_min"))
+    _s_cov_rounds = _safe_int(_sess.get("coverage_active_measured_rounds"))
+    # --- 死字段接活（21:40 §1.2 / ADDENDUM3 §2.1：5 个写后无生产读者）------
+    #
+    # 审计方独立统计：`coverage_active_denominator_kinds` /
+    # `coverage_active_p05` / `coverage_active_last` / `universe_active_scan_codes`
+    # / `scope_counts` **写进产物但没有任何生产读者** ——
+    # "与本仓库反复出现的'算了没人读'同类"。约定是**接进判决或删掉**。
+    # 下面把它们接成**真有判断力**的消费者，而不是为了消掉计数而随便读一下。
+    #
+    # ① `coverage_active_denominator_kinds` —— **跨轮可比性**门。
+    # 每轮覆盖率的**分母种类**决定它是不是同一个量：
+    # `provider_declared_total`（占 provider 声明总数）与
+    # `page_exhausted`（翻页翻完，无总数）**不是同一个分母**。
+    # 跨轮取 min 时把两种混在一起比，是**拿不可比的数当同一个数**。
+    _cov_kinds = _sess.get("coverage_active_denominator_kinds")
+    _cov_kinds = (_cov_kinds if isinstance(_cov_kinds, dict) else {})
+    _cov_mixed = len([k for k, v in _cov_kinds.items()
+                      if isinstance(v, (int, float)) and v > 0]) > 1
+    _cov_cmp_txt = ""
+    if _cov_mixed:
+        _cov_cmp_txt = (f"；⚠ 会话内分母种类**不统一**（{_cov_kinds}）"
+                        f"—— 跨轮最小值只作参考，不同分母的覆盖率"
+                        f"**不可直接比较**")
+    # ② `coverage_active_p05` / `coverage_active_last` —— 稳健下界与最新值。
+    # min 是**单点**极值；p05 是稳健下界（抗一个尖峰）。last 区分
+    # "**已恢复**"与"**仍在恶化**" —— 只看 min 无法区分。
+    _s_cov_p05 = _cf(_sess.get("coverage_active_p05"))
+    _s_cov_last = _cf(_sess.get("coverage_active_last"))
+    _recov_txt = ""
+    if (_s_cov_min is not None and _s_cov_last is not None
+            and _f_cov is not None and _s_cov_min < _f_cov <= _s_cov_last):
+        _recov_txt = (f"；最新一轮已回到 {_cpct(_s_cov_last)}"
+                      f"（≥ 下限）—— **已恢复**")
+    elif (_s_cov_min is not None and _s_cov_last is not None
+            and _f_cov is not None and _s_cov_last < _f_cov):
+        _recov_txt = f"；最新一轮 {_cpct(_s_cov_last)} 仍低于下限 —— **仍在恶化**"
+    if _s_cov_p05 is not None and _s_cov_min is not None:
+        _recov_txt += f"；p05 {_cpct(_s_cov_p05)}"
+    _cov_src = ""
+    if _cov_a_f is None and _s_cov_min is None:
+        _cov_eff = None
+    elif _cov_a_f is None:
+        _cov_eff = _s_cov_min
+        _cov_src = f"（t0 无可用覆盖，取自会话 {_s_cov_rounds} 轮最小值）"
+    elif _s_cov_min is None:
+        _cov_eff = _cov_a_f
+    elif _s_cov_min < _cov_a_f:
+        _cov_eff = _s_cov_min
+        _cov_src = (f"（**会话内最差** {_cpct(_s_cov_min)} < t0 "
+                    f"{_cpct(_cov_a_f)}，取最坏；共 {_s_cov_rounds} 轮）")
+    else:
+        _cov_eff = _cov_a_f
+    _s_txt = (f"；会话内最小 {_cpct(_s_cov_min)}（{_s_cov_rounds} 轮）"
+              if _s_cov_min is not None else "；会话内覆盖未测量")
+    _s_txt += _act_shift_txt + _recov_txt + _cov_cmp_txt
+    if _cov_eff is None:
+        # 分母未知 -> **不许**假装知道。新浪 clean pagination 就属这类：
+        # 它能证明"翻页翻完了"，但没有 numeric total，二者不能硬塞成
+        # 同一种 coverage。脏值同样走这里（判"未测量"而非崩溃）。
+        _why = (f"分母未知（{_dk}）" if _exp <= 0
+                else f"coverage 值不可解析（{_cov_a!r}）")
         add("universe_coverage", True,
-            "无 universe_truth（旧报告/未采集），无法判定（跳过不算失败）",
+            f"{_why} —— 无法计算全市场覆盖"
+            f"（跳过不算失败；此时'没有告警'不能解释为'没有异动'）",
             level="ok")
+    elif _cov_eff < _f_cov:
+        add("universe_coverage", False,
+            f"全市场覆盖过低：active {_act}/{_exp} = {_cpct(_cov_a)}"
+            f"{_cov_src}"
+            f"（下限 {_f_cov:.0%}）—— transport {_cpct(_cov_t)}、"
+            f"usable {_cpct(_cov_u)}；扫描范围缺 {_exp - _act} 只，"
+            f"漏报风险高{_s_txt}", level="fail")
+    elif _cov_eff < _w_cov:
+        add("universe_coverage", True,
+            f"全市场覆盖偏低：active {_act}/{_exp} = {_cpct(_cov_a)}"
+            f"{_cov_src}"
+            f"（警戒 {_w_cov:.0%}，下限 {_f_cov:.0%}）{_s_txt}",
+            level="warn")
+    else:
+        add("universe_coverage", True,
+            f"全市场覆盖 active {_act}/{_exp} = {_cpct(_cov_a)}"
+            f"（transport {_cpct(_cov_t)}、usable {_cpct(_cov_u)}；"
+            f"reported={_raw}/{_use}）{_s_txt}", level="ok")
 
     # --- 统一消费块：会话事实 **优先于** t0 快照 ------------------------
     #
@@ -2000,6 +2258,12 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
     _na = _safe_int(_sess.get("rounds_not_applied"))
     _ti = _safe_int(_sess.get("rounds_transport_incomplete"))
     _tmeas = _safe_int(_sess.get("rounds_transport_measured"))
+    # `IT-P2-UNIVERSE-FRESHNESS-POSITIVE-USES-EVIDENCED-SUBSET-001`：
+    # 全称肯定句的分母 —— 见下面 freshness 分支的说明。
+    # 注意：`_rounds_total` 已在 scope 块里定义过（同一个会话 fact），
+    # 这里**不再重复赋值** —— 重复赋值会让"唯一分母"出现两个来源，
+    # 正是本文件反复批评的"同一语义实现两次"。
+    _fresh_measured = _safe_int(_sess.get("freshness_measured_rounds"))
 
     if _sess_measured and _ti > 0:
         # 会话期间**确凿**有轮次被 provider 声明截断 —— 硬缺口，判 fail。
@@ -2070,9 +2334,28 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
                 f"会话期间股票池新鲜度**未测量**"
                 f"（states={_sess.get('states')}；缺年龄证据）"
                 f"—— 跳过不算失败，但也不代表新鲜", level="ok")
+        elif _fresh_measured < _rounds_total:
+            # --- `IT-P2-UNIVERSE-FRESHNESS-POSITIVE-USES-EVIDENCED-SUBSET-001`
+            # （09-23 00:12 §5，22:15 追加指认）--------------------------------
+            #
+            # **全称肯定句的分母必须是会话总轮数，不是"测到的那几轮"。**
+            # 修前实测：1 轮有 freshness key、29 轮完全没有 ->
+            # `states={'fresh':1}` / `measured=True` / `worst=fresh`
+            # -> 输出「会话期间股票池新鲜（{'fresh': 1}）」——
+            # 把"**存在至少一轮** fresh 证据"升级成了"**全会话** fresh"。
+            #
+            # ⚠ 这**不是**"有没有 `_measured` gate"的问题：这里 `_sess_measured`
+            # 已经是 True。真正缺的是**时间分母**。
+            add("universe_freshness", True,
+                f"会话期间**未全程取得新鲜度证据**："
+                f"{_fresh_measured}/{_rounds_total} 轮有新鲜度记录"
+                f"（states={_sess.get('states')}，最坏 {_worst}）"
+                f"—— 跳过不算失败，但**不能**说'会话期间股票池新鲜'",
+                level="ok")
         else:
             add("universe_freshness", True,
-                f"会话期间股票池新鲜（{_sess.get('states')}）", level="ok")
+                f"会话期间股票池新鲜（{_fresh_measured}/{_rounds_total} 轮，"
+                f"{_sess.get('states')}）", level="ok")
     elif _age is None and not _att:
         add("universe_freshness", True,
             "无活跃快照时间/刷新尝试信息，无法判定（跳过不算失败）",
@@ -2967,8 +3250,15 @@ def run(args: argparse.Namespace) -> int:
 
     # 先把股票池预热好，不然第一轮的 latency 里会混进 20 秒的股票池刷新，
     # 后面所有 p95/max 都被这一个离群值污染。
+    #
+    # ⚠ `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`（09-23 00:12 §2）：
+    # 这里曾写 `universe_size = 0`，**异常路径与"真的刷新出 0 只"共用同一个 0**。
+    # 那正是"测到 0"与"没测到"被合并的**生产者源头** ——
+    # 判决层再想分开也已经没有信息了。
+    # 现在：异常 -> `None`（**未测量**，不许判红）；
+    # `refresh_universe()` 正常返回 0 -> 真的 0（**明确坏**）。
     t0 = time.perf_counter()
-    universe_size = 0
+    universe_size: int | None = None
     try:
         universe_size = int(engine.refresh_universe() or 0)
     except Exception as exc:                         # noqa: BLE001

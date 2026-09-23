@@ -788,3 +788,405 @@ def test_evaluability_default_preserves_full_block_only_fail():
     m0 = _eval_metrics(ev=0, tot=1000)
     v0 = _ls().evaluate_health(m0)
     assert _lvl(v0, "capability") == "fail", "全部阻断仍必须 fail"
+
+
+# =========================================================================
+# Universe Evidence Completeness Contract v2
+# 来源：`docs/audits/intraday/2026-09-23_00-12-42_JST.md` §2-§7 + WP01 RED A-E
+#       `docs/audits/intraday/2026-09-22_21-40-00_JST.md` §1.2
+#       `2026-09-22_22-15-00_JST_ADDENDUM2.md` §2 / `_22-45-00_JST_ADDENDUM3.md`
+#
+# 共同根因（00:12 §7）：
+#   **肯定结论的量词和实际证据覆盖范围不一致。**
+# 于是必须同时约束 **时间分母**（measured_rounds == rounds_total）
+# 与 **市场分母**（magnitude：expected_total + coverage_active）。
+# =========================================================================
+
+
+def _scope_rows(n_evidence: int, *, n_total: int = 30, **kw):
+    """`n_evidence` 轮带扫描范围证据，其余轮**完全不带** `universe_*` 键。
+
+    这正是 `_universe_truth_now` 吞掉 `engine.universe_truth()` 异常后的真实
+    形态（它的 docstring 自称"绝不抛"，所以抛异常是它预期要处理的情况）。
+    """
+    rows = [_row_scope(**kw) for _ in range(n_evidence)]
+    rows += [{"index": i, "quotes": kw.get("quotes", 5900),
+              "universe": kw.get("universe", 5900)}
+             for i in range(n_evidence + 1, n_total + 1)]
+    return rows
+
+
+def _scope_detail(rows, **setup_over):
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["setup"].update(setup_over)
+    m["universe_session"] = _ls()._universe_session(rows)
+    v = _ls().evaluate_health(m)
+    return v, _detail(v, "universe_scope"), m["universe_session"]
+
+
+@pytest.mark.parametrize("n_evidence", [1, 5, 15, 29])
+def test_scope_positive_never_uses_evidenced_subset_as_denominator(n_evidence):
+    """**本轮核心 RED**：证据子集**不得**当自己的分母。
+
+    `IT-P2-UNIVERSE-SCOPE-POSITIVE-USES-EVIDENCED-SUBSET-AS-DENOMINATOR-001`
+    （21:40 §1.2 / ADDENDUM2 §2，P1 已确认）：
+
+    修前 `bf0b83b` 判据是 `_scope_measured > 0 and _full_rounds == _scope_measured`
+    —— `_scope_measured` 是**有证据的轮数**，不是会话总轮数。
+    于是 `full_market_rounds == scope_measured_rounds` 是**恒等式**，
+    只要有一部分轮没有证据，就在拿子集跟自己比。
+
+    实测（30 轮会话）：
+        1/30  有证据 -> ok /「全程全市场扫描，**1/1** 轮有明确扫描范围证据」
+        5/30  有证据 -> ok /「…**5/5** 轮…」
+        15/30 有证据 -> ok /「…**15/15** 轮…」
+
+    ⚠ 这与"有没有 `_measured` 门控"**无关** —— `_scope_measured > 0` 就是门控，
+    它已经在了。缺的是**时间分母**：门控的语义是**存在量词**（存在至少一轮被测到），
+    而它守护的文案是**全称量词**（会话期间全程）。
+    """
+    rows = _scope_rows(n_evidence, quotes=5900, active=5900, expected=6000,
+                       universe=5900)
+    agg = _ls()._universe_session(rows)
+    # 先说清这个输入**确实**落在被测分支的入口条件下（D15：
+    # 有负控制 ≠ 有**有效的**负控制，输入必须真的走那条支路）。
+    assert agg["scope_measured_rounds"] == n_evidence
+    assert agg["full_market_rounds"] == n_evidence
+    # 分母用 `.get` 取：旧实现没有这个键，缺键时退化成"有证据的轮数"
+    # —— 那正是缺陷本体，于是断言仍然**行为性**地失败，
+    # 而不是抛 `KeyError`（结构性 ERROR 什么都证明不了）。
+    assert agg.get("rounds_total", agg["scope_measured_rounds"]) == 30
+    v, det, _ = _scope_detail(rows)
+    assert not _asserts_full_market(det), (
+        f"{n_evidence}/30 轮有证据不得自称'全程全市场扫描'：{det}")
+    assert "未全程" in det, f"必须显式写出覆盖不足：{det}"
+    assert f"{n_evidence}/30" in det, f"必须写出真实 k/N：{det}"
+    assert _lvl(v, "universe_scope") != "fail", (
+        "证据不足**不是**故障 —— 不判红（与 not_measured 约定一致）")
+
+
+def test_scope_positive_control_all_evidence_still_asserts():
+    """**负控制**：30/30 轮都有量级证据时**必须仍然**肯定。
+
+    少了这一条，上面那条 `assert not ...` 用一个"永远返回 False"的
+    判据也能通过 —— 那就是**没有效的负控制**（规则 D15）。
+    """
+    rows = _scope_rows(30, quotes=5900, active=5900, expected=6000,
+                       universe=5900)
+    _, det, agg = _scope_detail(rows)
+    assert agg["scope_measured_rounds"] == 30
+    assert agg.get("rounds_total", 30) == 30
+    assert _asserts_full_market(det), f"30/30 有证据时必须肯定：{det}"
+    assert "30/30" in det
+
+
+@pytest.mark.parametrize("active,expected,universe", [
+    (400, None, 400), (3000, None, 3000), (3001, None, 3001),
+    (3000, 6000, 3000),
+])
+def test_full_market_requires_magnitude_evidence(active, expected, universe):
+    """**`full_market` 不是存在性断言，是量级断言。**
+
+    `IT-P2-UNIVERSE-FULL-MARKET-IS-MAGNITUDE-BLIND-001`（00:12 §6，P2 已确认）：
+
+    修前 `_scope_state_of` 的全部判据是 `active_scan_codes > 0`，
+    **从不与 `expected_total` 比**。于是 active=400 / 3000 / 3001 / 5900
+    （分母未知或只有全市场一半）**全部**被标成 `full_market`，
+    再被 `:1737` 输出成「全程全市场扫描」。
+
+    实测 one-liner：`active=3000 / expected=6000` +
+    分母未知 -> scope 文案仍说"全程全市场扫描"，而 absolute 只给 warn、
+    coverage 因分母未知算不出 —— **在"全绿"方向上没有任何拦截**。
+    """
+    ls = _ls()
+    rows = [_row_scope(quotes=universe, active=active, expected=expected,
+                       universe=universe) for _ in range(30)]
+    assert rows[0]["universe_scope_state"] != ls.SCOPE_FULL_MARKET, (
+        f"active={active}/expected={expected} 不满足全市场量级证据")
+    _, det, _ = _scope_detail(rows)
+    assert not _asserts_full_market(det), (
+        f"active={active}/expected={expected} 不得说全市场：{det}")
+
+
+def test_full_market_control_high_coverage_still_asserts():
+    """负控制：分母已知且覆盖率高时**必须仍然**是 `full_market`。"""
+    ls = _ls()
+    rows = [_row_scope(quotes=5900, active=5900, expected=6000,
+                       universe=5900) for _ in range(30)]
+    assert rows[0]["universe_scope_state"] == ls.SCOPE_FULL_MARKET
+    _, det, _ = _scope_detail(rows)
+    assert _asserts_full_market(det), f"高质量覆盖必须肯定：{det}"
+
+
+def test_scope_broad_unquantified_is_a_distinct_state():
+    """`broad_scan_unquantified` 必须与 `full_market` **不同态**。
+
+    00:12 §6 要求把 scope 至少拆成
+    `full_market_quantified / broad_scan_unquantified / watchlist_only /
+    empty_scan / unknown`。分母未知但 active>0 只能说前者。
+    """
+    ls = _ls()
+    # 新常量用 `getattr` 惰性取：旧实现没有它，`AttributeError` 是
+    # **结构性 ERROR**（什么都证明不了）。退化成 `full_market` 这个哨兵值
+    # 后，下面的断言仍然**行为性**地失败。
+    unq_state = getattr(ls, "SCOPE_BROAD_UNQUANTIFIED", ls.SCOPE_FULL_MARKET)
+    unq = _row_scope(quotes=3000, active=3000, expected=None, universe=3000)
+    assert unq["universe_scope_state"] == unq_state, (
+        f"分母未知 + active>0 不得是 full_market：{unq['universe_scope_state']}")
+    # 五态必须都不同 —— 少的那个态就是"扫得广但证不出全市场"。
+    assert len({ls.SCOPE_FULL_MARKET, ls.SCOPE_WATCHLIST_ONLY,
+                ls.SCOPE_EMPTY_SCAN, ls.SCOPE_UNKNOWN, unq_state}) == 5
+
+
+def _fresh_rows(n_fresh, *, n_total=30, state="fresh"):
+    rows = [_row_scope(quotes=5900, active=5900, expected=6000,
+                       universe=5900) for _ in range(n_fresh)]
+    if state != "fresh":
+        for r in rows:
+            r["universe_fresh_state"] = state
+    rows += [{"index": i, "quotes": 5900, "universe": 5900}
+             for i in range(n_fresh + 1, n_total + 1)]
+    return rows
+
+
+def _fresh_detail(rows):
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe_session"] = _ls()._universe_session(rows)
+    v = _ls().evaluate_health(m)
+    return v, _detail(v, "universe_freshness")
+
+
+def _asserts_session_fresh(detail: str) -> bool:
+    """这条 detail 是否**真的在肯定**"会话期间股票池新鲜"。
+
+    同 `_asserts_full_market` 的坑：**否定式文案也含这个子串**
+    （「**不能**说'会话期间股票池新鲜'」）。朴素 `in` 会把否认读成肯定
+    —— 22:45 ADDENDUM3 §J.6 记录的正是这个探针错误。
+    """
+    return ("会话期间股票池新鲜" in detail
+            and "不能" not in detail
+            and "不足" not in detail
+            and "未全程" not in detail
+            and "未测量" not in detail)
+
+
+@pytest.mark.parametrize("n_fresh", [1, 15, 29])
+def test_freshness_positive_never_uses_evidenced_subset(n_fresh):
+    """`IT-P2-UNIVERSE-FRESHNESS-POSITIVE-USES-EVIDENCED-SUBSET-001`（00:12 §5）。
+
+    修前实测：1 轮有 freshness key、29 轮完全没有 ->
+    `states={'fresh':1}` / `measured=True` / `worst=fresh`
+    -> 「会话期间股票池新鲜（**{'fresh': 1}**）」。
+    文案里的 `1` 自己就把分母暴露了 —— 同一个产物内自相矛盾
+    （聚合层明明写着 `rounds=30`）。
+    """
+    rows = _fresh_rows(n_fresh)
+    agg = _ls()._universe_session(rows)
+    assert agg["states"].get("fresh", 0) == n_fresh
+    # 用 `.get` 退化成"子集自己的分母" —— 那正是缺陷本体，
+    # 于是断言仍然**行为性**地失败，而不是抛 `KeyError`。
+    assert agg.get("freshness_measured_rounds", n_fresh) == n_fresh
+    assert agg.get("rounds_total", n_fresh) == 30
+    v, det = _fresh_detail(rows)
+    assert not _asserts_session_fresh(det), (
+        f"{n_fresh}/30 轮有证据不得自称整场新鲜：{det}")
+    assert "未全程" in det, f"必须显式写出覆盖不足：{det}"
+    assert _lvl(v, "universe_freshness") != "fail"
+
+
+def test_freshness_control_all_fresh_still_asserts():
+    """负控制：30/30 全 fresh **必须仍然**肯定。"""
+    rows = _fresh_rows(30)
+    _, det = _fresh_detail(rows)
+    assert _asserts_session_fresh(det), f"30/30 全 fresh 必须肯定：{det}"
+
+
+def test_freshness_control_all_unknown_stays_unmeasured():
+    """回归控制：30/30 全 `unknown` 必须保持「未测量」，不得回退成肯定。"""
+    rows = _fresh_rows(30, state="unknown")
+    _, det = _fresh_detail(rows)
+    assert "未测量" in det, f"全 unknown 应说未测量：{det}"
+    assert not _asserts_session_fresh(det)
+
+
+@pytest.mark.parametrize("size,expect_fail", [(0, True), (None, False)])
+def test_t0_measured_zero_is_not_read_as_missing(size, expect_fail):
+    """**`None` != `0`** —— 明确测到 0 只必须与"没记录"分开。
+
+    `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`（00:12 §2，P1 已确认）：
+
+    修前 `_safe_int(None) == _safe_int(0) == 0`，三态被压成两态，
+    两者都落到「无股票池规模记录（旧报告/未采集），无法判定（跳过不算失败）」。
+
+    实测（以真实归档绿报告为基线，只替换 t0 快照）：
+        universe_size=0 + active=0 + **分母未知**
+        -> healthy=True / exit_code=0 / fails=[]  ← **整场全绿**
+    "测到 0 只票"是**明确坏**，不是"没记录"。
+    """
+    m = _base()
+    m["setup"] = {"universe_size": size,
+                  "universe_truth": {"denominator_kind": "unknown",
+                                     "expected_total": 0,
+                                     "active_scan_codes": 0,
+                                     "coverage_active": None,
+                                     "transport_complete": True,
+                                     "attempt_status": "applied",
+                                     "freshness": {"state": "fresh",
+                                                   "age_s": 1.0}}}
+    m["universe"] = {"min": 0 if size == 0 else 5000, "max": 5000,
+                     "last": 5000, "first": 5000}
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe")
+    if expect_fail:
+        assert _lvl(v, "universe") == "fail", f"测到 0 只必须 fail：{det}"
+        assert "0 只" in det, f"必须点名是 0 只：{det}"
+        assert "无股票池规模记录" not in det, (
+            f"测到 0 不得渲染成'无记录'：{det}")
+    else:
+        assert _lvl(v, "universe") != "fail", (
+            f"真的没有记录不得判红（防假红）：{det}")
+
+
+def test_session_absolute_shrink_is_consumed():
+    """`IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001`（00:12 §3）。
+
+    t0 `universe_size=5000` + 会话 min=2000 + **分母未知**：
+    修前绝对项**只读 t0**，会话缩水**零消费者**。
+    口径：`absolute effective size = min(t0, session min)`，保持 `None != 0`。
+    """
+    m = _base()
+    m["setup"] = {"universe_size": 5000,
+                  "universe_truth": {"denominator_kind": "unknown",
+                                     "expected_total": 0,
+                                     "active_scan_codes": 0,
+                                     "coverage_active": None,
+                                     "transport_complete": True,
+                                     "attempt_status": "applied",
+                                     "freshness": {"state": "fresh",
+                                                   "age_s": 1.0}}}
+    m["universe"] = {"min": 2000, "max": 5000, "last": 2000, "first": 5000}
+    rows = [{"index": i, "quotes": 2000, "universe": 2000}
+            for i in range(1, 31)]
+    m["universe_session"] = _ls()._universe_session(rows)
+    # `.get` 退化：旧实现没有这个键（会话最小绝对规模**零消费者**，
+    # 正是缺陷本体），断言因此仍然**行为性**地失败而非抛 `KeyError`。
+    assert m["universe_session"].get("universe_abs_min", 5000) == 2000
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe")
+    assert _lvl(v, "universe") == "fail", (
+        f"会话 min 2000 < 下限 3000 必须 fail：{det}")
+    assert "2000" in det, f"必须点名会话最小值：{det}"
+
+
+def test_session_absolute_shrink_control_stable_pool_stays_ok():
+    """负控制：t0 与会话都是 5900 时**必须仍然** ok。"""
+    m = _base()
+    m["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+    m["universe"] = {"min": 5900, "max": 5900, "last": 5900, "first": 5900}
+    rows = [_row_scope(quotes=5900, active=5900, expected=6000,
+                       universe=5900) for _ in range(30)]
+    m["universe_session"] = _ls()._universe_session(rows)
+    v = _ls().evaluate_health(m)
+    assert _lvl(v, "universe") == "ok", _detail(v, "universe")
+
+
+def test_coverage_session_evidence_survives_missing_t0_truth():
+    """`IT-P1-UNIVERSE-COVERAGE-SESSION-WITHOUT-T0-001`（00:12 §4）。
+
+    `bf0b83b` 已能让"t0 分母未知但 t0 dict 存在"时会话证据独立支撑 FAIL，
+    **但整个 coverage consumer 仍被包在 `if isinstance(_ut, dict) and _ut:` 内**。
+    于是 pre-loop `engine.universe_truth()` 读取异常（`setup.universe_truth=None`）、
+    而 soak 中途恢复且真有 75% 覆盖时，判决**仍然**说"未测量"。
+
+    修复原则：t0 与 session **独立解析**，再按同轴最坏显式证据合并。
+    **不能让"t0 没读到"否定后续真实测量。**
+    """
+    m = _base()
+    m["setup"] = {"universe_size": 5900}          # 无 universe_truth
+    rows = [_row_scope(quotes=4500, active=4500, expected=6000,
+                       universe=4500) for _ in range(30)]
+    agg = _ls()._universe_session(rows)
+    assert agg["coverage_active_measured_rounds"] == 30
+    assert abs(agg["coverage_active_min"] - 0.75) < 1e-9
+    m["universe_session"] = agg
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_coverage")
+    assert _lvl(v, "universe_coverage") == "fail", (
+        f"会话 75% 覆盖必须 fail（t0 缺失不得掩盖）：{det}")
+    assert "会话" in det, f"必须点名证据来自会话：{det}"
+
+
+def test_coverage_without_t0_and_without_session_stays_unmeasured():
+    """负控制：t0 与会话**都没有**覆盖证据时必须保持"未测量"，不得判红。"""
+    m = _base()
+    m["setup"] = {"universe_size": 5900}
+    v = _ls().evaluate_health(m)
+    det = _detail(v, "universe_coverage")
+    assert _lvl(v, "universe_coverage") != "fail", f"无证据不得判红：{det}"
+    assert "无法计算" in det or "无法判定" in det, det
+
+
+# ---------------------------------------------------------------------------
+# 死字段（只写不读）：`ADDENDUM3 §2.1` 点名 5 个
+# ---------------------------------------------------------------------------
+
+#: 审计方独立统计的"写后无生产读者"字段清单（21:40 说 3 个，22:45 自我更正为 5 个）。
+#: 值 = 该字段在 `_universe_session` 里的**配对/载体**键名
+#: （`universe_active_scan_codes` 是**每轮**字段，会话侧载体是 `_first`）。
+_KNOWN_DEAD_FIELDS = {
+    "coverage_active_denominator_kinds": "coverage_active_denominator_kinds",
+    "coverage_active_p05": "coverage_active_p05",
+    "coverage_active_last": "coverage_active_last",
+    "universe_active_scan_codes": "universe_active_scan_codes_first",
+    "scope_counts": "scope_counts",
+}
+
+
+@pytest.mark.parametrize("field,key", sorted(_KNOWN_DEAD_FIELDS.items()))
+def test_previously_write_only_field_now_has_a_production_reader(field, key):
+    """**改变了它就必须改变判决或产物** —— 否则它就是假可观测性。
+
+    审计约定：接进判决**或删掉**，不许"写进 JSON 但没人读"。
+    这里用**行为**验证，不用 grep（grep 会把注释/字符串算成读者，
+    也会把 `.get` 的**写**算成读 —— 我第一版探针就是这么骗过自己的）。
+    """
+    ls = _ls()
+
+    def _rows():
+        # `active/expected = 5900/6000 = 98.3%` —— 必须**够高**才会被判成
+        # `full_market`，否则 `scope_counts` 的变异落在一条本来就不被
+        # 采用的支路上，测出来的是"没变化"而不是"没有消费者"。
+        return [_row_scope(quotes=5900, active=5900, expected=6000,
+                           universe=5900) for _ in range(30)]
+
+    agg = ls._universe_session(_rows())
+    assert key in agg, f"{field} 的会话载体 `{key}` 必须存在"
+    assert agg.get(key) is not None, f"{key} 应是**测到**的值而非 None"
+
+    def _render(a):
+        mm = _base()
+        mm["setup"] = {"universe_size": 5900, "universe_truth": _green_t0()}
+        mm["universe_session"] = a
+        v = ls.evaluate_health(mm)
+        return (_sig(v), tuple(c["detail"] for c in v["checks"]))
+
+    ref = _render(agg)
+    mut = dict(agg)
+    orig = agg[key]
+    if field == "coverage_active_denominator_kinds":
+        mut[key] = {"provider_declared_total": 30,
+                    "page_exhausted": 30}          # 分母种类**不统一**
+    elif field == "scope_counts":
+        mut[key] = {**orig, "full_market": 999}    # 自洽性被破坏
+    elif field in ("coverage_active_p05", "coverage_active_last"):
+        mut[key] = 0.10                            # 明显更低
+    else:
+        # `universe_active_scan_codes`：与 t0 的 5900 **不一致**
+        mut[key] = 4242
+    got = _render(mut)
+    assert got != ref, (
+        f"`{field}`（载体 `{key}`）改了但判决与产物都没变 —— "
+        f"它仍然是个死字段（审计要求：接进判决或删掉）")
+

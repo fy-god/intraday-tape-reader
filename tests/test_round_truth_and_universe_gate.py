@@ -342,9 +342,28 @@ def test_moderately_small_universe_warns_without_changing_exit():
 
 
 def test_universe_not_measured_charges_nothing():
-    """旧报告没有 setup / 规模为 0 -> 跳过，不算失败（与既有约定一致）。"""
-    for setup in (None, {}, {"universe_size": 0},
-                  {"universe_size": None}):
+    """旧报告没有 setup / **真的没测到** -> 跳过，不算失败。
+
+    ⚠ 本用例在 2026-09-23 被**任务定义调整**修正过（不是产品 bug）：
+
+    它原先把 `{"universe_size": 0}` 也归入"未测量"。但
+    `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`
+    （09-23 00:12 §2）指出 **`None` 与 `0` 是两种语义**：
+
+    ```text
+    None = 没有测量到股票池大小      -> NOT_MEASURED -> 跳过不算失败
+    0    = 明确测到 active scan = 0  -> FAIL（一只票都没扫）
+    ```
+
+    实测（以真实归档绿报告为基线，只替换 t0 快照）：
+    `universe_size=0 + active_scan_codes=0 + 分母未知`
+    修前 -> `healthy=True / exit_code=0 / fails=[]`（**整场全绿**）。
+
+    "测到 0 只票"是**明确坏**，把它当成"没记录"正是缺陷本体，
+    所以 `0` 从这个"不该判红"的集合里移出，改由
+    `test_universe_measured_zero_is_red` 覆盖。
+    """
+    for setup in (None, {}, {"universe_size": None}):
         m = _base_metrics()
         if setup is None:
             m.pop("setup", None)
@@ -353,6 +372,22 @@ def test_universe_not_measured_charges_nothing():
         v = _ls().evaluate_health(m)
         assert v["healthy"] is True, (
             f"未测量不该判红 setup={setup!r} fail={v.get('fail')}")
+
+
+def test_universe_measured_zero_is_red():
+    """**明确测到 0 只**必须判红 —— 与"没记录"**分开**。
+
+    `IT-P1-UNIVERSE-T0-MEASURED-ZERO-READ-AS-MISSING-001`（09-23 00:12 §2）。
+    三态：`None -> NOT_MEASURED`；`0 -> FAIL`；`>0 -> 正常阈值`。
+    """
+    m = _base_metrics()
+    m["setup"] = {"universe_size": 0, "fell_back_to_watchlist": False}
+    v = _ls().evaluate_health(m)
+    assert "universe" in v["fail"], (
+        f"明确测到 0 只票必须进 fail：{v.get('fail')}")
+    det = [c for c in v["checks"] if c["name"] == "universe"][0]["detail"]
+    assert "0 只" in det, f"必须点名 0 只，不得说'无记录'：{det}"
+    assert "无股票池规模记录" not in det, f"不得渲染成没记录：{det}"
 
 
 def test_universe_check_tolerates_dirty_setup():

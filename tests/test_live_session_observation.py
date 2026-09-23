@@ -53,8 +53,20 @@ def _obs(**over) -> dict:
 
 
 def _sample(**over) -> dict:
+    """一个轮样本。
+
+    ⚠ `universe` 默认值 09:23 从 `100` 改成 `5000`。
+
+    修 `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001` 之后，绝对项会读
+    **会话内最小绝对规模**（`min(t0, session min)`），于是一个
+    `universe=100 / quotes=5000` 的**内部矛盾桩值**会被正确地判成
+    "扫描池从 5000 塌到 100"。
+
+    这不是产品缺陷 —— 100 个代码的扫描池本来就产不出 5000 条行情。
+    是夹具的桩值不真实，本轮修夹具（**任务定义调整**，不是产品修复）。
+    """
     kw = dict(index=1, latency_ms=400.0, alerts=(), error=False, quotes=5000,
-              universe=100, history_points=10, history_codes=10, max_deque=1,
+              universe=5000, history_points=10, history_codes=10, max_deque=1,
               history_maxlen=360, watchlist_only=False)
     kw.update(over)
     return ls.make_round_sample(**kw)
@@ -109,7 +121,7 @@ def test_no_observation_keeps_legacy_shape():
         assert k not in s, f"没有 observation 时不应有 {k}"
     # 旧字段仍在
     assert s["quotes"] == 5000
-    assert s["universe"] == 100
+    assert s["universe"] == 5000
 
 
 def test_empty_observation_dict_is_treated_as_absent():
@@ -173,7 +185,18 @@ def test_round_with_observation_is_json_safe():
 #   soft-partial 得到 healthy=True / exit 0，逐项检查表里连一行都没有。
 # ===========================================================================
 def _healthy_metrics(rounds: list[dict], **over) -> dict:
-    """给一组轮样本配上一份"其余项全绿"的 metrics，单独暴露观测判定。"""
+    """给一组轮样本配上一份"其余项全绿"的 metrics，单独暴露观测判定。
+
+    ⚠ `setup` 必须显式给一份**真实形状**的股票池规模。
+
+    09:23 之前这里不传 `setup`，于是 `finalize_metrics` 用骨架里的
+    `universe_size = None`，而轮样本的 `universe=100` 是**桩值**。
+    修 `IT-P1-UNIVERSE-ABS-SIZE-SESSION-BLIND-001` 之后，
+    绝对项会读**会话内最小绝对规模**（`min(t0, session min)`），
+    于是一个 coverage 轴的测试会被 `universe` 轴以"扫描池仅 100 只"判红
+    —— 那是**测试夹具不真实**，不是产品缺陷（100 只票的扫描池
+    本来就该 fail）。
+    """
     m = ls.finalize_metrics(
         rounds,
         api={"requests": 20, "non_200": 0, "malformed": 0, "unreachable": 0},
@@ -181,6 +204,8 @@ def _healthy_metrics(rounds: list[dict], **over) -> dict:
              "events_by_type": {"tick": 5, "bye": 1}},
         logs={"WARNING": 0, "ERROR": 0, "CRITICAL": 0},
         browser={"ran": False, "skipped": True, "errors": []},
+        setup={"engine_build_s": 1.0, "universe_refresh_s": 1.0,
+               "universe_size": 5000, "fell_back_to_watchlist": False},
     )
     m.update(over)
     return m
