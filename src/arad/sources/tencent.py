@@ -456,9 +456,27 @@ def parse_response_detailed(text: str, seq: int = 0,
         if not c:
             return None
         sym = (prefix or guess_prefix(c)) + c
-        # 只有**显式**写过前缀、且该符号确实在指数集合里 == 指数；
-        # 其余（含裸 000001 想拉平安银行）都是个股 -> 裸码。
-        if prefix and sym in idx_set:
+        # ⚠ `IT-P2-TENCENT-DETAILED-EXPLICIT-STOCK-KEY-AXIS-001`
+        #   （云端 2026-09-23 20:09 §4，P2，我实测**确认**）。
+        #
+        #   修前这里只判 `prefix and sym in idx_set` —— 而类级出口
+        #   `snapshots_detailed` 构造的是
+        #       `idx_set = {sym for sym, explicit in norm if explicit}`
+        #   即**任何显式写了前缀的请求**都进 idx_set。
+        #   于是请求 `sh600000`（浦发银行，**不是**指数）时：
+        #       R = {sh600000}（带前缀）   而 raw `_key` = {600000}（裸码）
+        #   交集恒空 -> P=Q=∅ -> 报
+        #       「请求的股票 missing，另外返回了一个未请求代码」
+        #   而 provider 明明**正常返回**了。这正是本文件
+        #   `parse_response_detailed` docstring 里警告过的那个"同轴"易错点，
+        #   我在 raw 侧修对了、在 request 侧漏了。
+        #
+        #   修法：与 raw `_key` 用**同一份**"是否真指数"判据 ——
+        #   `looks_like_index` 只看符号/裸码（请求侧没有 name，
+        #   传空串即走"名称缺失一律按股票"的既有消歧规则，
+        #   与 `board_of` 的注释一致）。
+        #   不要拿"显式写了前缀"当"它是指数"的代理。
+        if prefix and sym in idx_set and looks_like_index(sym, "", c):
             return sym
         return c
 

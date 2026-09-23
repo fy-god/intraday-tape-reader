@@ -105,6 +105,11 @@ class SnapshotFetchResult(NamedTuple):
         return len(self.quotes)
 
     @property
+    def admitted_keys(self) -> frozenset[str]:
+        """``Q`` 的身份集（与 ``admitted`` 同一份真相，避免各处重算）。"""
+        return frozenset(_key_of(x) for x in self.quotes)
+
+    @property
     def unknown_missing_keys(self) -> frozenset[str]:
         """``R - P``。
 
@@ -114,12 +119,47 @@ class SnapshotFetchResult(NamedTuple):
         return self.requested_keys - self.raw_returned_requested_keys
 
     @property
+    def coverage(self) -> float | None:
+        """**已废弃别名** = ``usable_coverage``（``|Q|/|R|``）。
+
+        ⚠ 保留只是为了不破坏既有调用方，**新代码不要用**：
+        一个中性的名字 ``coverage`` 同时被"传输覆盖"与"可用覆盖"两种语义
+        争用，正是云端 20:09 WP01 RED 1 指认的缺陷 —— 同一个 generic
+        coverage 同时服务 RoundObservation 的 raw coverage 与诊断轴。
+        **显式用 ``raw_return_coverage`` 或 ``usable_coverage``。**
+        """
+        return self.usable_coverage
+
+    @property
     def is_exact(self) -> bool:
         return self.raw_presence_known
 
     @property
-    def coverage(self) -> float | None:
-        """``|Q| / |R|``；``R`` 为空时返回 ``None``（不是 0.0，也不是 1.0）。"""
+    def raw_return_coverage(self) -> float | None:
+        """**传输/raw 轴**：``|P| / |R|`` —— "服务端到底回了多少条"。
+
+        这是 ``RoundObservation.returned`` / ``coverage`` 该用的那个轴。
+        ``eastmoney.py:421-439`` 早就在股票池口径上把这两轴分开写明了
+        （``transport_complete`` 用传输轴，``usable_coverage`` 只是诊断），
+        这里是**同一纪律在快照口径上的落地**。
+
+        ``raw_presence_known=False`` 时返回 ``None``（**未测量**）：
+        legacy 路径下 ``P`` 是从 ``Q`` 投影反推的下界，拿它算比例会把
+        "没有证据"伪装成"覆盖率 100%"。本仓库的既有纪律是
+        **``None`` != ``0.0``**（见 ``engine.py`` 的 `_abs_min` 系列）。
+        """
+        if not self.requested_keys or not self.raw_presence_known:
+            return None
+        return len(self.raw_returned_requested_keys) / len(self.requested_keys)
+
+    @property
+    def usable_coverage(self) -> float | None:
+        """**可用轴**：``|Q| / |R|`` —— "解析后真正能用多少"。
+
+        纯**诊断**。**不得**用它代替 ``raw_return_coverage`` 去判传输完整性：
+        实测 A 股停牌率约 6%，把"市场里有停牌股"判成"服务端少给了数据"
+        是本仓库修过的旧缺陷（``IT-P1-COMPLETE-001-R1``）。
+        """
         if not self.requested_keys:
             return None
         return len(self.quotes) / len(self.requested_keys)
@@ -149,7 +189,9 @@ class SnapshotFetchResult(NamedTuple):
             "requested": self.requested,
             "returned": self.returned,
             "admitted": self.admitted,
-            "coverage": self.coverage,
+            "raw_return_coverage": self.raw_return_coverage,
+            "usable_coverage": self.usable_coverage,
+            "coverage": self.coverage,          # 废弃别名，= usable_coverage
             "requested_keys": sorted(self.requested_keys),
             "raw_returned_requested_keys":
                 sorted(self.raw_returned_requested_keys),
@@ -216,7 +258,6 @@ def merge_outcomes(parts: Iterable[SnapshotFetchResult]) -> SnapshotFetchResult:
 
     req: set[str] = set()
     raw_present: set[str] = set()
-    quality: set[str] = set()
     unexpected: set[str] = set()
     dups: set[str] = set()
     raw_rows: list[Any] = []
@@ -232,7 +273,6 @@ def merge_outcomes(parts: Iterable[SnapshotFetchResult]) -> SnapshotFetchResult:
     for p in parts:
         req |= p.requested_keys
         raw_present |= p.raw_returned_requested_keys
-        quality |= p.rejected_quality_keys
         unexpected |= p.unexpected_raw_keys
         dups |= p.duplicate_raw_keys
         raw_rows.extend(p.raw_rows)
@@ -262,10 +302,30 @@ def merge_outcomes(parts: Iterable[SnapshotFetchResult]) -> SnapshotFetchResult:
         normalized_request=tuple(sorted(req)), raw_keys=sorted(raw_present),
         quotes=quotes, raw_rows=raw_rows, raw_presence_known=True,
         provenance=prov)
-    # 诊断集按并集直接给出（不重新推导 —— 重新推导会把
-    # "跨批次重复" 这类信息丢掉）。
+    # ⚠ `rejected_quality_keys` **必须在 global merge 后按 P-Q 重算**，
+    #   不能直接用各批次的并集。
+    #
+    #   云端 20:09 任务书 WP01 RED 3：同一个 code 在批次 A 里
+    #   raw present 但 invalid、在批次 B 里 raw present 且 valid ——
+    #   并集让 A 的 `rejected_quality` 留了下来，于是**同一个码同时出现在
+    #   `rejected_quality` 和 `admitted` 里**。这在语义上是错的：
+    #   合并后的真实事实是"这个码 raw 回来了，而且能用了"。
+    #
+    #   我修前写的是 `quality |= p.rejected_quality_keys`（第 235 行），
+    #   并在 `_replace` 里把那个并集贴回去 —— 那是**把"逐批次的结论"
+    #   当成了"合并后的结论"**，与本地轮刚修完的
+    #   IT-P1-TRANSPORT-POSITIVE-USES-EVIDENCED-SUBSET 是**同一条 bug 类**：
+    #   拿子集的结论当全局的结论。
+    #
+    #   正确做法：**不要覆盖** —— `build_outcome` 已经按
+    #   `(P - Q) & R` 算好了 `rejected_quality_keys`，那正是合并后的真相。
+    #   （我第一版修成 `quality &= admitted_keys`，实测**仍然留下** `{code}`：
+    #    RED 3 里该码既在 quality 又在 admitted，交集非空 —— 交并都会错，
+    #    必须**重算**，而重算的唯一实现就在 `build_outcome` 里。）
+    #
+    #   `unexpected` / `duplicate` 仍按并集给出：那两个是**观测到的异常事件**
+    #   （服务端多给了、给重了），合并只会让事件更多，重算无从谈起。
     return out._replace(
-        rejected_quality_keys=frozenset(quality),
         unexpected_raw_keys=frozenset(unexpected),
         duplicate_raw_keys=frozenset(dups),
     )

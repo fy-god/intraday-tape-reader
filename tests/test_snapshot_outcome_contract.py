@@ -25,9 +25,11 @@ from arad.sources.outcome import (
     PROVENANCE_EXACT,
     PROVENANCE_LEGACY,
     build_outcome,
+    merge_outcomes,
 )
 from arad.sources.sina import parse_response as sina_old
 from arad.sources.sina import parse_response_detailed as sina_detailed
+from arad.sources.tencent import _norm_specs
 from arad.sources.tencent import parse_response_detailed as tx_detailed
 
 #: 三源共同的受影响代码（raw 在、数值不可用）与正常代码。
@@ -537,4 +539,171 @@ def test_v4_outlet_empty_request_returns_declared_outcome(cls_name):
     assert got.coverage is None, "空请求的覆盖率是'未测量'"
     assert got.raw_presence_known is True, (
         "空请求没有 parser 丢行的可能，可以声称 exact")
+
+
+# ===========================================================================
+# 云端 2026-09-23 20:09:44 任务书 WP01 —— 三条 RED
+#   （对同一份 v4 实现的独立复审；RED 2 我实测**已成立**，见下）
+# ===========================================================================
+
+def test_wp01_red1_coverage_has_two_axes():
+    """**RED 1（云端 20:09 WP01）**：`R=3 P=3 Q=1` 必须给出**两个**覆盖率。
+
+    云端原文：「禁止同一个 generic coverage 同时服务 RoundObservation
+    raw coverage」。我修前 `coverage` 只有一个实现 = `|Q|/|R|` = `1/3`，
+    而 RoundObservation 要的 raw 覆盖率是 `|P|/|R|` = `1.0` ——
+    **一个中性名字被两种语义争用**，正是本仓库反复出现的
+    "同一语义实现两次 / 一个名字服务两个语义" bug 类。
+
+    判据（照抄任务书）：
+        raw_return_coverage = 1.0
+        usable_coverage     = 1/3
+    """
+    payload = {"data": {"total": 3, "diff": [
+        _em_row("600001", valid=True), _em_row("600002", valid=False),
+        _em_row("600003", valid=False)]}}
+    g = parse_ulist_detailed(payload, requested=["600001", "600002",
+                                                 "600003"])
+    assert g.requested == 3 and len(g.raw_returned_requested_keys) == 3
+    assert g.admitted == 1
+    assert g.raw_return_coverage == pytest.approx(1.0), (
+        "传输轴：三条 raw 都回来了 -> 1.0")
+    assert g.usable_coverage == pytest.approx(1 / 3), (
+        "可用轴：只有一条能用 -> 1/3")
+    # 两轴**必须能分开**；相等就说明又合并回一个了。
+    assert g.raw_return_coverage != g.usable_coverage
+    # 废弃别名必须指向可用轴（旧调用方语义不变）。
+    assert g.coverage == g.usable_coverage
+
+
+def test_wp01_red1_legacy_raw_coverage_is_unmeasured_not_one():
+    """legacy 路径的 raw 覆盖率必须是 `None`（未测量），**不是** 1.0。
+
+    `raw_presence_known=False` 时 `P` 是从 `Q` 投影反推的**下界** ——
+    拿它算比例会把"没有证据"伪装成"覆盖率 100%"。本仓库既有纪律是
+    `None != 0.0`（见 `engine.py` 的 `_abs_min` 系列）。
+    """
+    g = build_outcome(route="stocks", source="legacy",
+                      normalized_request=(OK_CODE,), raw_keys=(),
+                      quotes=parse_ulist_detailed(
+                          EASTMONEY_JSON, requested=(OK_CODE,)).quotes,
+                      raw_presence_known=False)
+    assert g.raw_presence_known is False
+    assert g.raw_return_coverage is None, (
+        "没有 raw 证据就不得声称 raw 覆盖率")
+    assert g.usable_coverage is not None, "可用轴仍可算"
+
+
+def test_wp01_red2_explicit_prefix_is_not_index_identity():
+    """**RED 2（云端 20:09 §4）**：`requested=['sh600000']` 是**普通股**。
+
+    `IT-P2-TENCENT-DETAILED-EXPLICIT-STOCK-KEY-AXIS-001`。
+
+    机制：类级出口 `snapshots_detailed` 构造
+        `idx_set = {sym for sym, explicit in norm if explicit}`
+    —— 即**任何显式写了前缀的请求**都进 idx_set。修前 `_req_key` 只判
+    `prefix and sym in idx_set`，**没有再确认它真的是指数**，于是
+    `sh600000`（浦发银行）得到 `R={sh600000}`，而 raw `_key` 按
+    `looks_like_index` 给出裸码 `{600000}` —— **交集恒空**，
+    provider 明明正常返回却报"请求的股票 missing + 返回了未请求代码"。
+
+    ⚠ **我第一次的探针是错的**：写成
+    `parse_response_detailed(txt, requested=["sh600000"])`，
+    `index_codes` 默认 `None` -> `idx_set=set()` -> **绕开了缺陷那一行**，
+    于是误判"这条不成立"。必须走类级出口构造的那个 idx_set
+    （D15 / 规则 mmm2：探针没走进被审分支，等于没测）。
+    """
+    txt = _tx_line("sh600000", "600000", "11.00")
+    idx_set = {sym for sym, explicit in _norm_specs(["sh600000"]) if explicit}
+    assert idx_set == {"sh600000"}, "前提：显式前缀会进 idx_set（缺陷入口）"
+    g = tx_detailed(txt, requested=["sh600000"], index_codes=idx_set)
+    assert g.requested_keys == frozenset({"600000"}), (
+        f"个股必须落裸码轴，不得带前缀：{sorted(g.requested_keys)}")
+    assert g.raw_returned_requested_keys == frozenset({"600000"})
+    assert {q.code for q in g.quotes} == {"600000"}
+    assert not g.unknown_missing_keys, "R 与 P 同轴，不得报'全缺'"
+    assert not g.unexpected_raw_keys, "不得把裸 600000 当成未请求"
+    assert g.raw_return_coverage == pytest.approx(1.0)
+
+
+def test_wp01_red2_control_real_index_still_keeps_prefix():
+    """**阳性对照**：`sh000001`（上证指数）**必须仍然带前缀**。
+
+    修 `_req_key` 时若简单粗暴地"显式前缀一律当个股"，就会把真实指数
+    的 R 从 `sh000001` 打成 `000001` —— 那会和平安银行撞码，
+    正是 `looks_like_index` 存在的理由。这条钉住那个方向。
+    """
+    idx_text = _tx_line("sh000001", "000001", "3000.00")
+    idx_set = {sym for sym, e in _norm_specs(["sh000001"]) if e}
+    g = tx_detailed(idx_text, seq=0, index_codes=idx_set,
+                    requested=["sh000001"])
+    assert g.requested_keys == frozenset({"sh000001"}), (
+        "真指数必须保留前缀，否则与平安银行撞码")
+    assert g.raw_returned_requested_keys == frozenset({"sh000001"})
+    assert not g.unknown_missing_keys
+
+
+def test_wp01_red3_merge_recomputes_quality_globally():
+    """**RED 3（云端 20:09 WP01）**：`invalid -> valid` 必须重算 quality。
+
+    同 code：批次 A raw present / **invalid**，批次 B raw present / **valid**。
+    合并后的真实事实是"这个码 raw 回来了，而且能用了"。
+
+    我修前写的是 `quality |= p.rejected_quality_keys` ——
+    **把逐批次的结论当成了合并后的结论**，于是同一个码**同时出现在
+    `rejected_quality` 和 `admitted` 里**。这与我刚修完的
+    `IT-P1-TRANSPORT-POSITIVE-USES-EVIDENCED-SUBSET` 是**同一条 bug 类**。
+
+    判据（照抄任务书）：
+        admitted={code} / quality=**empty** / duplicate={code} / identity=True
+    """
+    code = "600001"
+    a = build_outcome(route="stocks", source="s", normalized_request=(code,),
+                      raw_keys=[code], quotes=[])              # raw 在 / invalid
+    b = build_outcome(route="stocks", source="s", normalized_request=(code,),
+                      raw_keys=[code],
+                      quotes=parse_ulist_detailed(
+                          {"data": {"diff": [_em_row(code, valid=True)]}},
+                          requested=[code]).quotes)             # raw 在 / valid
+    m = merge_outcomes([a, b])
+    assert m.admitted_keys == frozenset({code}), "B 的可用 Quote 必须合并进来"
+    assert m.rejected_quality_keys == frozenset(), (
+        "合并后按 P-Q 重算 -> 该码已可用，quality 必须为空")
+    assert m.duplicate_raw_keys == frozenset({code})
+    assert m.identity_holds()
+    # **核心不变量**：admitted 与 quality 不得有交集。
+    assert not (m.admitted_keys & m.rejected_quality_keys)
+
+
+def test_wp01_red3_control_still_quality_when_truly_invalid():
+    """**阳性对照**：如果批次 B **也没**给出可用 Quote，quality 必须**保留**。
+
+    没有这条，一个"永远把 quality 清空"的实现也能通过上面那条。
+    """
+    code = "600001"
+    a = build_outcome(route="stocks", source="s", normalized_request=(code,),
+                      raw_keys=[code], quotes=[])
+    b = build_outcome(route="stocks", source="s", normalized_request=(code,),
+                      raw_keys=[code], quotes=[])
+    m = merge_outcomes([a, b])
+    assert m.rejected_quality_keys == frozenset({code}), (
+        "两批都 raw 在但都不可用 -> quality 必须保留")
+    assert m.admitted_keys == frozenset()
+    assert m.identity_holds()
+
+
+def test_wp01_red3_control_unexpected_still_union():
+    """`unexpected` / `duplicate` 必须**仍是并集**（不许被"重算"误伤）。
+
+    它们是**观测到的异常事件**（服务端多给了、给重了），合并只会让事件
+    更多；重算无从谈起。我修 quality 时**不能**顺手把它们也清掉。
+    """
+    a = build_outcome(route="stocks", source="s", normalized_request=(OK_CODE,),
+                      raw_keys=[OK_CODE, "600999"], quotes=[])
+    b = build_outcome(route="stocks", source="s", normalized_request=(OK_CODE,),
+                      raw_keys=[OK_CODE, "600998"], quotes=[])
+    m = merge_outcomes([a, b])
+    assert m.unexpected_raw_keys == frozenset({"600999", "600998"}), (
+        "跨批次 unexpected 必须并起来")
+    assert m.duplicate_raw_keys == frozenset({OK_CODE}), "跨批次重复仍要记"
 
