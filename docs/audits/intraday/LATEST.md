@@ -6,8 +6,8 @@
 **最新本地 Agent 产品轮**：[`2026-09-22_21-00-00_JST.md`](./2026-09-22_21-00-00_JST.md)  
 **最新产品提交 / reviewed_source_sha**：`bf0b83bf212f169c720ca8a1c5108405c18a9712`  
 **本轮审计开始 docs HEAD**：`bd5528485e045bb6fadadecb8fbcc0764baf3824`  
-**report_commit_sha**：`c22008756257febfdb2d466142fde2dc79ce6383`  
-**agent_task_commit_sha**：`6fe2f3cd9f821971938c305f51f8702d862d0d93`  
+**report_commit_sha**：`c2208c0353863a1f829ca06d4d49426369dc1540`  
+**agent_task_commit_sha**：`6fe135a3594b0f51456c018a0316811a7c55ca9a`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
 https://github.com/fy-god/intraday-tape-reader/blob/bd5528485e045bb6fadadecb8fbcc0764baf3824/docs/audits/intraday/LATEST.md
 
