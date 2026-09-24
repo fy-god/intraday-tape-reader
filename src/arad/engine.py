@@ -96,6 +96,40 @@ def time_policy_for(source_name: str) -> dict[str, bool]:
 # ==========================================================================
 # 状态
 # ==========================================================================
+@dataclass(frozen=True)
+class StateUpdateResult:
+    """一次 ``update_detailed`` 的 **route-local admission facts**。
+
+    WP01（云端 2026-09-24_12-04-56 §WP01）。
+    `IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011`。
+
+    为什么必须有它：``update()`` 只返回 admitted 字典，future/ooo 只写
+    **全局** counters（``stats["t_reject:future"]`` 等）。``poll_once`` 于是在
+    两条 route 更新**之前**取一次基线、之后算一个 aggregate delta ——
+    而 aggregate 丢掉了归属：
+
+    ============  ==================  ==================
+    Case           index               stocks
+    ============  ==================  ==================
+    A             future=1            ooo=1
+    B             ooo=1               future=1
+    ============  ==================  ==================
+
+    两者 aggregate 都是 ``future=1 / ooo=1``，**无法恢复 route truth**。
+    这正是本仓库反复出现的那一类错：拿合并后的结论当每个子集的结论
+    （规则 D15 / "逐批次结论当成全局结论"）。
+
+    禁止从 global stats 反推 route reason —— 必须由产生方直接给出。
+    """
+
+    route: str
+    admitted: dict[str, Quote] = field(default_factory=dict)
+    rejected_future: int = 0
+    rejected_out_of_order: int = 0
+    #: 本 route 本轮出现陈旧包（未被硬拦，合同 `freshness_allowed=false`）的次数。
+    stale_diagnosed: int = 0
+
+
 @dataclass
 class EngineState:
     """行情历史与派生指标的共享容器（规则通过它读窗口数据）。"""
@@ -150,6 +184,39 @@ class EngineState:
     #: IT-P1-TIME-ROLE-002：``code -> 本地接收时刻``（秒）。
     #: 与 ``effective_event_time`` 分开，跨源比较才有依据。
     received_at: dict[str, float] = field(default_factory=dict)
+
+    # --- WP01（云端 2026-09-24_12-04-56 §WP02）：诊断映射也按 route 分账 ----
+    #
+    # `IT-P2-TIME-DIAGNOSTIC-ROUTE-COLLISION-010`。
+    #
+    # 上面那四个 `*_by_route` 之外的映射（`provider_ts_raw` /
+    # `effective_event_time` / `received_at` / `time_age_seconds`）此前
+    # **只按裸 code** 存。Sina 在 index route 上把 `sh000001` 解析成裸
+    # `000001`，而 stock route 的平安银行**也是** `000001` ——
+    # 两个不同标的抢一个 key，后更新的那个把前者的 age/timestamp 覆盖掉。
+    #
+    # 为什么 `accepted_watermark_by_route` 早就带 route 而这里没带：
+    # 水位线影响**硬准入**（错了会放进未来数据），改得早；
+    # 这四个只是诊断，被当成"顺带记一下"。但诊断正是
+    # "该源时间是否可信"的**唯一**可观察面（合同 `freshness_allowed=false`
+    # 时不做硬拒绝），覆盖掉就等于把证据删了。
+    #
+    # 旧的 stock-only 映射**保留**（既有调用方与测试仍读裸 code），
+    # 但新代码一律读 `*_by_route`。
+    #:
+    #: WP01：``(route, code) -> provider 原始 ts``（秒）。
+    provider_ts_raw_by_route: dict[tuple[str, str], float] = field(
+        default_factory=dict)
+    #: WP01：``(route, code) -> 实际用于入库的生效时间``（秒）。
+    effective_event_time_by_route: dict[tuple[str, str], float] = field(
+        default_factory=dict)
+    #: WP01：``(route, code) -> 本地接收时刻``（秒）。
+    received_at_by_route: dict[tuple[str, str], float] = field(
+        default_factory=dict)
+    #: WP01：``(route, code) -> age 诊断``（秒）。
+    time_age_seconds_by_route: dict[tuple[str, str], float] = field(
+        default_factory=dict)
+
     day_open: dict[str, float] = field(default_factory=dict)
     last_alert: dict[str, float] = field(default_factory=dict)
     #: cooldown_key -> 上次放行时刻。用于"同类告警至少间隔 N 秒"的时间距离判断，
@@ -245,11 +312,31 @@ class EngineState:
 
         IT-P1-TIME-ROLE-004：水位线与"本 epoch 是否见过"都按 **route** 分账。
         个股与指数是两个独立数据流，各有自己的 serving source 与切源时机。
+
+        WP01：本方法现在是 :meth:`update_detailed` 的**薄包装** —— 逻辑只有
+        一份（避免"同一语义实现两次"这个本仓库的老毛病）。需要 route-local
+        future/ooo 归属的调用方用 ``update_detailed``。
+        """
+        return self.update_detailed(quotes, now, route=route).admitted
+
+    def update_detailed(self, quotes: Iterable[Quote], now: datetime,
+                        *, route: str = DEFAULT_ROUTE) -> StateUpdateResult:
+        """同 :meth:`update`，但返回 **route-local** 的准入事实。
+
+        WP01 / `IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011`。
+
+        与 ``update`` 的唯一区别是返回值：``rejected_future`` /
+        ``rejected_out_of_order`` 只统计**本 route** 本轮的数字，
+        调用方不必（也**不允许**）拿全局 counters 做差值 ——
+        差值会丢掉归属，让 Case A 与 Case B 塌成同一个结果。
         """
         ep = now.timestamp()
         route = str(route or DEFAULT_ROUTE)
         self.seq += 1
         admitted: dict[str, Quote] = {}
+        rejected_future = 0
+        rejected_out_of_order = 0
+        stale_here = 0
         # IT-P1-TIME-ROLE-003-R1：陈旧硬拒绝是否可用，由该 route 的供数源的
         # 时间语义合同决定（三家目前都是 freshness_allowed=false）。
         _policy = time_policy_for(self.source_names.get(route, ""))
@@ -267,6 +354,12 @@ class EngineState:
                 freshness_allowed=_fresh_ok)
             if not ts_ok:
                 self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
+                # WP01：**同时**记 route-local 计数。全局 counters 保留是为了
+                # 不弄坏既有读者；但归属只能从这里拿 —— 从全局差值反推会丢归属。
+                if why == "future":
+                    rejected_future += 1
+                elif why == "out_of_order":
+                    rejected_out_of_order += 1
                 continue
 
             # IT-P1-TIME-ROLE-002：留痕 provider 原始 ts，并区分"生效时间"与
@@ -275,18 +368,23 @@ class EngineState:
                 try:
                     _raw = float(q.ts.timestamp())
                     self.provider_ts_raw[q.code] = _raw
+                    self.provider_ts_raw_by_route[wm_key] = _raw
                     # IT-P1-TIME-ROLE-003-R1：无论是否拦得住，都留下 age 诊断。
                     # 合同 freshness_allowed=false 时这是**唯一**可观察"该源时间
                     # 是否可信"的地方，不能因为"不拦"就不记。
                     _age = ep - _raw
                     self.time_age_seconds[q.code] = _age
+                    self.time_age_seconds_by_route[wm_key] = _age
                     if _age > STALE_TOLERANCE_SECONDS:
                         self.stale_diagnosed[route] = \
                             self.stale_diagnosed.get(route, 0) + 1
+                        stale_here += 1
                 except (AttributeError, OSError, ValueError):
                     pass
             self.effective_event_time[q.code] = q_ep
+            self.effective_event_time_by_route[wm_key] = q_ep
             self.received_at[q.code] = ep
+            self.received_at_by_route[wm_key] = ep
 
             # --- 乱序准入：用显式水位线，必须在任何写入之前判定 ----------
             # 水位线在每次准入成功时无条件推进（见函数末尾），因此"平价新鲜
@@ -297,6 +395,7 @@ class EngineState:
             if wm is not None and q_ep < wm:
                 self.stats["t_reject:out_of_order"] = \
                     self.stats.get("t_reject:out_of_order", 0) + 1
+                rejected_out_of_order += 1       # WP01：route-local 归属
                 continue
 
             self.quotes[q.code] = q
@@ -318,7 +417,14 @@ class EngineState:
                 q_ep if wm is None else max(wm, q_ep))
             self.seen_in_epoch[wm_key] = True
             admitted[q.code] = q
-        return admitted
+        # WP01：route-local 事实由**产生方**直接给出（禁止下游从 global 差值反推）。
+        return StateUpdateResult(
+            route=route,
+            admitted=admitted,
+            rejected_future=rejected_future,
+            rejected_out_of_order=rejected_out_of_order,
+            stale_diagnosed=stale_here,
+        )
 
     def _admit_time(self, q: Quote, now: datetime, ep: float,
                     *, first_seen: bool = False,
@@ -438,6 +544,18 @@ class EngineState:
             self.effective_event_time.pop(c, None)
             self.received_at.pop(c, None)
             self.time_age_seconds.pop(c, None)
+            # WP01：按 route 分账的新表必须与 history 一起回收 ——
+            # 否则长时间运行会随关注池轮换而无界增长（与上面四个同理）。
+            for key in [k for k in self.provider_ts_raw_by_route if k[1] == c]:
+                self.provider_ts_raw_by_route.pop(key, None)
+            for key in [k for k in self.effective_event_time_by_route
+                        if k[1] == c]:
+                self.effective_event_time_by_route.pop(key, None)
+            for key in [k for k in self.received_at_by_route if k[1] == c]:
+                self.received_at_by_route.pop(key, None)
+            for key in [k for k in self.time_age_seconds_by_route
+                        if k[1] == c]:
+                self.time_age_seconds_by_route.pop(key, None)
         # 冷却表按时间过期
         cutoff = time.time() - 3600
         stale = [k for k, v in self.last_alert.items() if v < cutoff]
@@ -1261,6 +1379,39 @@ class Engine:
         index_requested = len(self.index_codes) if idx_dispatched else 0
         return stock_requested, index_requested, stock_requested + index_requested
 
+    @staticmethod
+    def _route_ledger(*, stk_returned: int, stk_admitted: int,
+                      idx_returned: int, idx_admitted: int,
+                      stk_reject: tuple[int, int],
+                      idx_reject: tuple[int, int]) -> dict:
+        """route 归属账本的 **唯一事实来源**（WP01）。
+
+        正常路径与空轮分支都必须调它 —— 不许各写一套。理由与
+        :meth:`_request_arithmetic` 完全相同：**同一语义的第二份实现
+        就是下一个假绿的温床**（这个仓库已经在这上面栽过好几次）。
+
+        返回可直接 ``**`` 展开进 :class:`RoundObservationSet` 的 dict：
+        ``reject_by_route`` / ``admitted_by_route`` / ``returned_by_route``。
+
+        空轮传全 0：账本**形状**仍带两条 route 的键。这是有意的 ——
+        "读不到 index 键"与"index 键为 0"若混成同一种表现，
+        下游就无法区分"这条分支没接好"和"这条 route 本轮真的是 0"。
+        """
+        return {
+            "reject_by_route": {
+                ROUTE_STOCKS: (int(stk_reject[0]), int(stk_reject[1])),
+                ROUTE_INDEX: (int(idx_reject[0]), int(idx_reject[1])),
+            },
+            "admitted_by_route": {
+                ROUTE_STOCKS: int(stk_admitted),
+                ROUTE_INDEX: int(idx_admitted),
+            },
+            "returned_by_route": {
+                ROUTE_STOCKS: int(stk_returned),
+                ROUTE_INDEX: int(idx_returned),
+            },
+        }
+
     def _universe_meta_of(self, src: Any, quotes: list[Any]) -> dict:
         """取某来源最近一次 ``universe()`` 的完整性元数据（IT-P1-006）。
 
@@ -1627,6 +1778,14 @@ class Engine:
                         returned=0,
                         admitted=0,
                         index_admitted=0,
+                        # WP01：空轮也必须有 route 分账键（值为 0）——
+                        # 否则"下游读不到 index 键"会与"index 键为 0"
+                        # 混成同一种表现，两种分支的账本形状就不一致了。
+                        # 与正常路径共用 `_route_ledger`，不手写第二份。
+                        **self._route_ledger(
+                            stk_returned=0, stk_admitted=0,
+                            idx_returned=0, idx_admitted=0,
+                            stk_reject=(0, 0), idx_reject=(0, 0)),
                     ))
             except Exception:  # noqa: BLE001
                 # 可观测性不打断主链路，但**必须留痕** —— 静默吞掉正是
@@ -1660,14 +1819,23 @@ class Engine:
                 _route, f"{_serving_name}#{_serving_idx}",
                 source_name=_serving_name)
 
-        # 先记准入计数基线，用来算"本轮"拒绝数（stats 是累计值）。
-        _t0_future = int(self.state.stats.get("t_reject:future", 0))
-        _t0_ooo = int(self.state.stats.get("t_reject:out_of_order", 0))
-        # WP04 / IT-P1-OBS-010：陈旧**诊断**也要按轮差分 —— 它是累计值。
+        # WP01：**不再**记准入计数基线去算"本轮"拒绝数。
+        #
+        # 旧写法取全局累计 counters 的前后差值（`_t0_future` / `_t0_ooo`），
+        # 而两条 route 的更新**夹在同一个基线区间里** —— aggregate 差值把归属
+        # 丢掉了：`index future + stock ooo` 与 `index ooo + stock future`
+        # 都是 `future=1 / ooo=1`，无法恢复 route truth
+        # （`IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011`）。
+        # 现在每个 route 的 `update_detailed()` **自己**给出本轮的 future/ooo，
+        # 属于"禁止从 global stats 反推 route reason"。
+        # WP04 / IT-P1-OBS-010：陈旧**诊断**仍是累计值，仍需按轮差分。
         _t0_stale_diag = dict(self.state.stale_diagnosed)
-        idx_admitted = (self.state.update(idx_quotes, now, route=ROUTE_INDEX)
-                        if idx_quotes else {})
-        admitted = self.state.update(quotes, now, route=ROUTE_STOCKS)
+        idx_res = (self.state.update_detailed(idx_quotes, now,
+                                              route=ROUTE_INDEX)
+                   if idx_quotes else StateUpdateResult(route=ROUTE_INDEX))
+        stk_res = self.state.update_detailed(quotes, now, route=ROUTE_STOCKS)
+        idx_admitted = idx_res.admitted
+        admitted = stk_res.admitted
 
         # 粗筛：只有**本轮真正被准入**且合格的标的进入规则。
         #
@@ -1733,8 +1901,17 @@ class Engine:
         req_stocks, index_requested, _req_total = self._request_arithmetic()
         raw_stock = list(quotes)
         raw_idx = list(idx_quotes)
-        future_rej = int(self.state.stats.get("t_reject:future", 0)) - _t0_future
-        ooo_rej = int(self.state.stats.get("t_reject:out_of_order", 0)) - _t0_ooo
+        # WP01：**route-local** 事实由产生方直接给出，不再用全局差值反推。
+        future_rej = stk_res.rejected_future + idx_res.rejected_future
+        ooo_rej = (stk_res.rejected_out_of_order
+                   + idx_res.rejected_out_of_order)
+        # 按 route 分开留档（下游想看"是哪条 route 被拒"时不必再猜）。
+        reject_by_route = {
+            ROUTE_STOCKS: (stk_res.rejected_future,
+                           stk_res.rejected_out_of_order),
+            ROUTE_INDEX: (idx_res.rejected_future,
+                          idx_res.rejected_out_of_order),
+        }
         # WP04：陈旧诊断的**本轮增量**，按 route 分账后再合计。
         stale_diag_by_route = {
             r: int(n) - int(_t0_stale_diag.get(r, 0))
@@ -1743,10 +1920,18 @@ class Engine:
         }
         stale_diag = sum(stale_diag_by_route.values())
         # 被诊断的**代码集合**：age 表超线的那些（本轮原始返回中出现过）。
-        _stale_codes = {
-            q.code for q in (raw_stock + raw_idx)
-            if self.state.time_age_seconds.get(q.code, 0.0) > STALE_TOLERANCE_SECONDS
-        }
+        #
+        # WP01：改用 **route 分账** 的 age 表。旧写法读裸 code 表
+        # （`time_age_seconds`），而 `000001` 既是指数又是平安银行 ——
+        # stock 侧的新鲜值会把 index 侧的陈旧值覆盖掉，这条诊断就再也报不出来。
+        _stale_codes = set()
+        for _objs, _route in ((raw_stock, ROUTE_STOCKS),
+                              (raw_idx, ROUTE_INDEX)):
+            for q in _objs:
+                _age = self.state.time_age_seconds_by_route.get(
+                    (_route, q.code))
+                if _age is not None and _age > STALE_TOLERANCE_SECONDS:
+                    _stale_codes.add(q.code)
 
         # 质量不可用：provider 返回了但 price<=0（update 内部第 145 行丢弃）
         quality_bad = tuple(
@@ -1789,6 +1974,13 @@ class Engine:
             rejected_quality=quality_bad,
             future_rejected=max(future_rej, 0),
             out_of_order_rejected=max(ooo_rej, 0),
+            # WP01：拒绝/准入的 **route 归属**。合计值不再丢归属。
+            # 与空轮分支**共用** `_route_ledger`（同一语义只有一份实现）。
+            **self._route_ledger(
+                stk_returned=len(raw_stock), stk_admitted=len(admitted),
+                idx_returned=len(raw_idx), idx_admitted=len(idx_admitted),
+                stk_reject=reject_by_route[ROUTE_STOCKS],
+                idx_reject=reject_by_route[ROUTE_INDEX]),
             # WP04 / IT-P1-OBS-010：陈旧是**诊断**，与 future 分账。
             provider_stale_diagnosed=max(stale_diag, 0),
             provider_stale_diagnosed_codes=_stale_codes,

@@ -469,11 +469,30 @@ class EastmoneySource:
             elif failed:
                 reason = f"第 {failed[0]} 页起失败，共 {len(failed)} 页"
         else:
-            # total 不可用（data/diff 为 null）：顺序探测，遇空页即停，避免空转 80 页。
-            # 「空页」判据沿用**可用行情为空**（而不是 raw 行为空），与修复前一致。
+            # total 不可用（data/diff 为 null）：顺序探测，遇**空页**即停，
+            # 避免空转 80 页。
+            #
+            # `IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001`：
+            # 终止判据必须是 **raw 代码行为空**（传输层真的没数据了），
+            # 而**不是** `page.quotes`（解析后可用行情）为空。
+            #
+            # 旧代码写的是 ``if not page.quotes: break``，而一页完全可能
+            # **有原始代码行、但可用行情为 0** —— 该页恰好全是停牌股
+            # （东财对停牌股给 ``f2="-"``，``_quote_of`` 按契约丢弃）。
+            # 此时循环**提前终止**，后面真正有行情的页永远抓不到，
+            # 池子被**静默截断**：``universe()`` 返回一个更小的池，
+            # 而调用方看到的是"正常完成"。
+            #
+            # 这与本仓库反复出现的那一类错同源 ——
+            # **拿"可用子集"当成"全集"**（bug 类 e「证据子集自称全程」），
+            # 只是方向相反：这次把「子集为空」误读成了「全集为空」。
+            #
+            # 修好后 ``transport_complete`` 语义不变：无 total 时仍然是
+            # False（没有基准就证明不了完整），不会变成假报完整。
             for pn in range(2, self.max_pages + 1):
                 page = parse_clist_page(self._request_json(self._clist_url(pn)), seq)
-                if not page.quotes:
+                # 真·终止点：传输层一行代码都没有。
+                if page.raw_code_rows <= 0 and not page.codes:
                     break
                 pages.append(page)
                 pages_requested = pn

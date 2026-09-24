@@ -523,6 +523,32 @@ class RoundObservationSet:
     #: ``TIME_POLICY[*].freshness_allowed``。）
     future_rejected: int = 0
     out_of_order_rejected: int = 0
+    #: WP01 / `IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011`：拒绝计数**按 route 分账**。
+    #:
+    #: 为什么必须分账：``future_rejected`` / ``out_of_order_rejected`` 是**合计**，
+    #: 而
+    #:
+    #: ============  ==================  ==================
+    #: Case           index               stocks
+    #: ============  ==================  ==================
+    #: A             future=1            ooo=1
+    #: B             ooo=1               future=1
+    #: ============  ==================  ==================
+    #:
+    #: 两者的合计**完全相同**。只要下游只读合计，就永远区分不出
+    #: "指数数据来自未来"和"个股数据乱序"这两种完全不同的故障 ——
+    #: 而它们的排查方向、影响范围、处置动作都不一样。
+    #:
+    #: 这两个 map 由 ``EngineState.update_detailed()`` 的 route-local 结果直接
+    #: 装配，**不允许**从 global counters 差分反推（那正是本字段要修的病）。
+    #: 值为 ``(future, out_of_order)``，route 无请求时不出现该键。
+    reject_by_route: dict[str, tuple[int, int]] = field(
+        default_factory=dict)
+    #: WP01：各 route 本轮**准入**条数（``route -> n``）。
+    #: 与 ``admitted``（合计）配合，使"哪条 route 掉了"不必靠减法猜。
+    admitted_by_route: dict[str, int] = field(default_factory=dict)
+    #: WP01：各 route 本轮**原始返回**条数（``route -> n``）。
+    returned_by_route: dict[str, int] = field(default_factory=dict)
     #: WP04 / IT-P1-OBS-010：provider ts 被判定"过旧"的**诊断**条数
     #: （``age > STALE_TOLERANCE_SECONDS``），**不是**拒绝计数。
     #:
@@ -894,6 +920,15 @@ class RoundObservationSet:
             "rejected_quality": list(self.rejected_quality),
             "future_rejected": self.future_rejected,
             "out_of_order_rejected": self.out_of_order_rejected,
+            # --- WP01：拒绝/准入的 route 归属 -----------------------------------
+            # 上面两个合计值**无法区分** `index future + stock ooo` 与
+            # `index ooo + stock future`（两者都是 1/1）。这三个 map 才是
+            # 能恢复 route truth 的数据。
+            "reject_by_route": {
+                r: {"future": int(f), "out_of_order": int(o)}
+                for r, (f, o) in self.reject_by_route.items()},
+            "admitted_by_route": dict(self.admitted_by_route),
+            "returned_by_route": dict(self.returned_by_route),
             # --- WP04 / IT-P1-OBS-010：陈旧诊断与"未来"必须是两条曲线 ---------
             # 上一轮 stale_rejected 被 alias 成 future_rejected，两个互斥的桶
             # 永远同值。现在分别导出，并把陈旧说清是**诊断**不是拒绝。
@@ -905,6 +940,10 @@ class RoundObservationSet:
                 "provider_stale_diagnosed": "诊断计数（age 超线），**不是**拒绝",
                 "future_rejected": "超前拒绝计数；与陈旧互斥",
                 "stale_rejected": "已弃用的别名，指向 provider_stale_diagnosed",
+                "reject_by_route": (
+                    "WP01：拒绝的 route 归属。合计值分不出 "
+                    "index-future+stock-ooo 与 index-ooo+stock-future，"
+                    "必须读这里"),
             },
             "unavailable_capability": self.unavailable_capability,
             # --- WP01 / IT-P1-CAPABILITY-003：逐 signal 可评估性 ---------------

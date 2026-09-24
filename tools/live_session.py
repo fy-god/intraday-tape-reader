@@ -335,6 +335,24 @@ def make_round_sample(
         if "future_rejected" not in obs and "stale_rejected" in obs:
             out["stale_rejected"] = _safe_int(obs.get("stale_rejected"))
         out["out_of_order_rejected"] = _safe_int(obs.get("out_of_order_rejected"))
+        # WP01：拒绝的 **route 归属**。合计值分不出
+        # `index future + stock ooo` 与 `index ooo + stock future`
+        # （两者合计都是 1/1），soak 报告若只留合计，事后无法复盘
+        # 是哪条 route 在超时/乱序。只保留有界的 route 分账，不引入明细。
+        rbr = obs.get("reject_by_route")
+        if isinstance(rbr, dict) and rbr:
+            out["reject_by_route"] = {
+                str(r): {"future": _safe_int(
+                             (v or {}).get("future") if isinstance(v, dict) else 0),
+                         "out_of_order": _safe_int(
+                             (v or {}).get("out_of_order")
+                             if isinstance(v, dict) else 0)}
+                for r, v in rbr.items()
+            }
+        for _k in ("admitted_by_route", "returned_by_route"):
+            _v = obs.get(_k)
+            if isinstance(_v, dict) and _v:
+                out[_k] = {str(r): _safe_int(n) for r, n in _v.items()}
         missing = obs.get("unknown_missing")
         out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
         quality = obs.get("rejected_quality")
