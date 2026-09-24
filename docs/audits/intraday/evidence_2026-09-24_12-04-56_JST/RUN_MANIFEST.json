@@ -1,0 +1,73 @@
+{
+  "report": "docs/audits/intraday/2026-09-24_17-35-20_JST.md",
+  "task_book": "docs/audits/intraday/2026-09-24_12-04-56_JST_AGENT_TASK.md",
+  "repo": "fy-god/intraday-tape-reader",
+  "audit_start_head": "5d9c946ef8eb9bf9a855cb7d3cdcf5c2f2af5483",
+  "fixed_product_sha_per_cloud_1204": "7a4f549a15e78fe87db7de00796eff71b707ae9b",
+  "python": "3.13.12",
+  "pytest": "9.1.1",
+  "workdir": "D:\\ccc\\ashare-radar",
+  "pythonpath": "src",
+  "pytest_args": ["-o", "addopts=", "-q", "-p", "no:cacheprovider"],
+  "pytest_args_note": "pyproject.toml 的 addopts=\"-q\" 会抑制末尾汇总行，必须用 -o addopts=\"\" 覆盖",
+  "changed_files": [
+    {"path": "src/arad/engine.py", "status": "modified",
+     "what": "StateUpdateResult; update_detailed(); update() 薄包装; 4 个 *_by_route 诊断表 + prune 回收; _route_ledger(); poll_once 接线"},
+    {"path": "src/arad/capabilities.py", "status": "modified",
+     "what": "reject_by_route / admitted_by_route / returned_by_route + as_dict + _schema_note"},
+    {"path": "src/arad/sources/eastmoney.py", "status": "modified",
+     "what": "无总数翻页终止判据: not page.quotes -> raw_code_rows<=0 and not codes"},
+    {"path": "tools/live_session.py", "status": "modified",
+     "what": "采集三个 route 分账字段（有界，不收明细）"},
+    {"path": "tests/test_engine_route_time.py", "status": "added", "tests": 12},
+    {"path": "tests/test_engine_route_ledger_wiring.py", "status": "added", "tests": 8},
+    {"path": "tests/test_eastmoney_no_total_pagination.py", "status": "added", "tests": 7},
+    {"path": "docs/audits/intraday/2026-09-24_17-35-20_JST.md", "status": "added"},
+    {"path": "docs/audits/intraday/LATEST.md", "status": "modified",
+     "what": "移动接续指针（保留不可变历史快照 URL）"}
+  ],
+  "not_modified": [
+    "deployment config", ".github/workflows", "Windows scheduled tasks", "config/settings.yaml"
+  ],
+  "commands": [
+    {"cmd": "python -m pytest -o addopts=\"\" -q -p no:cacheprovider -v",
+     "result": "1946 passed", "exit_code": 0, "log": "full_pytest.log"},
+    {"cmd": "python tools/check_bom.py", "result": "no BOM", "exit_code": 0},
+    {"cmd": "tools/check_*.py", "result": "8/8 pass", "exit_code": 0},
+    {"cmd": "node tools/dash_render_check.js", "result": "ok", "exit_code": 0},
+    {"cmd": "python -m arad.cli selftest", "result": "68 alerts / 6 types", "exit_code": 0}
+  ],
+  "rollback_teeth": {
+    "total": 8,
+    "behavioral": 8,
+    "structural": 0,
+    "cases": [
+      {"id": "RB-A", "what": "诊断映射去掉 by_route 写入", "result": "2 failed", "log": "route_reject_rollback.log"},
+      {"id": "RB-B", "what": "future/ooo 退回 global-only", "result": "3 failed", "log": "route_reject_rollback.log"},
+      {"id": "RB-C", "what": "route 归属写死成默认值", "result": "1 failed", "log": "route_reject_rollback.log"},
+      {"id": "RB-D", "what": "旧形状（计数不传，0 默认值兜住）", "result": "3 failed", "log": "route_reject_rollback.log"},
+      {"id": "RB-E", "what": "poll_once 退回 update()", "result": "2 failed", "log": "engine_detailed_rollback.log"},
+      {"id": "RB-F", "what": "退回差分全局 counters", "result": "2 failed", "log": "engine_detailed_rollback.log"},
+      {"id": "RB-G", "what": "空轮手写第二套账（不共用 helper）", "result": "1 failed", "log": "engine_detailed_rollback.log"},
+      {"id": "RB-P", "what": "退回 if not page.quotes: break", "result": "1 failed", "log": "pagination_rollback.log"}
+    ]
+  },
+  "source_sha256_restored": {
+    "src/arad/engine.py": ["6afc7a3d6558", "12c8701d3047"],
+    "src/arad/sources/eastmoney.py": ["d811117e3b3a"]
+  },
+  "defects_fixed": [
+    {"id": "IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011", "location": "src/arad/engine.py EngineState.update / Engine.poll_once"},
+    {"id": "IT-P2-TIME-DIAGNOSTIC-ROUTE-COLLISION-010", "location": "src/arad/engine.py EngineState 诊断映射"},
+    {"id": "IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001", "location": "src/arad/sources/eastmoney.py universe()"}
+  ],
+  "not_run": "not_run/BLOCKED.md",
+  "next_steps": "NEXT_STEPS.md",
+  "honest_limits": {
+    "user_goal_live_monitoring_running": false,
+    "spirit_rules_enabled": false,
+    "real_precision_recall_missed_rate_trading_return": "unavailable",
+    "call_detailed_production_call_sites": 0,
+    "model_training_delta": 0
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "test_engine_route_time.py": [
+    "test_state_update_result_carries_route_local_facts",
+    "test_route_code_collision_does_not_overwrite_index_age",
+    "test_route_collision_keeps_both_provider_timestamps",
+    "test_stale_diagnosed_is_counted_per_route",
+    "test_backward_compatible_stock_only_view_still_works",
+    "test_reject_reason_route_attribution_case_a",
+    "test_reject_reason_route_attribution_case_b",
+    "test_case_a_and_b_are_distinguishable",
+    "test_global_counters_still_updated_for_compatibility",
+    "test_update_detailed_admits_normally",
+    "test_result_route_is_the_callers_route_not_a_default",
+    "test_legacy_update_signature_unchanged"
+  ],
+  "test_engine_route_ledger_wiring.py": [
+    "test_poll_once_calls_update_detailed",
+    "test_poll_once_no_longer_diffs_global_counters",
+    "test_route_ledger_helper_is_the_single_source",
+    "test_poll_once_docstring_has_no_update_detailed",
+    "test_route_ledger_keys_are_stable_in_normal_round",
+    "test_route_ledger_keys_exist_even_in_empty_round",
+    "test_two_route_faults_with_identical_totals_are_distinguishable",
+    "test_as_dict_exports_route_attribution"
+  ],
+  "test_eastmoney_no_total_pagination.py": [
+    "test_parse_of_suspended_page_has_raw_but_no_usable",
+    "test_parse_of_live_page_has_both",
+    "test_suspended_page_does_not_stop_pagination",
+    "test_first_page_suspended_also_continues",
+    "test_first_page_suspended_also_continues",
+    "test_empty_raw_page_stops_pagination",
+    "test_all_suspended_pages_do_not_loop_forever",
+    "test_no_total_still_reports_incomplete"
+  ]
+}

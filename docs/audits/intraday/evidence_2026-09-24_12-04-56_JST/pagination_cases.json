@@ -1,0 +1,47 @@
+{
+  "file": "tests/test_eastmoney_no_total_pagination.py",
+  "defect": "IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001",
+  "branch": "universe() 的 data.total 不可用分支（顺序探测）",
+  "observed_old_behavior": {
+    "page_sequence": [
+      "live 600011",
+      "suspended 600022",
+      "live 600033",
+      "empty"
+    ],
+    "requested_pages": [
+      1,
+      2
+    ],
+    "codes_returned": [
+      "600011"
+    ],
+    "silently_lost": [
+      "600033"
+    ]
+  },
+  "observed_fixed_behavior": {
+    "requested_pages": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "codes_returned": [
+      "600011",
+      "600033"
+    ]
+  },
+  "stop_criterion_fixed": "page.raw_code_rows <= 0 and not page.codes",
+  "tests": [
+    "test_parse_of_suspended_page_has_raw_but_no_usable",
+    "test_parse_of_live_page_has_both",
+    "test_suspended_page_does_not_stop_pagination",
+    "test_first_page_suspended_also_continues",
+    "test_first_page_suspended_also_continues",
+    "test_empty_raw_page_stops_pagination",
+    "test_all_suspended_pages_do_not_loop_forever",
+    "test_no_total_still_reports_incomplete"
+  ],
+  "count": 8
+}

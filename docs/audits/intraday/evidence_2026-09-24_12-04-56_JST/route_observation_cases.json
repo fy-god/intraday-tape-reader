@@ -1,0 +1,21 @@
+{
+  "file": "tests/test_engine_route_ledger_wiring.py",
+  "scope_note": "WP03 的 per-route terminal buckets 本轮**未实现**。本文件覆盖的是 WP01 的**生产接线**（poll_once 是否真的消费 update_detailed、是否还在差分全局 counters、两条分支是否共用 _route_ledger）。不要把它当成 WP03 的产物。",
+  "ast_based_checks": [
+    "test_poll_once_calls_update_detailed",
+    "test_poll_once_no_longer_diffs_global_counters",
+    "test_route_ledger_helper_is_the_single_source",
+    "test_poll_once_docstring_has_no_update_detailed"
+  ],
+  "tests": [
+    "test_poll_once_calls_update_detailed",
+    "test_poll_once_no_longer_diffs_global_counters",
+    "test_route_ledger_helper_is_the_single_source",
+    "test_poll_once_docstring_has_no_update_detailed",
+    "test_route_ledger_keys_are_stable_in_normal_round",
+    "test_route_ledger_keys_exist_even_in_empty_round",
+    "test_two_route_faults_with_identical_totals_are_distinguishable",
+    "test_as_dict_exports_route_attribution"
+  ],
+  "count": 8
+}

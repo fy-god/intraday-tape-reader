@@ -1,18 +1,89 @@
 # 最新审计
 
+**最新本地独立审计**：[2026-09-24_17-35-20_JST.md](./2026-09-24_17-35-20_JST.md)  
 **最新云端独立审计**：[2026-09-24_16-02-09_JST.md](./2026-09-24_16-02-09_JST.md)  
 **最新云端 Agent 任务书**：[2026-09-24_16-02-09_JST_AGENT_TASK.md](./2026-09-24_16-02-09_JST_AGENT_TASK.md)  
+**上一版云端独立审计**：[2026-09-24_12-04-56_JST.md](./2026-09-24_12-04-56_JST.md)  
+**上一版云端 Agent 任务书**：[2026-09-24_12-04-56_JST_AGENT_TASK.md](./2026-09-24_12-04-56_JST_AGENT_TASK.md)  
 **上一版本地独立审计**：[2026-09-24_09-27-16_JST.md](./2026-09-24_09-27-16_JST.md)  
 **reviewed_source_sha / 本轮固定产品代码**：`7a4f549a15e78fe87db7de00796eff71b707ae9b`  
 **audit_start_head / 本轮开始 main**：`5d9c946ef8eb9bf9a855cb7d3cdcf5c2f2af5483`  
-**report_commit_sha**：`869de2008e85543eb44eafbb4c31aef0196471c5`  
-**agent_task_commit_sha**：`4f171fa1124a60447524e58b5a8ad69f60b0a5b5`  
+**云端 16:02 report_commit_sha**：`869de2008e85543eb44eafbb4c31aef0196471c5`  
+**云端 16:02 agent_task_commit_sha**：`4f171fa1124a60447524e58b5a8ad69f60b0a5b5`  
+**上一版云端 report_commit_sha**：`b54d6289b29b04bdc8b308448e938da3adda258c`  
+**上一版云端 agent_task_commit_sha**：`916cd36c93b63779a601d52d544d8687a666af8b`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
 https://github.com/fy-god/intraday-tape-reader/blob/5d9c946ef8eb9bf9a855cb7d3cdcf5c2f2af5483/docs/audits/intraday/LATEST.md
 
-> 版本纪律：`7a4f549..5d9c946` 的 GitHub compare changed files 全部位于 `docs/audits/intraday/`，故真正产品代码仍固定为 `7a4f549`。本轮只发布报告、任务书并移动索引，不删除历史报告。
+> 版本纪律：`7a4f549..5d9c946` 的 GitHub compare changed files 全部位于
+> `docs/audits/intraday/`，故真正产品代码仍固定为 `7a4f549`。
+>
+> **云端已独立复核我的上一轮修复**（`2026-09-24_12-04-56_JST.md` §6
+> 「已修项不重开」）：原文「产品 `7a4f549` 已经真正修复：Tencent
+> caller-owned identity role；wrong-type detailed return 穿透 failover；
+> detailed source/route binding」，并确认「最新本地独立审计全量：
+> `1919 passed in 81.96s / exit 0`」。⇒ 外部验证收到，不再重开那三项。
 
-## 2026-09-24 16:02:09 JST
+## 2026-09-24 17:35:20 JST（本地 · WP01/WP02/WP06）
+
+对应任务书 `2026-09-24_12-04-56_JST_AGENT_TASK.md`。**性质：修复 + 生产接线。**
+
+1. `IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011` — **已修复**
+   （`engine.py` `EngineState.update` / `Engine.poll_once`）。
+   旧代码取一次全局基线再差分 → `index future + stock ooo` 与
+   `index ooo + stock future` **塌成同一个结果**（都是 future=1/ooo=1），
+   无法恢复 route truth。新增 `StateUpdateResult` + `update_detailed()`；
+   `poll_once` 直接消费 route-local 计数，**删除全局差分**；
+   `RoundObservationSet` 增 `reject_by_route` / `admitted_by_route` /
+   `returned_by_route` 并导出；两条分支共用 `_route_ledger()`。
+2. `IT-P2-TIME-DIAGNOSTIC-ROUTE-COLLISION-010` — **已修复**：
+   `time_age_seconds` 等四个诊断映射只按**裸 code** 存，`000001`
+   既是指数又是平安银行 → stock 覆盖 index 的 age。
+   新增四个 `*_by_route` 表（双写保留兼容 view）+ `prune` 同步回收；
+   `poll_once` 的 `_stale_codes` 改读 by_route 表。
+3. `IT-P2-EASTMONEY-UNKNOWN-TOTAL-USABLE-EMPTY-STOPS-PAGINATION-001` —
+   **已修复**（`eastmoney.py` `universe()` 无 total 分支）：
+   旧终止判据 `if not page.quotes: break` 把"该页全是停牌股"
+   当成"翻完了"。**实测真数据丢失**：`[正常, 停牌, 正常, 空]` 序列下
+   旧行为只请求 `[1,2]`，第 3 页的 `600033` **静默丢失**；
+   改为 `raw_code_rows <= 0 and not codes` 后请求 `[1,2,3,4]`，
+   两只都拿到。`transport_complete` 语义未变。
+4. **WP01 生产接线**：`poll_once` 现在真的调 `update_detailed`，
+   并用 **AST 层** gate 钉住（不是子串匹配）。
+
+### 回退验牙
+
+**8 条全部行为性、0 结构性**：RB-A(2)/RB-B(3)/RB-C(1)/RB-D(3)/
+RB-E(2)/RB-F(2)/RB-G(1)/RB-P(1)。源码 sha256 恢复前后一致。
+
+### 我自己犯的三个错（如实记录）
+
+- **接线测试曾是重言式**：用 `"update_detailed" in getsource(...)`，
+  而我**自己的注释**里就有这个词 → 回退把真实调用全删掉后测试**照样绿**。
+  改走 AST + 加自检锁。**牙被自己的散文缴了械。**
+- **WP06 RED 没走进被测分支**（D15 再犯）：第 1 页在循环外，
+  不受 break 管辖 → 第一版报 `6 passed`，看着像"产品已经对的"。
+- **WP01 RB-C 的 target 名单写错**：它打红了，我却判"牙不咬" ——
+  错在我的名单，不在 gate。另：任务书写 `age=900s`，
+  仓库 `STALE_TOLERANCE_SECONDS=14400`，照抄会写出自相矛盾的断言。
+
+### 测试真数
+
+**1946 passed / 0 failed / exit 0**。`check_*.py` **8/8**；
+BOM exit 0；`dash_render_check.js` exit 0；
+`arad.cli selftest` 68 告警 / 6 类型 / exit 0。
+
+### ⚠ 诚实交代
+
+`spirit_*` 仍 `enabled: false`，**用户要的"盯盘"仍然没有跑起来**；
+真实 Precision/Recall/漏事件率/交易收益仍 `unavailable`；
+`call_detailed` 生产调用点仍 **0**（WP04 未做）。
+本轮改的是**账本与准入的内部正确性**。
+
+## 2026-09-24 16:02:09 JST（云端）
+
+> 版本纪律：`7a4f549..5d9c946` 的 GitHub compare changed files 全部位于
+> `docs/audits/intraday/`，故真正产品代码仍固定为 `7a4f549`。
 
 主实验：`EXP-IT-SINA-INDEX-IDENTITY-017`
 

@@ -1,0 +1,47 @@
+{
+  "file": "tests/test_engine_route_time.py",
+  "defect": "IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011",
+  "fixture": {
+    "case_a": {
+      "index": "future=1",
+      "stocks": "ooo=1"
+    },
+    "case_b": {
+      "index": "ooo=1",
+      "stocks": "future=1"
+    },
+    "expected_signatures": {
+      "case_a": [
+        1,
+        0,
+        0,
+        1
+      ],
+      "case_b": [
+        0,
+        1,
+        1,
+        0
+      ],
+      "aggregate_both": {
+        "future": 1,
+        "out_of_order": 1
+      }
+    }
+  },
+  "tests": [
+    "test_state_update_result_carries_route_local_facts",
+    "test_route_code_collision_does_not_overwrite_index_age",
+    "test_route_collision_keeps_both_provider_timestamps",
+    "test_stale_diagnosed_is_counted_per_route",
+    "test_backward_compatible_stock_only_view_still_works",
+    "test_reject_reason_route_attribution_case_a",
+    "test_reject_reason_route_attribution_case_b",
+    "test_case_a_and_b_are_distinguishable",
+    "test_global_counters_still_updated_for_compatibility",
+    "test_update_detailed_admits_normally",
+    "test_result_route_is_the_callers_route_not_a_default",
+    "test_legacy_update_signature_unchanged"
+  ],
+  "count": 12
+}
