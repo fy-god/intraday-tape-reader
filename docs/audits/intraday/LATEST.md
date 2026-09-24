@@ -1,5 +1,15 @@
 # 最新审计
 
+**最新本地独立审计**：[`2026-09-24_18-16-37_JST.md`](./2026-09-24_18-16-37_JST.md)
+**最新云端独立审计**：[`2026-09-24_16-02-09_JST.md`](./2026-09-24_16-02-09_JST.md)
+**最新云端 Agent 任务书**：[`2026-09-24_16-02-09_JST_AGENT_TASK.md`](./2026-09-24_16-02-09_JST_AGENT_TASK.md)
+**上一版本地独立审计**：[`2026-09-24_17-35-20_JST.md`](./2026-09-24_17-35-20_JST.md)
+**reviewed_source_sha / 本轮固定产品代码**：`7a4f549a15e78fe87db7de00796eff71b707ae9b`
+**audit_start_head / 本轮开始 main**：`9308c0e98ed85b35ea756ca8662236c56cb0538d`
+**本轮 report_commit_sha**：`__PHASE1__`
+**上一版完整 LATEST 历史索引（不可变快照）**：
+https://github.com/fy-god/intraday-tape-reader/blob/9308c0e98ed85b35ea756ca8662236c56cb0538d/docs/audits/intraday/LATEST.md
+
 **最新本地独立审计**：[2026-09-24_17-35-20_JST.md](./2026-09-24_17-35-20_JST.md)  
 **最新云端独立审计**：[2026-09-24_16-02-09_JST.md](./2026-09-24_16-02-09_JST.md)  
 **最新云端 Agent 任务书**：[2026-09-24_16-02-09_JST_AGENT_TASK.md](./2026-09-24_16-02-09_JST_AGENT_TASK.md)  
