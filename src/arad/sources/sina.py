@@ -469,8 +469,14 @@ class SinaSource:
             return dict(getattr(self, "_last_universe", {}) or {})
 
     def snapshots(self, codes: list[str]) -> list[Quote]:
-        """指定代码的最新快照（每批 ``bulk_chunk``，并发）。批次失败即抛 SourceError。"""
-        wanted = _norm_codes(codes)
+        """指定代码的最新快照（每批 ``bulk_chunk``，并发）。批次失败即抛 SourceError。
+
+        `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`：
+        ``codes`` 里的**显式交易所前缀必须保留到 HTTP wire**。
+        指数（``sh000001``）不能靠 ``guess_prefix`` 重猜 —— 那会推成
+        ``sz000001``（平安银行），抓到**另一个证券**却看起来完全正常。
+        """
+        wanted = _wire_symbols(codes)
         if not wanted:
             return []
         seq = self._next_seq()
@@ -492,10 +498,20 @@ class SinaSource:
                     self._stats["pages_failed"] += len(errors)
                     self._stats["last_err"] = str(errors[0])[:200]
                 raise SourceError(f"sina {len(errors)}/{len(batches)} 批失败: {errors[0]}")
-        # 只返回被请求的代码：新浪可能对同一次 list= 查询附带别的代码，
-        # 调用方按 code 取值，多返回会造成意外覆盖。
-        wanted_set = set(wanted)
-        out = _dedupe(q for q in quotes if q.code in wanted_set)
+        # 只返回被请求的代码。
+        #
+        # ⚠ `_fetch_bulk` **已经**按"带前缀的完整符号"精确过滤过（这是
+        # `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012` 的
+        # 第二道修复）。这里只做最后的兜底去重，**不能**再按 `wanted`
+        # 的字面值比 `q.code` —— `wanted` 是 wire 符号（`sh000001`），
+        # 而 `q.code` 是全仓约定的**裸码**（`000001`），两边根本不同域，
+        # 比了会把所有结果都滤掉。
+        #
+        # 保留一层**保守**兜底：只放行"裸码属于请求过的那批"的结果，
+        # 防止 provider 顺带返回完全无关的代码。
+        wanted_bare = {_split_prefix(w)[1] for w in wanted
+                       if _split_prefix(w) is not None}
+        out = _dedupe(q for q in quotes if q.code in wanted_bare)
         with self._lock:
             self._stats["quotes"] = len(out)
         return out
@@ -569,9 +585,40 @@ class SinaSource:
         )
 
     def _fetch_bulk(self, codes: list[str], seq: int) -> list[Quote]:
-        prefixed = [f"{guess_prefix(c)}{c}" for c in codes]
-        url = self._bulk_url(prefixed)
-        return parse_response(self._request(url), seq)
+        """抓一批 wire 符号，并**按保留前缀的完整符号**过滤响应。
+
+        `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`：
+
+        1. 不能再对已剥前缀的 codes 调 ``guess_prefix`` —— 那会把
+           ``sh000001`` 推成 ``sz000001``（平安银行），请求发错证券。
+           ``codes`` 必须是**保留调用方前缀**的 wire 符号
+           （由 :func:`_wire_symbols` 产出）。
+        2. 响应过滤必须按**带前缀的完整符号**做：``sh000001``（上证指数）
+           与 ``sz000001``（平安银行）的裸码都是 ``000001``，
+           只按裸码过滤会把**错误证券**的响应当成自己的收下。
+           旧代码的过滤键恰好是裸码（``_norm_codes`` 剥掉了前缀），
+           所以它既发错请求、又拦不住错响应 —— 两道都漏。
+
+        在这一层做过滤是刻意的：只有这里能同时拿到"请求的完整符号"
+        与"响应的原始前缀"。`Quote.code` 仍按全仓约定是**裸码**。
+        """
+        url = self._bulk_url(codes)
+        text = _as_text(self._request(url))
+        quotes = parse_response(text, seq)
+
+        # 允许的裸码 = 实际在响应里**以被请求的完整符号**出现的那些。
+        want_syms = set(codes)
+        allowed_bare: set[str] = set()
+        for m in LINE_RE.finditer(text):
+            sym = str(m.group(1) or "").strip().lower()
+            if sym in want_syms:
+                allowed_bare.add(sym[2:].zfill(6))
+        # 无前缀请求（纯个股）保持既有宽松语义：裸码相等即收。
+        loose_bare = {b for c in codes
+                      if not _split_prefix(c)[0]
+                      for b in (_split_prefix(c)[1],)}
+        return [q for q in quotes
+                if q.code in allowed_bare or q.code in loose_bare]
 
     def snapshots_detailed(self, codes: list[str], *,
                            route: str = "stocks") -> "SnapshotFetchResult":
@@ -581,26 +628,39 @@ class SinaSource:
         "provider 返回了这一行、只是数值不可用" 与
         "provider 根本没返回" 分开 —— 见模块级 ``parse_response_detailed``
         的说明。旧 ``snapshots()`` 行为**完全不变**。
+
+        `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`：
+        wire 符号与请求身份**都必须保留调用方前缀**。旧代码用
+        ``_norm_codes`` 剥前缀后用 ``guess_prefix`` 重猜，
+        会把 ``sh000001``（上证指数）发成 ``sz000001``（平安银行）。
+        更糟的是 detailed 路径的 R/P/Q 三轴**都用裸码**，
+        于是对**错误证券**机械自洽 —— 产出 "exact but wrong" 的假精确。
         """
         from .outcome import PROVENANCE_EXACT, build_outcome, merge_outcomes
 
-        wanted = _norm_codes(codes)
+        # wire 符号：保留前缀（指数）或按个股规则补前缀。
+        wanted = _wire_symbols(codes)
         if not wanted:
             return build_outcome(route=route, source=self.name,
                                  normalized_request=(), raw_keys=(),
                                  quotes=(), raw_presence_known=True,
                                  provenance=PROVENANCE_EXACT)
+        # 请求身份轴：账本用**裸码**（与 `outcome._key_of(quote)` 同轴）。
+        # 带前缀的 wire 符号另行传给 parser 做**严格过滤** —— 两者分工明确：
+        # 账本可比，过滤精确。
+        req_axis = [_norm_code(w) for w in wanted]
         seq = self._next_seq()
         batches = [wanted[i:i + self.bulk_chunk]
                    for i in range(0, len(wanted), self.bulk_chunk)]
         parts: list[SnapshotFetchResult] = []
         errors: list[SourceError] = []
         if len(batches) == 1:
-            parts.append(self._fetch_bulk_detailed(batches[0], seq, wanted, route))
+            parts.append(self._fetch_bulk_detailed(batches[0], seq, req_axis,
+                                                   route))
         else:
             with ThreadPoolExecutor(max_workers=min(self.workers, len(batches))) as ex:
-                futs = {ex.submit(self._fetch_bulk_detailed, b, seq, wanted, route): b
-                        for b in batches}
+                futs = {ex.submit(self._fetch_bulk_detailed, b, seq, req_axis,
+                                  route): b for b in batches}
                 for fut in as_completed(futs):
                     try:
                         parts.append(fut.result())
@@ -615,17 +675,22 @@ class SinaSource:
     def _fetch_bulk_detailed(self, codes: list[str], seq: int,
                              requested: list[str],
                              route: str) -> "SnapshotFetchResult":
-        prefixed = [f"{guess_prefix(c)}{c}" for c in codes]
-        url = self._bulk_url(prefixed)
+        # codes 已是保留前缀的 wire 符号，不再重猜。
+        url = self._bulk_url(codes)
         return parse_response_detailed(self._request(url), seq,
-                                       requested=requested, route=route)
+                                       requested=requested, route=route,
+                                       wire_symbols=codes)
 
 
 # --------------------------------------------------------------------------
 # 工具
 # --------------------------------------------------------------------------
 def _norm_code(value: Any) -> str | None:
-    """``600000`` / ``"sh600000"`` -> ``"600000"``。"""
+    """``600000`` / ``"sh600000"`` -> ``"600000"``（**丢前缀**）。
+
+    ⚠ 指数**不能**用这个函数来构造 wire symbol —— 见
+    :func:`_wire_symbol` 与 :func:`_norm_codes_keep_index_prefix`。
+    """
     if value is None or isinstance(value, bool):
         return None
     s = str(value).strip().upper()
@@ -636,7 +701,70 @@ def _norm_code(value: Any) -> str | None:
     return s.zfill(6)
 
 
+def _split_prefix(value: Any) -> tuple[str, str] | None:
+    """``"sh000001"`` -> ``("sh", "000001")``；无前缀返回 ``("", 码)``。
+
+    非法输入返回 ``None``。前缀大写归一为小写。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    s = str(value).strip().upper()
+    pre = ""
+    if s[:2] in ("SH", "SZ", "BJ"):
+        pre, s = s[:2].lower(), s[2:]
+    if not s.isdigit() or len(s) > 6:
+        return None
+    return pre, s.zfill(6)
+
+
+def _wire_symbol(spec: str) -> str | None:
+    """请求代码 -> sina wire 符号，**保留调用方给的前缀**。
+
+    `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`。
+
+    #### 缺陷本体
+
+    旧路径是 :func:`_norm_codes` -> :func:`guess_prefix`：
+
+    ```python
+    prefixed = [f"{guess_prefix(c)}{c}" for c in codes]   # codes 已被剥前缀
+    ```
+
+    但 :func:`guess_prefix` 的 docstring 自己写着「**只对个股可靠**。
+    指数必须由调用方显式给出前缀」—— 而调用方给的 `sh000001` 前缀
+    **已经在 `_norm_code` 里被剥掉了**。于是指数退化成"猜"：
+
+    | 请求 | 剥前缀后 | guess_prefix 重建 | 结果 |
+    |---|---|---|---|
+    | `sh000001` | `000001` | `sz000001` | **平安银行**（不是上证指数） |
+    | `sh000300` | `000300` | `sz000300` | 错误 |
+    | `sh000688` | `000688` | `sz000688` | 错误 |
+
+    #### 为什么这比 missing 严重
+
+    `sz000001` 是**真实存在的股票**，且 `snapshots()` 的过滤条件是
+    ``q.code in wanted_set``，而 ``wanted_set`` 恰好是**裸码**
+    ``{"000001", ...}`` —— 所以错误证券的响应**能通过过滤被收下**。
+    调用方拿到一个"看起来完全正常"的 Quote，只是它是**另一个证券**。
+
+    这是本仓库 bug 类 (g)「同一语义在两个时点/两个轴上分别推断」的第三例：
+    身份在这里**推断了两次**（剥前缀一次、猜前缀一次），两次都可以错。
+
+    #### 修法
+
+    前缀是**调用方拥有的事实**，只能搬运、不能重猜。
+    有前缀就用前缀；没有前缀才退回 :func:`guess_prefix`（个股场景）。
+    """
+    sp = _split_prefix(spec)
+    if sp is None:
+        return None
+    pre, bare = sp
+    return f"{pre}{bare}" if pre else f"{guess_prefix(bare)}{bare}"
+
+
 def _norm_codes(codes: Iterable[str]) -> list[str]:
+    """**兼容保留**：剥前缀去重（个股语义）。指数路径请用
+    :func:`_wire_symbol`，不要经这里。"""
     out: list[str] = []
     seen: set[str] = set()
     for raw in codes or []:
@@ -647,9 +775,26 @@ def _norm_codes(codes: Iterable[str]) -> list[str]:
     return out
 
 
+def _wire_symbols(codes: Iterable[str]) -> list[str]:
+    """请求代码 -> wire 符号列表（去重，**保留前缀语义**）。
+
+    这是 `snapshots()` / `snapshots_detailed()` 应当使用的唯一入口。
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in codes or []:
+        w = _wire_symbol(raw)
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
 def parse_response_detailed(text: str | bytes, seq: int = 0,
                             requested: Iterable[str] | None = None,
-                            route: str = "stocks") -> "SnapshotFetchResult":
+                            route: str = "stocks",
+                            wire_symbols: Iterable[str] | None = None,
+                            ) -> "SnapshotFetchResult":
     """``parse_response`` 的**精确 raw-presence** 版本（Snapshot Outcome v4）。
 
     #### 这是本轮最核心的缺陷本体（12:37 §2）
@@ -686,29 +831,67 @@ def parse_response_detailed(text: str | bytes, seq: int = 0,
     而 bulk parser 丢掉它们 —— 同一个源内部两套相反口径。
     本函数**不改变**旧 ``parse_response`` 的行为（它被大量测试与
     ``parse_universe`` 依赖），只把**事实**额外交出来。
+
+    #### `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`
+
+    身份轴**必须保留交易所前缀**（`sh000001` 而不是 `000001`）。
+    旧代码三轴都用裸码，于是请求 `sh000001` 而 provider 回
+    `sz000001`（平安银行）时，三轴会**机械自洽** —— 产出
+    "exact but wrong" 的假精确。这是本仓库 bug 类 (g)
+    「同一语义在两个时点/两个轴上分别推断」的第三例。
     """
     from .outcome import PROVENANCE_EXACT, build_outcome, normalize_request
 
+    # 账本身份轴 R 保持**裸码**（与 `outcome._key_of(quote)` 同轴，
+    # 否则 R 与 Q 不同域，会造出 phantom missing）。
     req = normalize_request(requested or (), normalize=_norm_code)
+    req_set = set(req)
+
+    # ⚠ 但**过滤**必须用带前缀的 wire 符号 —— 这是
+    # `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012` 的核心：
+    # 请求 `sh000001`（上证指数）时，provider 回的 `sz000001`
+    # （平安银行）裸码也是 `000001`，按裸码过滤**拦不住**它。
+    # `wire` 是本批真正请求的完整符号，只有出现在其中的响应行才算命中。
+    wire = {str(w).strip().lower() for w in (wire_symbols or ())}
+    strict = {w for w in wire if _split_prefix(w)[0]}
+    # 请求里出现过、但只有裸码形式的那部分（纯个股）：保持宽松。
+    loose = {_norm_code(w) for w in wire if not _split_prefix(w)[0]}
+    loose |= {r for r in req_set if not strict}
 
     s = _as_text(text)
     raw_keys: list[str] = []
     raw_rows: list[Any] = []
+    matched_bare: set[str] = set()
     if s.strip():
         for m in LINE_RE.finditer(s):
-            code = m.group(1)[2:]
+            sym = str(m.group(1) or "").strip().lower()   # 例 "sh000001"
+            code = sym[2:]
             if not code.isdigit():
                 continue
+            bare = code.zfill(6)
+            # 严格优先：带前缀请求时，只认完整符号命中的行。
+            if strict:
+                hit = sym in strict
+            else:
+                hit = bare in loose
+            if not hit:
+                continue
             # **身份在数值质量门之前捕获** —— 本函数存在的全部理由。
-            raw_keys.append(code.zfill(6))
+            raw_keys.append(bare)
             raw_rows.append(m.group(0))
+            matched_bare.add(bare)
+
+    # 只保留**确实匹配请求身份**的行情。旧代码直接塞 `parse_response()`
+    # 的全量结果，于是错误证券的 Quote 也进了结果集。
+    quotes = tuple(q for q in parse_response(text, seq)
+                   if q.code in matched_bare)
 
     return build_outcome(
         route=route,
         source=SinaSource.name,
         normalized_request=req,
         raw_keys=raw_keys,
-        quotes=parse_response(text, seq),
+        quotes=quotes,
         raw_rows=raw_rows,
         raw_presence_known=True,
         provenance=PROVENANCE_EXACT,
