@@ -1,6 +1,7 @@
 # 最新审计
 
-**最新本地独立审计**：[`2026-09-24_18-16-37_JST.md`](./2026-09-24_18-16-37_JST.md)
+**最新本地独立审计**：[`2026-09-24_18-55-39_JST.md`](./2026-09-24_18-55-39_JST.md)  
+**上一版本地独立审计**：[`2026-09-24_18-16-37_JST.md`](./2026-09-24_18-16-37_JST.md)  
 **最新云端独立审计**：[`2026-09-24_16-02-09_JST.md`](./2026-09-24_16-02-09_JST.md)
 **最新云端 Agent 任务书**：[`2026-09-24_16-02-09_JST_AGENT_TASK.md`](./2026-09-24_16-02-09_JST_AGENT_TASK.md)
 **上一版本地独立审计**：[`2026-09-24_17-35-20_JST.md`](./2026-09-24_17-35-20_JST.md)
@@ -10,7 +11,8 @@
 **上一版完整 LATEST 历史索引（不可变快照）**：
 https://github.com/fy-god/intraday-tape-reader/blob/9308c0e98ed85b35ea756ca8662236c56cb0538d/docs/audits/intraday/LATEST.md
 
-**最新本地独立审计**：[2026-09-24_17-35-20_JST.md](./2026-09-24_17-35-20_JST.md)  
+**最新本地独立审计**：[`2026-09-24_18-55-39_JST.md`](./2026-09-24_18-55-39_JST.md)  
+**上一版本地独立审计**：[`2026-09-24_18-16-37_JST.md`](./2026-09-24_18-16-37_JST.md)  
 **最新云端独立审计**：[2026-09-24_16-02-09_JST.md](./2026-09-24_16-02-09_JST.md)  
 **最新云端 Agent 任务书**：[2026-09-24_16-02-09_JST_AGENT_TASK.md](./2026-09-24_16-02-09_JST_AGENT_TASK.md)  
 **上一版云端独立审计**：[2026-09-24_12-04-56_JST.md](./2026-09-24_12-04-56_JST.md)  
@@ -33,6 +35,41 @@ https://github.com/fy-god/intraday-tape-reader/blob/5d9c946ef8eb9bf9a855cb7d3cdc
 > caller-owned identity role；wrong-type detailed return 穿透 failover；
 > detailed source/route binding」，并确认「最新本地独立审计全量：
 > `1919 passed in 81.96s / exit 0`」。⇒ 外部验证收到，不再重开那三项。
+
+## 2026-09-24 18:55:39 JST（本地 · Sina 指数身份）
+
+对应云端任务书 `2026-09-24_16-02-09_JST_AGENT_TASK.md` §1。
+**性质：修复（拿错证券）。**
+
+`IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012` —
+**已修复，并且我独立复现确认了云端的主张成立**（云端 18:16 也独立复现了同一机制）。
+
+云端说 Sina 把 `sh000001`（上证指数）发成 `sz000001`（平安银行）。
+我用**真实调用链**（只替换 `_request`）复现：默认 5 个 `index_codes` 里
+**3/5 抓的是错误证券**，且错误证券的响应**能通过裸码过滤被当成成功收下**。
+
+旧代码两步都错且互相掩盖：`_norm_codes` 剥掉调用方给的前缀，
+`guess_prefix` 再用"只对个股可靠"的规则重猜 —— 而 `guess_prefix`
+的 docstring 自己就写着「指数必须由调用方显式给出前缀」。
+
+修法：**前缀是调用方拥有的事实，只能搬运，不能重猜。**
+新增 `_split_prefix` / `_wire_symbol` / `_wire_symbols`；
+`_fetch_bulk` 按**带前缀的完整符号**过滤响应（第二道，旧代码这里也漏）；
+detailed 路径新增 `wire_symbols` 参数做严格过滤。
+账本轴 R/P/Q 保持裸码（与 `outcome._key_of` 同轴），过滤轴用完整符号。
+
+实测 RED 为 **3 条行为性 + 3 条结构性**（如实分类，不是所有红都算证据）。
+回退验牙 **3/3 行为性咬合，0 结构性**；`sina.py` sha256 前后一致。
+全量 **1957 passed / 0 failed / exit 0**；`check_*.py` **8/8**；BOM exit 0；
+`dash_render_check.js` exit 0；`arad.cli selftest` 68 告警 / 6 类型 / exit 0。
+
+**附带修复**：发现 `.gitignore:25` 的 `*.log` 把任务书点名的
+`*_red.log` / `*_green.log` / `*_rollback.log` **全部吞掉** ——
+**我上一轮报告引用的 8 个证据日志从未真正上传**。已 `git add -f` 补入两轮共 11 个。
+
+**未决**：`Quote.code` 对指数仍不带前缀（账本仍分不清 `sh000001`/`sz000001`）；
+`call_detailed` 生产调用点仍 **0**（WP04 未做）；其他源是否有同类
+"剥前缀再重猜"模式未逐一审计。**`spirit_*` 仍 `enabled: false`。**
 
 ## 2026-09-24 17:35:20 JST（本地 · WP01/WP02/WP06）
 
