@@ -1,0 +1,23 @@
+{
+  "product_code": true,
+  "members": [
+    "FUTURE",
+    "OUT_OF_ORDER",
+    "STALE",
+    "NO_REJECT"
+  ],
+  "values": [
+    "future",
+    "out_of_order",
+    "stale",
+    ""
+  ],
+  "stats_keys_closed_set": [
+    "t_reject:future",
+    "t_reject:out_of_order",
+    "t_reject:stale"
+  ],
+  "str_matches_value": true,
+  "concat_is_byte_identical": true,
+  "typo_raises": true
+}

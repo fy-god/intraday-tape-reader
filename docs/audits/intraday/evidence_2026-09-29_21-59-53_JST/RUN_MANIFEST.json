@@ -1,0 +1,78 @@
+{
+  "evidence_dir": "evidence_2026-09-29_21-59-53_JST",
+  "jst_timestamp": "2026-09-29_21-59-53",
+  "head_at_round_start": "4e702b68066ac5187b1b298a52c132873672ee6d",
+  "product_sha256": {
+    "src/arad/engine.py": "199404017ba26989307232cd1ac3190214dbd1134ed74c0c23d6b3391880e2df",
+    "src/arad/capabilities.py": "d686ba1de63255d36e044f33d813852042583ba0ae6981a40d73bdf47f259010",
+    "src/arad/sources/eastmoney.py": "d60ad54c8cf1c2bb2cb756445fd6877e982524eee5774d4836333e705ffcf84e",
+    "tools/live_session.py": "7c1a50ae83ac185c5a8c010cd3a95fcac137a590632741cbe6ef47b4860a1260"
+  },
+  "tests": {
+    "eastmoney_no_total_truncation": {
+      "rc": 0,
+      "targets": [
+        "tests/test_eastmoney_no_total_truncation_diag.py"
+      ]
+    },
+    "eastmoney_pagination_regression": {
+      "rc": 0,
+      "targets": [
+        "tests/test_eastmoney_no_total_pagination.py"
+      ]
+    },
+    "admit_reason_vocabulary": {
+      "rc": 0,
+      "targets": [
+        "tests/test_admit_reason_vocabulary.py"
+      ]
+    },
+    "soak_raw_presence_grade": {
+      "rc": 0,
+      "targets": [
+        "tests/test_live_session_raw_presence_grade.py"
+      ]
+    },
+    "identity_regression_round13": {
+      "rc": 0,
+      "targets": [
+        "tests/test_sina_index_quote_identity.py",
+        "tests/test_cross_source_identity.py",
+        "tests/test_engine_state_index_identity.py",
+        "tests/test_snapshot_raw_ledger_wiring.py"
+      ]
+    },
+    "universe_truth_gate": {
+      "rc": 0,
+      "targets": [
+        "tests/test_universe_truth.py"
+      ]
+    },
+    "route_ledger_and_time": {
+      "rc": 0,
+      "targets": [
+        "tests/test_engine_route_ledger_wiring.py",
+        "tests/test_engine_route_time.py",
+        "tests/test_source_epoch_route.py",
+        "tests/test_source_epoch_time_contract.py"
+      ]
+    }
+  },
+  "gates": {
+    "check_py": {
+      "ok": 8,
+      "fail": 0
+    },
+    "selftest_rc": 0,
+    "dash_render_check_rc": 0
+  },
+  "rollback_eastmoney": {
+    "rc": 0
+  },
+  "full_pytest": {
+    "rc": 0,
+    "tail": [
+      "2060 passed in 94.30s (0:01:34)"
+    ]
+  }
+}

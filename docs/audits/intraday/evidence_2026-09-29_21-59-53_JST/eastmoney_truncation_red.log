@@ -1,0 +1,10 @@
+# R4 回滚牙齿：逐条还原 Eastmoney 修复，确认目标测试转红
+# 纪律 D15：必须命中各自保护的测试；区分 behavioral / structural
+# ------------------------------------------------------------------
+tooth                     rc  class                  test
+------------------------------------------------------------------------------------------------
+RB-R4-truncated-flag       1  behavioral             test_no_total_exhausting_max_pages_is_marked_truncated
+RB-R4-reason-confirmed     1  behavioral             test_no_total_truncation_reason_says_confirmed_not_unknown
+
+牙齿 2 颗：RED 2 （behavioral 2 / structural 0），未转红 0，锚点缺失 0，未还原 0
+MANIFEST: {"teeth": [{"id": "RB-R4-truncated-flag", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_eastmoney_no_total_truncation_diag.py::test_no_total_exhausting_max_pages_is_marked_truncated", "desc": "无 total 翻满 max_pages 必须标 truncated=True", "restored": true, "sha_before": "d60ad54c8cf1c2bb", "sha_after": "d60ad54c8cf1c2bb"}, {"id": "RB-R4-reason-confirmed", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_eastmoney_no_total_truncation_diag.py::test_no_total_truncation_reason_says_confirmed_not_unknown", "desc": "reason 必须说确证截断", "restored": true, "sha_before": "d60ad54c8cf1c2bb", "sha_after": "d60ad54c8cf1c2bb"}]}

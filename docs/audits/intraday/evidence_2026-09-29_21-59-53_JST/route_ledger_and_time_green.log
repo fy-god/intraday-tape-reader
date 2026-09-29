@@ -1,0 +1,6 @@
+# route_ledger_and_time —— GREEN 基线（真实产品代码）
+# 命令: python -m pytest tests/test_engine_route_ledger_wiring.py tests/test_engine_route_time.py tests/test_source_epoch_route.py tests/test_source_epoch_time_contract.py -o addopts= -q
+# exit code: 0
+# ------------------------------------------------------------------
+..................................................                       [100%]
+50 passed in 0.25s

@@ -497,9 +497,33 @@ class EastmoneySource:
                 pages.append(page)
                 pages_requested = pn
             else:
+                # `for...else` = 循环**跑满** max_pages 而没有 break，
+                # 即最后一页**仍有代码行** —— 传输层明明还有数据，
+                # 我们却因页数上限停了。
+                #
+                # `IT-P1-006-R1-R2`：这里以前只写 `pages_requested`，
+                # **不设 `truncated`**，因为 `truncated` 只在
+                # `if total > 0` 分支（:458）里被赋值。
+                # 于是无 total 场景下 `truncated` 恒为 False，
+                # 诊断字段与事实相反 —— 而 reason 还写成
+                # "无法确认是否翻完"，可我们**恰恰有证据**证明被截断了。
+                #
+                # 安全性本身没漏（`transport_complete` 在无 total 时
+                # 恒为 False，fail-closed），但**诊断说谎**会让下游
+                # 把"被 max_pages 卡住"误诊成"接口不返回总数"，
+                # 从而去修错的旋钮（调 API 而不是调 max_pages）。
                 pages_requested = self.max_pages
+                truncated = True
+
             # 没有 total 就没有「应该有多少只」的基准，无法证明完整。
-            reason = "接口未返回总数，只能顺序探测，无法确认是否翻完"
+            if truncated:
+                reason = (f"接口未返回总数，且翻满 max_pages="
+                          f"{self.max_pages} 后**仍有数据**"
+                          f"（第 {self.max_pages} 页有代码行）-> "
+                          f"确证被页数上限截断；池子不完整")
+            else:
+                reason = ("接口未返回总数，顺序探测已到底"
+                          "（末页无代码行），但无基准仍无法证明完整")
 
         # ---- 双账：传输层原始行 与 解析后可用行情 分开数 ------------------
         raw_rows = sum(p.raw_rows for p in pages)

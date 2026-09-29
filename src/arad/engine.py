@@ -14,6 +14,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from enum import Enum
 from typing import Any, Callable, Iterable
 
 from .capabilities import RoundObservationSet, capabilities_for
@@ -24,7 +25,7 @@ from .rules.base import Rule, RuleContext
 from .session import OBSERVABLE, SessionPhase, TradingCalendar
 from .store import AlertStore
 
-__all__ = ["EngineState", "AlertBus", "SourceManager", "Engine", "run_forever", "build_rules", "build_notifiers"]
+__all__ = ["AdmitReason", "EngineState", "AlertBus", "SourceManager", "Engine", "run_forever", "build_rules", "build_notifiers"]
 
 log = logging.getLogger("arad.engine")
 
@@ -94,6 +95,87 @@ def time_policy_for(source_name: str) -> dict[str, bool]:
 
 
 # ==========================================================================
+# 时间准入的**闭集**词表
+# ==========================================================================
+class AdmitReason(str, Enum):
+    """``_admit_time()`` 拒绝原因的**闭集**词表（单一事实来源）。
+
+    为什么必须是 enum，而不是裸字符串 / ``typing.Literal``
+    ------------------------------------------------------
+    修前 ``_admit_time()`` 返回的第三个元素是**自由字符串** ``why``，
+    调用方用 ``if why == "future" / elif why == "out_of_order"`` 分支，
+    并直接把它拼进 stats 键 ``f"t_reject:{why}"``。
+
+    这就是本仓库 bug 类 (d)「默认分支是假绿出口」的温床：把 ``"future"``
+    拼成 ``"furure"``、或写成 ``"out-of-order"``，代码**不报任何错** ——
+    它会静默新建一个 ``t_reject:furure`` 桶，同时 ``if/elif`` 两条路由
+    全部落空，route-local 归属计数保持 0。观测面上多出一条谁都不认识的
+    曲线，而本该被归类的拒绝变成了"没发生"。
+
+    **为什么选 enum 而不是 ``typing.Literal``**：
+
+    * 本仓已有三处 ``class X(str, Enum)``（``models.Board`` /
+      ``models.AlertKind`` / ``session.SessionPhase``）—— enum 是既有风格，
+      ``Literal`` 在全仓**零** 使用。新增第二种机制本身就会制造
+      「同一语义两套写法」。
+    * ``Literal`` 只在**静态类型检查**下闭合；本仓没有 mypy 门禁（也没有
+      类型检查 CI），运行时传 ``"furure"`` 照样静默通过 —— 对它而言
+      "拼错是硬错误"只是**注释里的承诺**，正是我们要消灭的那种假绿。
+      enum 在**运行时** 就构造不出非法值（``AdmitReason("furure")`` 抛
+      ``ValueError``），与仓内"没有 CI 门禁时靠运行时不变量兜底"的纪律一致。
+    * 继承 ``str`` 后成员**就是** 字符串：``AdmitReason.FUTURE == "future"``
+      为真，``f"t_reject:{AdmitReason.FUTURE}"`` 仍逐字节得到
+      ``"t_reject:future"`` —— 既有 stats 键、既有字符串比较、
+      既有 JSON 序列化**全部不变**（见
+      ``tests/test_admit_reason_vocabulary.py`` 的字节级断言）。
+
+    ``NO_REJECT`` 是"接纳、无拒绝"的显式值，取代修前的空字符串 ``""``。
+    它的 ``value`` 是 ``""``，所以 ``f"t_reject:{...}"`` 的观感与修前一致；
+    但接纳路径**不会** 用到它拼键（只在 ``not ts_ok`` 时统计），
+    因此不会凭空造出 ``t_reject:`` 这个桶。
+    """
+
+    #: 提供者时间戳远超 ``FUTURE_TOLERANCE_SECONDS``（时钟跑飞/未来数据）。
+    FUTURE = "future"
+    #: 迟于该 (route, code) 已接受的水位线（epoch 内真实乱序）。
+    OUT_OF_ORDER = "out_of_order"
+    #: 首见码携带超过 ``STALE_TOLERANCE_SECONDS`` 的陈旧 ts。**仅在**
+    #: 该来源合同 ``freshness_allowed=true`` 时可达；当前三家均为 ``false``。
+    STALE = "stale"
+    #: 接纳（无拒绝）。``value`` 与修前的空串一致。
+    NO_REJECT = ""
+
+    # ``Enum.__str__`` 返回 ``"AdmitReason.FUTURE"``，而 f-string 走
+    # ``__format__`` 同样返回枚举 repr 名 —— 实测 ``f"{R}"`` 得到的是
+    # ``"AdmitReason.FUTURE"`` 而**不是** ``"future"``（``str`` mixin 只让
+    # ``+`` 拼接生效，不覆盖 ``__str__``/``__format__``）。这是最阴的一处：
+    # 谁写 ``f"t_reject:{why}"`` 都会拿到 ``t_reject:AdmitReason.FUTURE``，
+    # 键被**静默改掉**，正是本任务要防的事。
+    #
+    # 因此显式把 ``__str__`` 与 ``__format__`` 绑回 ``str`` 的实现，让
+    # ``str(R) == f"{R}" == R.value == "future"`` —— 三处一致，任何写法都
+    # 逐字节等于修前的字符串。
+    __str__ = str.__str__
+    __format__ = str.__format__
+
+    @property
+    def stats_key(self) -> str:
+        """该原因对应的全局 stats 键，形如 ``t_reject:future``。
+
+        **唯一** 的拼键点：调用方不得再自己写 f-string（或至少，即使写了，
+        上面绑定的 ``__format__`` 也保证逐字节正确 —— 双保险）。
+        """
+        return f"t_reject:{self.value}"
+
+
+#: ``t_reject:*`` 系列 stats 键的**闭集**，由 :class:`AdmitReason` 派生。
+#: 既有读者（dashboards / ``tools/live_session.py`` / 测试）按字符串匹配，
+#: 这些值必须与修前**逐字节相同**。
+ADMIT_REJECT_STATS_KEYS: frozenset[str] = frozenset(
+    r.stats_key for r in AdmitReason if r is not AdmitReason.NO_REJECT)
+
+
+# ==========================================================================
 # 状态
 # ==========================================================================
 @dataclass(frozen=True)
@@ -126,6 +208,18 @@ class StateUpdateResult:
     admitted: dict[str, Quote] = field(default_factory=dict)
     rejected_future: int = 0
     rejected_out_of_order: int = 0
+    #: 本 route 本轮被**陈旧下限**硬拒的条数（``AdmitReason.STALE``）。
+    #:
+    #: 为什么补这一个桶：修前的 ``why`` 分派只有 future / ooo 两支，而
+    #: ``_admit_time`` 其实还能返回 ``"stale"``（三个现有测试通过把
+    #: ``TIME_POLICY[*]["freshness_allowed"]`` 打开来走这条路径）。于是陈旧
+    #: 拒绝会写全局 ``t_reject:stale``，却**同时**落进两条 route-local 分支
+    #: 之外 —— 归属静默丢失。这正是 bug 类 (d)「默认分支是假绿出口」在本仓
+    #: 的**存活实例**，由引入 :class:`AdmitReason` 闭集后的穷尽分派暴露出来。
+    #:
+    #: 生产合同（三源 ``freshness_allowed=false``）下该路径不可达，所以
+    #: 默认 0 不改变任何既有数字。
+    rejected_stale: int = 0
     #: 本 route 本轮出现陈旧包（未被硬拦，合同 `freshness_allowed=false`）的次数。
     stale_diagnosed: int = 0
 
@@ -336,6 +430,7 @@ class EngineState:
         admitted: dict[str, Quote] = {}
         rejected_future = 0
         rejected_out_of_order = 0
+        rejected_stale = 0
         stale_here = 0
         # IT-P1-TIME-ROLE-003-R1：陈旧硬拒绝是否可用，由该 route 的供数源的
         # 时间语义合同决定（三家目前都是 freshness_allowed=false）。
@@ -353,13 +448,29 @@ class EngineState:
                 q, now, ep, first_seen=wm_key not in self.seen_in_epoch,
                 freshness_allowed=_fresh_ok)
             if not ts_ok:
-                self.stats[f"t_reject:{why}"] = self.stats.get(f"t_reject:{why}", 0) + 1
+                # ``why`` 是 AdmitReason 闭集成员；拼键只走 ``stats_key``，
+                # 调用方不再手写 f-string（否则词表白建，见 AdmitReason）。
+                self.stats[why.stats_key] = self.stats.get(why.stats_key, 0) + 1
                 # WP01：**同时**记 route-local 计数。全局 counters 保留是为了
                 # 不弄坏既有读者；但归属只能从这里拿 —— 从全局差值反推会丢归属。
-                if why == "future":
+                #
+                # 这里是**穷尽** 分派：合法拒绝原因只有 FUTURE / OUT_OF_ORDER /
+                # STALE 三种，且由 ``_admit_time`` 的返回类型保证。STALE 在
+                # 生产合同（三源 freshness_allowed=false）下不可达，但它**显式**
+                # 列出并**有自己的桶**，而不是落进一个静默的默认分支 ——
+                # 修前它同时落空 future/ooo 两支，route-local 归属静默丢失
+                # （bug 类 (d) 的存活实例）。
+                if why is AdmitReason.FUTURE:
                     rejected_future += 1
-                elif why == "out_of_order":
+                elif why is AdmitReason.OUT_OF_ORDER:
                     rejected_out_of_order += 1
+                elif why is AdmitReason.STALE:
+                    rejected_stale += 1
+                else:  # pragma: no cover - 由闭集类型保证不可达
+                    raise AssertionError(
+                        f"未知的时间拒绝原因 {why!r}（类型 "
+                        f"{type(why).__name__}）—— 拒绝原因必须取自 "
+                        f"AdmitReason 闭集，不得是自由字符串")
                 continue
 
             # IT-P1-TIME-ROLE-002：留痕 provider 原始 ts，并区分"生效时间"与
@@ -393,8 +504,9 @@ class EngineState:
             # 跨 epoch 的旧时间戳不算"倒退"（见 begin_source_epoch）。
             wm = self.accepted_watermark_by_route.get(wm_key)
             if wm is not None and q_ep < wm:
-                self.stats["t_reject:out_of_order"] = \
-                    self.stats.get("t_reject:out_of_order", 0) + 1
+                # 乱序拒绝的键同样出自闭集（不得手写字符串，见 AdmitReason）。
+                _ooo_key = AdmitReason.OUT_OF_ORDER.stats_key
+                self.stats[_ooo_key] = self.stats.get(_ooo_key, 0) + 1
                 rejected_out_of_order += 1       # WP01：route-local 归属
                 continue
 
@@ -423,13 +535,19 @@ class EngineState:
             admitted=admitted,
             rejected_future=rejected_future,
             rejected_out_of_order=rejected_out_of_order,
+            rejected_stale=rejected_stale,
             stale_diagnosed=stale_here,
         )
 
     def _admit_time(self, q: Quote, now: datetime, ep: float,
                     *, first_seen: bool = False,
-                    freshness_allowed: bool = False) -> tuple[bool, float, str]:
+                    freshness_allowed: bool = False) -> tuple[bool, float, AdmitReason]:
         """写前时间准入。返回 ``(是否接纳, 用于入库的时间戳, 拒绝原因)``。
+
+        第三个元素是 :class:`AdmitReason` 的**闭集**成员，不再是自由字符串 ——
+        拼错不可能构造出来（``AdmitReason("furure")`` 抛 ``ValueError``），
+        因此不会再静默新建 stats 桶（bug 类 (d)）。它继承 ``str``，
+        既有 ``== "future"`` 比较与 ``f"t_reject:{why}"`` 拼键保持逐字节不变。
 
         事件时间缺失时按"接收时间"处理（视作准时），这是兼容既有行为：
         多数 source 不填 ``ts``。
@@ -446,22 +564,22 @@ class EngineState:
         不需要再改结构。
         """
         if q.ts is None:
-            return True, ep, ""
+            return True, ep, AdmitReason.NO_REJECT
         try:
             q_ep = float(q.ts.timestamp())
         except (AttributeError, OSError, ValueError):
-            return True, ep, ""
+            return True, ep, AdmitReason.NO_REJECT
         if q_ep > ep + FUTURE_TOLERANCE_SECONDS:
-            return False, q_ep, "future"
+            return False, q_ep, AdmitReason.FUTURE
         # 陈旧判定只在两个条件**同时**成立时才硬拒绝：
         #   ① 该来源的时间语义允许判新鲜度（合同 freshness_allowed）；
         #   ② 这是本 route 本 epoch 的首见包（已有水位线的码由乱序判定负责）。
         # 否则只记诊断，不拦截 —— 这与 source_time_contract.json 一致。
         if first_seen and freshness_allowed and q_ep < ep - STALE_TOLERANCE_SECONDS:
-            return False, q_ep, "stale"
+            return False, q_ep, AdmitReason.STALE
         if q_ep > ep:
-            return True, ep, ""          # 轻微超前 -> 夹到 now，保留数据
-        return True, q_ep, ""
+            return True, ep, AdmitReason.NO_REJECT   # 轻微超前 -> 夹到 now，保留数据
+        return True, q_ep, AdmitReason.NO_REJECT
 
     def begin_source_epoch(self, route: str, source: str | None = None, *,
                            source_name: str | None = None) -> bool:
@@ -2008,6 +2126,9 @@ class Engine:
         future_rej = stk_res.rejected_future + idx_res.rejected_future
         ooo_rej = (stk_res.rejected_out_of_order
                    + idx_res.rejected_out_of_order)
+        # 陈旧**硬拒**的合计。修前这条完全没有出口（``why=="stale"`` 同时
+        # 落空 future/ooo 两支）—— 见 StateUpdateResult.rejected_stale。
+        stale_hard_rej = (stk_res.rejected_stale + idx_res.rejected_stale)
         # 按 route 分开留档（下游想看"是哪条 route 被拒"时不必再猜）。
         reject_by_route = {
             ROUTE_STOCKS: (stk_res.rejected_future,
@@ -2090,6 +2211,7 @@ class Engine:
             rejected_quality=quality_bad,
             future_rejected=max(future_rej, 0),
             out_of_order_rejected=max(ooo_rej, 0),
+            stale_hard_rejected=max(stale_hard_rej, 0),
             # WP01：拒绝/准入的 **route 归属**。合计值不再丢归属。
             # 与空轮分支**共用** `_route_ledger`（同一语义只有一份实现）。
             **self._route_ledger(

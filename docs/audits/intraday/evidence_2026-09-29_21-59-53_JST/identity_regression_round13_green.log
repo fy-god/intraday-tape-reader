@@ -1,0 +1,6 @@
+# identity_regression_round13 —— GREEN 基线（真实产品代码）
+# 命令: python -m pytest tests/test_sina_index_quote_identity.py tests/test_cross_source_identity.py tests/test_engine_state_index_identity.py tests/test_snapshot_raw_ledger_wiring.py -o addopts= -q
+# exit code: 0
+# ------------------------------------------------------------------
+.............................................                            [100%]
+45 passed in 0.60s

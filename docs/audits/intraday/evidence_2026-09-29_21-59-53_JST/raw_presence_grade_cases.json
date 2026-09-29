@@ -1,0 +1,57 @@
+{
+  "product_code": true,
+  "note": "三态必须互不相同；key_absent 必须是 not_measured 而不是 exact",
+  "states_observed": [
+    "exact",
+    "mixed",
+    "not_measured",
+    "projected"
+  ],
+  "cases": [
+    {
+      "case": "exact_both_routes",
+      "grade_state": "exact",
+      "exact_all_routes": true,
+      "projected_routes": [],
+      "unknown_missing_count": 3,
+      "rejected_quality_count": 1
+    },
+    {
+      "case": "projected_stocks",
+      "grade_state": "mixed",
+      "exact_all_routes": false,
+      "projected_routes": [
+        "stocks"
+      ],
+      "unknown_missing_count": 3,
+      "rejected_quality_count": 1
+    },
+    {
+      "case": "projected_both",
+      "grade_state": "projected",
+      "exact_all_routes": false,
+      "projected_routes": [
+        "index",
+        "stocks"
+      ],
+      "unknown_missing_count": 3,
+      "rejected_quality_count": 1
+    },
+    {
+      "case": "key_absent",
+      "grade_state": "not_measured",
+      "exact_all_routes": false,
+      "projected_routes": [],
+      "unknown_missing_count": 3,
+      "rejected_quality_count": 1
+    },
+    {
+      "case": "dirty_value",
+      "grade_state": "not_measured",
+      "exact_all_routes": false,
+      "projected_routes": [],
+      "unknown_missing_count": 3,
+      "rejected_quality_count": 1
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+# universe_truth_gate —— GREEN 基线（真实产品代码）
+# 命令: python -m pytest tests/test_universe_truth.py -o addopts= -q
+# exit code: 0
+# ------------------------------------------------------------------
+.........................                                                [100%]
+25 passed in 0.19s

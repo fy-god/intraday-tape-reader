@@ -1,0 +1,42 @@
+{
+  "product_code": true,
+  "note": "修前 no_total_exhausted_maxpages 的 truncated 报 False（诊断说谎）; transport_complete 三态均为 False，安全未漏",
+  "cases": [
+    {
+      "case": "no_total_exhausted_maxpages",
+      "expect_truncated": true,
+      "truncated": true,
+      "transport_complete": false,
+      "pages_requested": 5,
+      "reason": "接口未返回总数，且翻满 max_pages=5 后**仍有数据**（第 5 页有代码行）-> 确证被页数上限截断；池子不完整",
+      "matches_expectation": true
+    },
+    {
+      "case": "no_total_reached_end",
+      "expect_truncated": false,
+      "truncated": false,
+      "transport_complete": false,
+      "pages_requested": 3,
+      "reason": "接口未返回总数，顺序探测已到底（末页无代码行），但无基准仍无法证明完整",
+      "matches_expectation": true
+    },
+    {
+      "case": "total_truncated",
+      "expect_truncated": true,
+      "truncated": true,
+      "transport_complete": false,
+      "pages_requested": 5,
+      "reason": "翻页被 max_pages=5 截断：总数 1000 只需 100 页，仅请求了前 5 页；行数缩水：传输层只有 50 个唯一代码（50 行，去重后 50 条可用） < 总数 1000（缺 950，覆盖 5.0%）",
+      "matches_expectation": true
+    },
+    {
+      "case": "total_fully_fetched",
+      "expect_truncated": false,
+      "truncated": false,
+      "transport_complete": true,
+      "pages_requested": 3,
+      "reason": "已按总数翻完",
+      "matches_expectation": true
+    }
+  ]
+}

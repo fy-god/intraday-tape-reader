@@ -1,15 +1,42 @@
 # 最新审计
 
-**最新本地独立审计**：[2026-09-29_17-00-00_JST.md](./2026-09-29_17-00-00_JST.md)  
+**最新本地独立审计**：[2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)  
+**上一版本地独立审计**：[2026-09-29_17-00-00_JST.md](./2026-09-29_17-00-00_JST.md)  
 **最新云端独立审计**：[2026-09-24_20-08-07_JST.md](./2026-09-24_20-08-07_JST.md)  
 **最新云端 Agent 任务书**：[2026-09-24_20-08-07_JST_AGENT_TASK.md](./2026-09-24_20-08-07_JST_AGENT_TASK.md)  
-**上一版本地独立审计**：[2026-09-24_18-55-39_JST.md](./2026-09-24_18-55-39_JST.md)  
-**reviewed_source_sha / 本轮固定产品代码**：`221146d2efc8eb052a77b8032a3e540513e8df50`  
-**audit_start_head / 本轮开始 main**：`221146d2efc8eb052a77b8032a3e540513e8df50`  
+**reviewed_source_sha / 本轮固定产品代码**：`4e702b68066ac5187b1b298a52c132873672ee6d`  
+**audit_start_head / 本轮开始 main**：`4e702b68066ac5187b1b298a52c132873672ee6d`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/221146d2efc8eb052a77b8032a3e540513e8df50/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/4e702b68066ac5187b1b298a52c132873672ee6d/docs/audits/intraday/LATEST.md
 
-> 版本纪律：`9670dd9..221146d` 之间只有审计 docs/evidence 提交，因此本轮真正被审产品代码是 `221146d`（其树内产品代码 == `9670dd9`）。本轮**修改了产品代码**（Sina 指数身份 + 生产 detailed 接线），故 reviewed_source_sha 指修改前的 HEAD。
+> 版本纪律：本轮 `git fetch` 后 `origin/main == 4e702b6`，**无新云端报告**；最新云端审计仍是 09-24 20:08。本轮做的是既有任务书尾巴（WP08/未决项），修改了产品代码，故 reviewed_source_sha 指修改前的 HEAD。
+
+## 2026-09-29 22:00:00 JST（本地）
+
+**本轮结论**：挖出并修掉 **3 个真实缺陷**：
+
+1. `IT-P1-ADMIT-REASON-STALE-SILENT-DROP-016` — `AdmitReason.stale` 拒绝
+   **静默丢失 route 归属**（bug 类 d 假绿出口，**已在树里**，且被两个既有
+   测试覆盖）。**更正云端任务书**："`stale` 不可达"是错的。
+2. `IT-P1-SOAK-RAW-PRESENCE-GRADE-BLIND-001` — `live_session` 把**投影反推**
+   的 missing/quality 当**精确事实**上报（上一轮我加了字段却零读者）。
+   已改为三态 `exact`/`mixed`/`not_measured`，**键缺失不得当成 exact**。
+3. `IT-P1-006-R1-R2` — Eastmoney 无 total 分支 `truncated` **恒 False**
+   （诊断说谎；安全性未漏，恒 fail-closed）。
+
+**独立复核并把一个"疑似缺陷"降级**：`call` 与 `call_detailed` 两份
+failover 逻辑经 4 条路径探针实测**行为完全一致** —— 是潜在维护风险，
+**不是**已确认缺陷。
+
+- 全量测试 **2002 → 2060 passed**（+58），零回归
+- 回滚牙齿：Eastmoney **2/2 behavioral RED**；AdmitReason 给了
+  **structural + behavioral 双证**（诚实标注 structural 是较弱证据）
+- 门禁：`check_*.py` 8 ok / 0 fail；`selftest` exit 0；`dash_render_check` exit 0
+- 证据目录：`evidence_2026-09-29_21-59-53_JST/`
+- **模型真正增量提升 = 0**；真实 Precision/Recall/漏事件率/收益仍 `unavailable`
+- **诚实标记**：`stale_hard_rejected` 在生产**恒为 0**（三源 `freshness_allowed=false`），
+  是 capability-ready 遥测，**不是会动的曲线**
+- **用户获得感提示**：`spirit_index` 仍默认关闭，非交易时段，WP09 soak 未运行
 
 ## 2026-09-29 17:00:00 JST（本地）
 

@@ -523,6 +523,21 @@ class RoundObservationSet:
     #: ``TIME_POLICY[*].freshness_allowed``。）
     future_rejected: int = 0
     out_of_order_rejected: int = 0
+    #: 因**陈旧下限**被硬拒的条数（``engine.AdmitReason.STALE``）。
+    #:
+    #: 为什么必须与上面两个桶分开，且**不能**复用已弃用的
+    #: :attr:`stale_rejected` 属性名：那个名字（IT-P1-OBS-010）被定义为
+    #: "陈旧**诊断**数"，与"陈旧**拒绝**数"是两条互斥的曲线。若这里也叫
+    #: ``stale_rejected``，就会再次把"诊断"与"拒绝"塌成一个名字 ——
+    #: 正是上一轮修掉的病。
+    #:
+    #: ⚠ **消费者现状（如实登记，bug 类 c 自查）**：本字段由
+    #: ``EngineState.update_detailed()`` 的 ``rejected_stale`` 装配，
+    #: 在 ``as_dict()`` 里导出。但生产合同（三源
+    #: ``freshness_allowed=false``）下 ``AdmitReason.STALE`` **不可达**，
+    #: 所以它在本轮的现场数据里恒为 0 —— 它是**能力就绪**的留痕，
+    #: 不是当前会动的曲线。``tools/live_session.py`` 尚未消费它。
+    stale_hard_rejected: int = 0
     #: WP01 / `IT-P2-TIME-REJECT-ROUTE-ATTRIBUTION-011`：拒绝计数**按 route 分账**。
     #:
     #: 为什么必须分账：``future_rejected`` / ``out_of_order_rejected`` 是**合计**，
@@ -934,6 +949,10 @@ class RoundObservationSet:
             "rejected_quality": list(self.rejected_quality),
             "future_rejected": self.future_rejected,
             "out_of_order_rejected": self.out_of_order_rejected,
+            # 陈旧**硬拒**（AdmitReason.STALE）。与上面的"拒绝"两个桶同族，
+            # 与下面的 provider_stale_diagnosed（诊断）**互斥**。
+            # 生产合同下恒为 0（三源 freshness_allowed=false）。
+            "stale_hard_rejected": self.stale_hard_rejected,
             # --- WP01：拒绝/准入的 route 归属 -----------------------------------
             # 上面两个合计值**无法区分** `index future + stock ooo` 与
             # `index ooo + stock future`（两者都是 1/1）。这三个 map 才是
@@ -958,6 +977,10 @@ class RoundObservationSet:
             "_schema_note": {
                 "provider_stale_diagnosed": "诊断计数（age 超线），**不是**拒绝",
                 "future_rejected": "超前拒绝计数；与陈旧互斥",
+                "stale_hard_rejected": (
+                    "陈旧**硬拒**计数（AdmitReason.STALE）。与 "
+                    "provider_stale_diagnosed（诊断）互斥；生产合同"
+                    "（freshness_allowed=false）下恒为 0"),
                 "stale_rejected": "已弃用的别名，指向 provider_stale_diagnosed",
                 "reject_by_route": (
                     "WP01：拒绝的 route 归属。合计值分不出 "

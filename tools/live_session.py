@@ -135,6 +135,11 @@ _OBSERVATION_MARKER_KEYS: tuple[str, ...] = (
     "unknown_missing", "rejected_quality", "unavailable_capability",
     "observation_fields", "capabilities", "unavailable_by_reason",
     "signal_evaluability",
+    # WP08：证据等级。它**必须**在两个白名单里 —— 否则聚合方无从知道
+    # 这条轮样本是"测出来是降级"还是"根本没测这个字段"，而那正是本字段
+    # 要回答的问题（`IT-P1-SOAK-RAW-PRESENCE-GRADE-BLIND-001`）。
+    "raw_presence_known_by_route", "raw_presence_grade_state",
+    "raw_presence_projected_routes", "raw_presence_exact_all_routes",
     # IT-P1-SOAK-LEDGER-BLIND-001：新交付账本必须也在这里，否则 soak 对它
     # 完全盲 —— 白名单只到 signal_evaluability 时，汇总仍从旧的 eval 账本
     # 累加 ev_committed，而那个数只覆盖 2/7 规则（9.1% 覆盖率）。
@@ -149,6 +154,10 @@ _OBSERVATION_VALUE_FIELDS: tuple[str, ...] = (
     "future_rejected", "stale_rejected", "out_of_order_rejected",
     "unknown_missing", "rejected_quality", "unavailable_capability",
     "capabilities", "unavailable_by_reason", "signal_evaluability",
+    # WP08：同上，证据等级必须进 value 白名单，否则 `make_round_sample`
+    # 的分位/最差轮消费方看不到它。
+    "raw_presence_known_by_route", "raw_presence_grade_state",
+    "raw_presence_projected_routes", "raw_presence_exact_all_routes",
     # IT-P1-SOAK-LEDGER-BLIND-001：同上，交付账本必须进入 value 白名单，
     # 否则 ``make_round_sample`` 的 slim 视图会把它整段丢掉。
     "signal_delivery", "delivery_accounting",
@@ -357,6 +366,63 @@ def make_round_sample(
         out["unknown_missing"] = len(missing) if isinstance(missing, (list, tuple)) else 0
         quality = obs.get("rejected_quality")
         out["rejected_quality"] = len(quality) if isinstance(quality, (list, tuple)) else 0
+        # --- WP08：raw presence 的**证据等级**（逐 route，三态） -------------
+        #
+        # 缺陷（本轮修的，bug 类 c + e）：``unknown_missing`` /
+        # ``rejected_quality`` 被这里**当成硬事实**计数上报 —— 但账本里
+        # ``raw_presence_known_by_route[route]=False`` 明确说这两个桶的分界
+        # 是从**可用 Quote 投影反推**的（legacy 出口），此时
+        # 「provider 根本没返回这一行」与「返回了但 price<=0」**不可区分**。
+        # 旧代码从不读那个键，于是降级轮的投影数与精确轮的数在报告里
+        # **同样权威**，而且 failover 一次就把同一事实换了个桶。
+        #
+        # 三态纪律（与 ``_optional_bool`` 同一纪律，**不得**压成两态）：
+        #   True      -> 该 route 的 missing/quality 分界是**精确**的；
+        #   False     -> **降级**：投影反推，下游不得说"provider 没返回"；
+        #   键缺席/脏值 -> **未测量**（旧版本轮样本、legacy 来源）。
+        #               "键不在"绝不能读成 True —— 那正是 fail-open 的方向。
+        _rp_raw = obs.get("raw_presence_known_by_route")
+        _rp: dict[str, bool] = {}
+        if isinstance(_rp_raw, dict):
+            for _r, _v in _rp_raw.items():
+                _b = _optional_bool(_v)
+                # 脏值（"maybe"/NaN/dict）降级为**未测量**：读不出就不登记，
+                # 与"这条 route 没有键"在语义上等价，绝不猜成 True。
+                if _b is not None:
+                    _rp[str(_r)] = _b
+        # 该轮真正出数的 route（由 engine 的逐 route 分账恢复）。
+        # 用来发现"出过数、却没登记证据等级"的 route —— 真实来源是
+        # legacy 源：engine 只在 detailed 出口给出 outcome 时才登记 route，
+        # 于是「指数走 legacy、个股走 detailed」的轮次只带一个键。
+        _seen_routes: set[str] = set()
+        for _k in ("returned_by_route", "admitted_by_route", "reject_by_route"):
+            _m = obs.get(_k)
+            if isinstance(_m, dict):
+                _seen_routes |= {str(x) for x in _m}
+        # **部分证据**：只看已登记的键会读出 "exact"，而另一条 route
+        # 出过数却没有证据 —— 那正是 bug 类 (e)「证据子集自称全程」。
+        # 所以这里是 fail-closed 的：有未登记的出数 route 就**不报 exact**。
+        _ungraded = sorted(_seen_routes - set(_rp))
+        # 三态汇总。``not_measured`` = 本轮**没有**任何"全 route 精确"的
+        # 证据：要么一条等级都没读到，要么有 route 出过数却没登记。
+        if not _rp:
+            _rp_state = "not_measured"
+        elif all(_rp.values()):
+            _rp_state = "not_measured" if _ungraded else "exact"
+        elif not any(_rp.values()):
+            _rp_state = "projected"
+        else:
+            _rp_state = "mixed"
+        out["raw_presence_known_by_route"] = _rp
+        out["raw_presence_grade_state"] = _rp_state
+        # 投影反推的 route 名单（**有序**，报告可直接点名）。
+        out["raw_presence_projected_routes"] = sorted(
+            r for r, ok in _rp.items() if not ok)
+        # 出过数却没登记等级的 route（部分证据，bug 类 e）。
+        out["raw_presence_ungraded_routes"] = _ungraded
+        # 单布尔诚实旗标：True **只**在全 route 都有精确证据时为真。
+        # 未测量 -> False（fail-closed）：没有证据就不给"精确"这个背书。
+        out["raw_presence_exact_all_routes"] = _rp_state == "exact"
         out["unavailable_capability"] = _safe_int(obs.get("unavailable_capability"))
         # WP03 / IT-P1-CAPABILITY-003：逐 signal 可评估率。
         # 只保留判定需要的**有界**计数，丢掉 blocked_sample 明细（逐股，
@@ -913,6 +979,43 @@ def summarize_rounds(rounds: Sequence[dict], *,
     unavailable_rounds = 0
     unavailable_by_reason: dict[str, int] = {}
     capability_missing: dict[str, int] = {}      # {能力名: 有多少轮该源不提供}
+    # --- WP08：raw presence 证据等级（逐 route 三态）的会话累计 -----------
+    #
+    # 为什么必须**逐 route 分开**统计：个股走 detailed、指数还走 legacy
+    # （或反之）是真实可能的状态。用一个全局布尔会把"一条 route 精确、
+    # 另一条在投影"抹平成同一句话 —— 正是本仓库 bug 类 (e)
+    # 「证据子集自称全程」。
+    #
+    # **三态**：某 route 在某轮**没有** ``raw_presence_known_by_route`` 键
+    # （旧轮样本 / legacy 来源）既不算精确也不算投影，进 ``not_measured``。
+    # 把它塞进"精确"就是 fail-open，塞进"投影"就是凭空定罪 —— 两者都错。
+    rp_route_state: dict[str, dict[str, int]] = {}
+    rp_rounds_not_measured = 0                   # 一条 route 等级都没读到的轮数
+    rp_rounds_with_fact = 0                      # 至少读到一条 route 等级的轮数
+    #: 有事实**但不完整**的轮数：`raw_presence_known_by_route` 存在且非空，
+    #: 可**没有覆盖到该轮真正出数的 route**。真实来源是 legacy 源 ——
+    #: engine 只在 detailed 出口真正给出 outcome 时才登记 route，所以
+    #: 「指数走 legacy、个股走 detailed」的轮次会只带一个键。
+    #:
+    #: 这一格存在正是为了**不把部分证据当全程证据**（bug 类 e）：
+    #: 只看已有的键会得出"全程精确"，而"另一条 route 没登记"这件事
+    #: 恰恰是本次要暴露的东西。
+    rp_rounds_partial = 0
+    rp_rounds_partial_indexes: list[Any] = []
+    #: 该轮真正出数的**路线名字**（路由名取自轮样本自带字段）。
+    #: 只用于"逐 route 三格之和 == 带账本轮数"这条机械对账，
+    #: 不参与任何健康判决。
+    rp_rounds_by_route: dict[str, int] = {}
+    #: 会话里出现过的 route 全集（含只在部分轮出现的）。
+    rp_known_routes: set[str] = set()
+    #: 投影反推的轮号（**点名**，不是只给个数）：有人看到"3 轮降级"之后
+    #: 必须能直接回查是哪 3 轮，否则这个数字不可行动。
+    rp_projected_rounds: list[Any] = []
+    #: 降级轮里被**投影反推**出来的 missing / quality 计数（**上界口径**）。
+    #: 单独命名，**绝不**与 ``missing_total`` / ``quality_total`` 混为一谈：
+    #: 那两个数在混合场次里同时包含精确轮与投影轮，任何判决读它们都会
+    #: 把投影数的权威抬到与精确数同级。
+    rp_projected_counts = {"missing": 0, "quality": 0}
     # --- WP03：逐 signal 可评估率（新口径，替代整类轮比例当判据） --------
     # 形状：{signal: {"considered": int, "evaluable": int, ...}}
     # 为什么按 signal 而不是按轮：不同 signal 需要不同 capability
@@ -996,6 +1099,73 @@ def summarize_rounds(rounds: Sequence[dict], *,
             reject_totals["stale_total"] += stale
             if stale > 0:
                 reject_rounds["stale_total"] += 1
+
+        # --- WP08：raw presence 证据等级（逐 route 三态） ------------------
+        #
+        # 三态**绝不压成两态**。``present`` 只告诉我们"这个字段采到了没有"，
+        # 而它自己是三态键（True/False/未测量）：
+        #   * 键缺席（旧轮样本、legacy 来源）-> 该 route 记 not_measured；
+        #   * 脏值 -> _optional_bool 给 None -> 同样 not_measured（不猜 True）。
+        #
+        # ⚠ "键缺席"有**两种互不相同**的原因，混淆它们就是 bug 类 (e)：
+        #   (i) 这条 route 本轮真的没出数（没被请求）-> not_measured 正确；
+        #  (ii) 这条 route **出数了**、只是它的出口没给证据（legacy 源）
+        #       -> not_measured 正确，而"把已有的键当成全程"就不正确了。
+        # 后者由 ``rp_rounds_partial`` 单独点名（见下）。
+        _rp_map = r.get("raw_presence_known_by_route")
+        _rp_here: dict[str, bool] = {}
+        if isinstance(_rp_map, dict):
+            for _r, _v in _rp_map.items():
+                _b = _optional_bool(_v)
+                if _b is not None:
+                    _rp_here[str(_r)] = _b
+        if _rp_here:
+            rp_rounds_with_fact += 1
+        else:
+            rp_rounds_not_measured += 1
+        # 逐 route 计数：**该轮**每个登记过的 route 按等级 +1，没登记的
+        # route 记 not_measured。三格之和因此恒等于带账本的轮数
+        # （每个 route 每一轮恰好落一格）—— 可机械对账，不许丢轮。
+        #
+        # ⚠ 顺序：必须**先**把本轮真正出数的 route 也纳入 ``rp_known_routes``，
+        # 否则"上轮登记过、本轮却缺席"的 route 会静默少一轮，三格之和
+        # 就对不上带账本轮数 —— 而那正是"证据子集自称全程"能藏身的地方。
+        _seen_here: set[str] = set()
+        for _k in ("returned_by_route", "admitted_by_route", "reject_by_route"):
+            _m = r.get(_k)
+            if isinstance(_m, dict):
+                _seen_here |= {str(x) for x in _m}
+        rp_known_routes |= _seen_here
+        for _r in set(_rp_here) | rp_known_routes:
+            cell = rp_route_state.setdefault(
+                _r, {"exact": 0, "projected": 0, "not_measured": 0})
+            if _r not in _rp_here:
+                cell["not_measured"] += 1
+        rp_known_routes |= set(_rp_here)
+        _projected_here = False
+        for _r, _b in _rp_here.items():
+            cell = rp_route_state.setdefault(
+                _r, {"exact": 0, "projected": 0, "not_measured": 0})
+            cell["exact" if _b else "projected"] += 1
+            if not _b:
+                _projected_here = True
+        for _r in _seen_here:
+            rp_rounds_by_route[_r] = rp_rounds_by_route.get(_r, 0) + 1
+        # **部分证据**：有键、但没覆盖到本轮真正出数的 route。
+        # 这就是"证据子集自称全程"的机械探测器。
+        if _rp_here and (_seen_here - set(_rp_here)):
+            rp_rounds_partial += 1
+            rp_rounds_partial_indexes.append(_row_index(r, pos))
+        if _projected_here:
+            rp_projected_rounds.append(_row_index(r, pos))
+            # 该轮的 missing/quality 是**投影反推**的：单独累计成
+            # "上界口径"，不混入 missing_total / quality_total 的语义。
+            if "unknown_missing" in present:
+                rp_projected_counts["missing"] += _safe_int(
+                    r.get("unknown_missing"))
+            if "rejected_quality" in present:
+                rp_projected_counts["quality"] += _safe_int(
+                    r.get("rejected_quality"))
 
         # source mix：本轮是哪家源在供数（空/缺失归 unknown，不猜）。
         if "source" in present:
@@ -1118,8 +1288,48 @@ def summarize_rounds(rounds: Sequence[dict], *,
 
     # ---- 最差 N 轮：按 coverage 升序（同分保持轮号稳定），只收有效 coverage --
     ranked.sort(key=lambda t: (t[0], t[1]))
+
+    def _round_grade(r: dict) -> dict:
+        """这条轮样本的 raw presence 证据等级（逐 route，纯函数）。
+
+        与 ``make_round_sample`` 写入时同一套三态判定 —— 判定只有一份实现，
+        避免"写的时候是这一套、读的时候是那一套"。
+        """
+        grade: dict[str, bool] = {}
+        raw = r.get("raw_presence_known_by_route")
+        if isinstance(raw, dict):
+            for _r, _v in raw.items():
+                _b = _optional_bool(_v)
+                if _b is not None:
+                    grade[str(_r)] = _b
+        if not grade:
+            state = str(r.get("raw_presence_grade_state") or "not_measured")
+        elif all(grade.values()):
+            state = "exact"
+        elif not any(grade.values()):
+            state = "projected"
+        else:
+            state = "mixed"
+        # 部分证据：本轮真正出数的 route 里有没被登记等级的 —— 单看已有
+        # 的键会读出 "exact"，所以这里必须把它降下来并**点名**。
+        seen: set[str] = set()
+        for _k in ("returned_by_route", "admitted_by_route", "reject_by_route"):
+            _m = r.get(_k)
+            if isinstance(_m, dict):
+                seen |= {str(x) for x in _m}
+        ungraded = sorted(seen - set(grade))
+        if ungraded:
+            state = "not_measured" if state == "exact" else state
+        return {
+            "grade": state,
+            "by_route": grade,
+            "projected_routes": sorted(r_ for r_ in grade if not grade[r_]),
+            "ungraded_seen_routes": ungraded,
+        }
+
     worst: list[dict] = []
     for cov, pos, r in ranked[:max(0, int(worst_n))]:
+        _g = _round_grade(r)
         worst.append({
             "index": _row_index(r, pos),
             "coverage": round(cov, 4),
@@ -1132,6 +1342,23 @@ def summarize_rounds(rounds: Sequence[dict], *,
             "future": _safe_int(r.get("future_rejected")),
             "ooo": _safe_int(r.get("out_of_order_rejected")),
             "unavailable_capability": _safe_int(r.get("unavailable_capability")),
+            # --- WP08：**证据等级必须与数字相邻** ---------------------------
+            # "最差轮"表里 missing/quality 是为数不多会被人直接引用去
+            # 打质量标签的地方。投影轮的这两个数**不是硬事实**，
+            # 所以旗标必须与它们同一条记录，而不是藏在别处。
+            "raw_presence_grade": _g["grade"],
+            "raw_presence_by_route": _g["by_route"],
+            "raw_presence_projected_routes": _g["projected_routes"],
+            # 出过数却没登记证据等级的 route（**部分证据**，bug 类 e）。
+            "raw_presence_ungraded_routes": _g["ungraded_seen_routes"],
+            "_grade_note": (
+                "missing/quality 是**投影反推**的上界口径，"
+                "不能读作'provider 没返回'"
+                if _g["grade"] in ("projected", "mixed") else
+                "missing/quality 的分界来自精确 provider-raw-presence 出口"
+                if _g["grade"] == "exact" else
+                "证据等级**未测量**：missing/quality 的分界口径不明，"
+                "不得当作精确事实"),
         })
 
     def _r4(v: float | None) -> float | None:
@@ -1289,6 +1516,85 @@ def summarize_rounds(rounds: Sequence[dict], *,
                 else ("ok" if dl_acct_total > 0 else "not_measured")),
         },
         "worst_rounds": worst,
+        # --- WP08 / `IT-P1-SOAK-RAW-PRESENCE-GRADE-BLIND-001` ----------------
+        # raw presence 的**证据等级**（会话级，逐 route 三态）。
+        #
+        # 修前：``live_session.py`` 只读 ``unknown_missing`` / ``rejected_quality``
+        # 的**长度**，从不读 ``raw_presence_known_by_route`` —— 于是
+        # ``raw_presence_known_by_route[route]=False``（分界由 Quote 投影反推）
+        # 的轮次与精确轮在报告里**同样权威**。这是 bug 类 (c)（算好了没人读）
+        # 加 (e)（证据子集自称全程）。
+        #
+        # 三态纪律：``not_measured`` 是**独立状态**，不并入 exact 也不并入
+        # projected。旧轮样本没有这个键 —— 把它读成 True 就是 fail-open。
+        "raw_presence_grade": {
+            # 会话级总判定，命名与轮级一致（exact/projected/mixed/not_measured）。
+            #
+            # ⚠ **这里也是 fail-closed 的**：只要存在"没测到"的轮次，
+            # 就不报 exact —— 否则那句「全程精确」是把**部分**轮次的
+            # 结论当成**全部**轮次的结论（bug 类 e）。修前那个隐含假设
+            # 正是本缺陷：报告只读能读到的字段，然后当成整场都测过了。
+            "state": (
+                "not_measured"
+                if (rp_rounds_with_fact == 0
+                    or rp_rounds_not_measured > 0
+                    or rp_rounds_partial > 0)
+                else "projected" if rp_projected_rounds
+                else "exact"),
+            # 至少一条 route 有等级的轮数 / 一条都没有的轮数。两者之和 ==
+            # ``rounds_with_observation``（带账本的轮），可机械对账。
+            "rounds_with_fact": rp_rounds_with_fact,
+            "rounds_not_measured": rp_rounds_not_measured,
+            # **部分证据**：有键、但没覆盖到本轮真正出数的 route。
+            # 单看已有的键会读出"全程精确"，而"另一条 route 根本没登记"
+            # 恰恰是这里必须暴露的东西（bug 类 e）。
+            "rounds_partial": rp_rounds_partial,
+            "partial_round_indexes": list(rp_rounds_partial_indexes[:20]),
+            "projected_rounds": len(rp_projected_rounds),
+            "projected_round_indexes": list(rp_projected_rounds[:20]),
+            # 逐 route：exact / projected / not_measured 各多少轮。
+            # **每个 route 的三格之和 == 带账本的轮数**（每轮每条 route
+            # 恰好落一格）—— 可机械对账，不许丢轮。
+            "by_route": {
+                r: dict(cell) for r, cell in sorted(rp_route_state.items())},
+            # 本轮真正**出过数**的 route 各多少轮（由 returned/admitted/
+            # reject_by_route 恢复）。用于看出"某条 route 根本没出数"
+            # 与"某条 route 出数但没给证据"的区别。
+            "rounds_seen_by_route": dict(sorted(rp_rounds_by_route.items())),
+            # 被判为**投影反推**的 route 全集（会话级）。
+            "projected_routes": sorted(
+                r for r, cell in rp_route_state.items() if cell["projected"] > 0),
+            "exact_routes": sorted(
+                r for r, cell in rp_route_state.items()
+                if cell["exact"] > 0 and cell["projected"] == 0),
+            # 单布尔诚实旗标（消费方最省事的读法）。
+            #
+            # ⚠ 这是**唯一**一个被压成两态的字段，所以必须**双向 fail-closed**：
+            #   * 有未测量轮（旧样本 / legacy 出口没给证据）-> False；
+            #   * 有部分证据轮（键没覆盖到真正出数的 route）-> False；
+            #   * 有投影轮 -> False；
+            #   * 零轮（零证据）-> False。
+            # 只有"每一轮每一条 route 都明确登记为精确"才为 True。
+            # 任何"读不出"都必须落在 False 这一侧 —— 把未测量读成 True
+            # 就是 `bool(None) is False` 的镜像错误，而且是静默的。
+            "exact_all_rounds": (rp_rounds_with_fact > 0
+                                 and not rp_projected_rounds
+                                 and rp_rounds_not_measured == 0
+                                 and rp_rounds_partial == 0),
+            # 投影轮的 missing/quality **上界口径**。单独命名，
+            # **不得**与 missing_total / quality_total 混读。
+            "projected_missing_upper_bound": rp_projected_counts["missing"],
+            "projected_quality_upper_bound": rp_projected_counts["quality"],
+            "_semantics": (
+                "state=exact 表示所有轮次的 missing/quality 分界都来自精确 "
+                "provider-raw-presence 出口；projected/mixed 表示至少一条 "
+                "route 的分界是**从可用 Quote 投影反推**的，此时"
+                "unknown_missing 与 rejected_quality **不可区分**"
+                "（'provider 没返回' vs '返回了但 price<=0'），"
+                "两者的计数只能当**上界**，不得读作硬事实；"
+                "not_measured 表示轮样本里没有证据等级字段（旧版本），"
+                "口径不明，同样不得当作精确。"),
+        },
     }
 
 
@@ -3035,8 +3341,52 @@ def _fmt_observation_summary(metrics: dict) -> str:
     def _fmt_worst(rows: Sequence[dict]) -> str:
         if not rows:
             return "（无有效 coverage 读数）"
-        return " ".join(f"#{r.get('index')}={_pct(r.get('coverage'))}"
-                        for r in rows)
+
+        def _tag(r: dict) -> str:
+            """最差轮里那一轮的证据等级 —— **贴在数字旁边**，不是另起一行。
+
+            projected 的 missing/quality 是投影反推的上界，与精确轮同表
+            并列时若不标注，读者会把两者当成同一强度的证据。
+            """
+            g = str(r.get("raw_presence_grade") or "not_measured")
+            if g == "exact":
+                return ""
+            if g == "not_measured":
+                return "?"
+            return "!"
+
+        return " ".join(f"#{r.get('index')}={_pct(r.get('coverage'))}{_tag(r)}"
+                        for r in rows) + "（! = 该轮缺失/质量为**投影反推**，只能当上界；" \
+                                         "? = 证据等级**未测量**）"
+
+    grade = metrics.get("raw_presence_grade")
+    grade = grade if isinstance(grade, dict) else {}
+
+    def _fmt_grade() -> str:
+        """证据等级一行（WP08）。
+
+        ``!`` = 该轮缺失/质量计数是**投影反推**的（只能当上界）；
+        ``?`` = 证据等级**未测量**（旧样本）。两者都**不是**"精确"。
+        """
+        state = str(grade.get("state") or "not_measured")
+        if state == "exact":
+            return "  证据等级（缺失/质量分界）：exact —— 全部轮次来自精确 provider raw presence"
+        if state == "not_measured":
+            return (
+                f"  证据等级：**未测量/不完整**（{grade.get('rounds_not_measured')} 轮"
+                f"无 raw_presence_known_by_route 字段，"
+                f"{grade.get('rounds_partial')} 轮只覆盖部分 route，"
+                f"轮号 {grade.get('partial_round_indexes')}）—— 上面的"
+                f"缺失/质量总数口径不明，**不得**读作精确事实")
+        proj = grade.get("projected_routes") or []
+        return (
+            f"  证据等级：**降级（{state}）** —— {grade.get('projected_rounds')} 轮"
+            f"的缺失/质量分界是从可用 Quote **投影反推**的"
+            f"（路线 {proj or '未登记'}，轮号 {grade.get('projected_round_indexes')}）；"
+            f"这些轮次里 `unknown_missing` 与 `rejected_quality` **不可区分**，"
+            f"上面两个总数只能当**上界**读"
+            f"（纯投影上界：缺失 {grade.get('projected_missing_upper_bound')} / "
+            f"质量 {grade.get('projected_quality_upper_bound')}）")
 
     return (
         f"  观测覆盖：p05/p50/min/max = {_pct(metrics.get('coverage_p05'))} / "
@@ -3065,7 +3415,8 @@ def _fmt_observation_summary(metrics: dict) -> str:
         f"累计 {metrics.get('capability_unavailable_total')} 个标的"
         f"（比例 {_pct(metrics.get('capability_unavailable_ratio'))}）"
         f"{metrics.get('unavailable_by_reason') or ''}\n"
-        f"  最差轮次（按 coverage 升序）：{_fmt_worst(metrics.get('worst_rounds') or [])}"
+        f"  最差轮次（按 coverage 升序）：{_fmt_worst(metrics.get('worst_rounds') or [])}\n"
+        f"{_fmt_grade()}"
     )
 
 
