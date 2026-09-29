@@ -1,0 +1,8 @@
+# 回滚后字节级还原证明（sha256 前后一致）
+# 说明：用 bytes 读写而非 Path.write_text，避免 universal-newline
+#       把 CRLF 改写导致 sha256 假失败（上一轮踩过）。
+{
+  "src/arad/sources/sina.py": true,
+  "src/arad/engine.py": true,
+  "src/arad/capabilities.py": true
+}

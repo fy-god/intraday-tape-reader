@@ -1,0 +1,86 @@
+{
+  "source": "arad.sources.sina.parse_response",
+  "product_code": true,
+  "cases": [
+    {
+      "wire_symbol": "sh000001",
+      "caller_index_codes": [
+        "sh000001"
+      ],
+      "expect_role": "index",
+      "quote_code": "sh000001",
+      "board": "index",
+      "is_index_board": true
+    },
+    {
+      "wire_symbol": "sz399001",
+      "caller_index_codes": [
+        "sz399001"
+      ],
+      "expect_role": "index",
+      "quote_code": "sz399001",
+      "board": "index",
+      "is_index_board": true
+    },
+    {
+      "wire_symbol": "sz399006",
+      "caller_index_codes": [
+        "sz399006"
+      ],
+      "expect_role": "index",
+      "quote_code": "sz399006",
+      "board": "index",
+      "is_index_board": true
+    },
+    {
+      "wire_symbol": "sh000300",
+      "caller_index_codes": [
+        "sh000300"
+      ],
+      "expect_role": "index",
+      "quote_code": "sh000300",
+      "board": "index",
+      "is_index_board": true
+    },
+    {
+      "wire_symbol": "sh000688",
+      "caller_index_codes": [
+        "sh000688"
+      ],
+      "expect_role": "index",
+      "quote_code": "sh000688",
+      "board": "index",
+      "is_index_board": true
+    },
+    {
+      "wire_symbol": "sz000001",
+      "caller_index_codes": [
+        "sh000001"
+      ],
+      "expect_role": "stock",
+      "quote_code": "000001",
+      "board": "main",
+      "is_index_board": false
+    },
+    {
+      "wire_symbol": "sh600000",
+      "caller_index_codes": [
+        "sh000001"
+      ],
+      "expect_role": "stock",
+      "quote_code": "600000",
+      "board": "main",
+      "is_index_board": false
+    },
+    {
+      "wire_symbol": "sz300750",
+      "caller_index_codes": [
+        "sh000001"
+      ],
+      "expect_role": "stock",
+      "quote_code": "300750",
+      "board": "gem",
+      "is_index_board": false
+    }
+  ]
+}

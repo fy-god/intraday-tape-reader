@@ -1,0 +1,59 @@
+{
+  "product_code": true,
+  "cases": [
+    {
+      "route": "index",
+      "requested_codes": [
+        "sh000001"
+      ],
+      "R": [
+        "sh000001"
+      ],
+      "P": [
+        "sh000001"
+      ],
+      "Q": [
+        "sh000001"
+      ],
+      "unknown_missing": [],
+      "quote_codes": [
+        "sh000001"
+      ],
+      "identity_holds": true
+    },
+    {
+      "route": "stocks",
+      "requested_codes": [
+        "600000"
+      ],
+      "R": [
+        "600000"
+      ],
+      "P": [],
+      "Q": [],
+      "unknown_missing": [
+        "600000"
+      ],
+      "quote_codes": [],
+      "identity_holds": true
+    },
+    {
+      "route": "index",
+      "requested_codes": [
+        "sh000001"
+      ],
+      "provider_returned": "sz000001",
+      "R": [
+        "sh000001"
+      ],
+      "P": [],
+      "Q": [],
+      "unknown_missing": [
+        "sh000001"
+      ],
+      "quote_codes": [],
+      "identity_holds": true,
+      "note": "错误证券必须 admitted=0 且 sh000001 可观测为 missing"
+    }
+  ]
+}

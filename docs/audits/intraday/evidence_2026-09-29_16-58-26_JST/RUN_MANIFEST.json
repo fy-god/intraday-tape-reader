@@ -1,0 +1,94 @@
+{
+  "evidence_dir": "evidence_2026-09-29_16-58-26_JST",
+  "jst_timestamp": "2026-09-29_16-58-26",
+  "product_files": {
+    "src/arad/sources/sina.py": "aadb5279b51dbffdfcdd3772e5dc22fc639c32cdfe41fb2125715ae993c38656",
+    "src/arad/engine.py": "f0ab4d96ea2c01611200338dc017fc6c8cada00aca9a4218d3c9c56aedaea051",
+    "src/arad/capabilities.py": "42c2facfb2110313ecea5ffc4df566eb15387f0df5a95af76630f4cfebf5c228"
+  },
+  "logs": {
+    "sina_quote_identity_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_sina_index_quote_identity.py"
+      ]
+    },
+    "sina_detailed_prefix_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_sina_index_quote_identity.py"
+      ]
+    },
+    "cross_source_identity_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_cross_source_identity.py"
+      ]
+    },
+    "engine_state_identity_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_engine_state_index_identity.py"
+      ]
+    },
+    "round_identity_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_sina_index_quote_identity.py",
+        "tests/test_cross_source_identity.py"
+      ]
+    },
+    "snapshot_raw_ledger_wiring_green.log": {
+      "rc": 0,
+      "targets": [
+        "tests/test_snapshot_raw_ledger_wiring.py"
+      ]
+    }
+  },
+  "rollback_rc": 0,
+  "rollback_restored": {
+    "src/arad/sources/sina.py": true,
+    "src/arad/engine.py": true,
+    "src/arad/capabilities.py": true
+  },
+  "full_pytest": {
+    "rc": 0,
+    "tail": [
+      "2002 passed in 80.77s (0:01:20)"
+    ]
+  },
+  "check_gates": {
+    "ok": 8,
+    "fail": 0
+  },
+  "tests_added": {
+    "tests/test_sina_index_quote_identity.py": "4d4d7ae2479a6e1c54254b908cb8449a96566f4b303a43caa5583f8f8198426c",
+    "tests/test_cross_source_identity.py": "cfbceaec67ed921e294ff14d8c92ca6e74f472e4ded406a04bf53146a9410961",
+    "tests/test_engine_state_index_identity.py": "d786196e52d90d449f3626f39153c1069c6a9a4884dbd3b5a5041f9ec1a6573b",
+    "tests/test_snapshot_raw_ledger_wiring.py": "684eec383485a95c3556e305902362c1fa4e60a2603aec650b80d414e5ca52aa"
+  },
+  "selftest_rc": 0,
+  "selftest_summary": "68 alerts / 6 types / all scenarios hit",
+  "dash_render_check_rc": 0,
+  "check_py_paths": [
+    "check_audit_shots.py",
+    "check_bom.py",
+    "check_colors.py",
+    "check_config_consumed.py",
+    "check_config_wiring.py",
+    "check_orphan_config.py",
+    "check_readme_tools.py",
+    "check_spirit_mapping.py"
+  ],
+  "not_run": [
+    "WP09 live soak (non-trading session, spirit_index disabled)",
+    "WP08 tail: live_session.py wiring (out of session boundary)",
+    "WP10 research (needs real multi-day manifest)"
+  ],
+  "identity_asserts": {
+    "index_quote_code": "sh000001 (was 000001)",
+    "index_board": "Board.INDEX (was Board.MAIN)",
+    "collision_with_stock": false,
+    "cross_source_RPQ_identical": true
+  }
+}

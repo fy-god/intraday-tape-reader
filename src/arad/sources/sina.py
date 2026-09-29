@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable, Iterable
 
-from ..models import Board, Quote, board_of, guess_prefix
+from ..models import Board, Quote, board_of, guess_prefix, looks_like_index
 from .base import SourceError
 
 if TYPE_CHECKING:                                      # pragma: no cover
@@ -174,22 +174,49 @@ def _ts_of(fields: list[str]) -> datetime | None:
     return None
 
 
-def parse_response(text: str | bytes, seq: int = 0) -> list[Quote]:
+def parse_response(text: str | bytes, seq: int = 0,
+                   index_codes: set[str] | None = None) -> list[Quote]:
     """解析新浪批量行情响应；纯函数，无 I/O。
 
     - 空 payload（停牌/退市/无此代码，``hq_str_xxx=""``）整行跳过；
     - 现价或昨收 <= 0 的行跳过（停牌股价格全 0，进规则只会制造噪声）；
     - ``volume_lots`` = 字段 8 的股数 / 100。
+
+    #### `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`
+
+    ``index_codes``：调用方声明的**带前缀**指数符号集合
+    （如 ``{"sh000001", "sz399001"}``，即 ``engine.index_codes``）。
+    命中时该行的 ``code`` **保留带前缀的形式**并强制 ``board=INDEX``。
+
+    为什么必须这样：``sh000001``（上证指数）与 ``sz000001``（平安银行）
+    剥掉前缀后**都是 ``000001``**。若这里压成裸码，两者会在
+    ``EngineState.quotes`` / ``history`` / ``day_open`` 里**互相覆盖** ——
+    而 ``spirit_index.is_index_quote`` 的判据又依赖 ``board``/名称，
+    于是正确抓到的指数还会被判成个股，永远不会触发指数类信号。
+
+    这与腾讯的合同一致（``tencent.parse_response`` 的
+    ``out_code = symbol if is_index else code``），两源必须同调，
+    否则一次 failover 就会改变同一证券的身份键。
+
+    ⚠ **角色由调用方拥有**（caller-owned role），不靠名称猜：
+    名称只用于 ``board`` 归类，不用于身份键。
     """
     out: list[Quote] = []
+    idx_set = index_codes or set()
     s = _as_text(text)
     if not s.strip():
         return out
     for m in LINE_RE.finditer(s):
-        code = m.group(1)[2:]  # 正则已保证 [a-z]{2}\d{6}，去掉 sh/sz/bj 前缀
-        if not code.isdigit():
+        symbol = m.group(1).lower()   # 正则已保证 [a-z]{2}\d{6}
+        bare = symbol[2:]
+        if not bare.isdigit():
             continue
-        code = code.zfill(6)
+        code = bare.zfill(6)
+        # 身份：指数保留带前缀符号，个股用裸码（与腾讯同调）。
+        # ⚠ 判定**必须**走 `_identity_key` —— 它与 `_fetch_bulk` 的过滤
+        # 共用同一个函数，否则"过滤允许的键"与"Quote 实际的键"会不同域。
+        out_code = _identity_key(symbol, idx_set)
+        is_index = out_code != code
         fields = m.group(2).split(",")
         if len(fields) < MIN_FIELDS:
             continue  # 空 payload / 字段不足 -> 跳过
@@ -208,9 +235,9 @@ def parse_response(text: str | bytes, seq: int = 0) -> list[Quote]:
         amount = _num(fields[9])                 # 元
         out.append(
             Quote(
-                code=code,
+                code=out_code,
                 name=name,
-                board=board_of(code, name),
+                board=Board.INDEX if is_index else board_of(code, name),
                 price=price,
                 prev_close=prev_close,
                 open=_pos(fields[1], prev_close),
@@ -468,6 +495,11 @@ class SinaSource:
         with self._lock:
             return dict(getattr(self, "_last_universe", {}) or {})
 
+    #: 调用方声明的**带前缀**指数符号集合（caller-owned role）。
+    #: 由引擎按路由设置（``index`` 路由 = ``engine.index_codes``），
+    #: 使 :func:`parse_response` 不必靠名称猜身份。
+    index_codes: set[str] = set()
+
     def snapshots(self, codes: list[str]) -> list[Quote]:
         """指定代码的最新快照（每批 ``bulk_chunk``，并发）。批次失败即抛 SourceError。
 
@@ -475,19 +507,25 @@ class SinaSource:
         ``codes`` 里的**显式交易所前缀必须保留到 HTTP wire**。
         指数（``sh000001``）不能靠 ``guess_prefix`` 重猜 —— 那会推成
         ``sz000001``（平安银行），抓到**另一个证券**却看起来完全正常。
+
+        `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`：
+        命中 :attr:`index_codes` 的行，``Quote.code`` **保留带前缀身份**，
+        不再压成与平安银行相同的裸码 ``000001``。
         """
         wanted = _wire_symbols(codes)
         if not wanted:
             return []
+        idx_set = {c for c in self.index_codes if _split_prefix(c)[0]}
         seq = self._next_seq()
         batches = [wanted[i:i + self.bulk_chunk] for i in range(0, len(wanted), self.bulk_chunk)]
         quotes: list[Quote] = []
         errors: list[SourceError] = []
         if len(batches) == 1:
-            quotes = self._fetch_bulk(batches[0], seq)
+            quotes = self._fetch_bulk(batches[0], seq, idx_set)
         else:
             with ThreadPoolExecutor(max_workers=min(self.workers, len(batches))) as ex:
-                futs = {ex.submit(self._fetch_bulk, b, seq): b for b in batches}
+                futs = {ex.submit(self._fetch_bulk, b, seq, idx_set): b
+                        for b in batches}
                 for fut in as_completed(futs):
                     try:
                         quotes.extend(fut.result())
@@ -500,18 +538,13 @@ class SinaSource:
                 raise SourceError(f"sina {len(errors)}/{len(batches)} 批失败: {errors[0]}")
         # 只返回被请求的代码。
         #
-        # ⚠ `_fetch_bulk` **已经**按"带前缀的完整符号"精确过滤过（这是
-        # `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012` 的
-        # 第二道修复）。这里只做最后的兜底去重，**不能**再按 `wanted`
-        # 的字面值比 `q.code` —— `wanted` 是 wire 符号（`sh000001`），
-        # 而 `q.code` 是全仓约定的**裸码**（`000001`），两边根本不同域，
-        # 比了会把所有结果都滤掉。
-        #
-        # 保留一层**保守**兜底：只放行"裸码属于请求过的那批"的结果，
-        # 防止 provider 顺带返回完全无关的代码。
-        wanted_bare = {_split_prefix(w)[1] for w in wanted
-                       if _split_prefix(w) is not None}
-        out = _dedupe(q for q in quotes if q.code in wanted_bare)
+        # ⚠ `_fetch_bulk` **已经**按"身份键"精确过滤过。这里的兜底
+        # 必须用**同一个** `_identity_key`，不能再按 `wanted` 的字面值
+        # 或一律裸码比 —— `wanted` 是 wire 符号（`sh000001`），
+        # 而指数 `q.code` 现在也是 `sh000001`、个股才是裸码。
+        # 三者（wire / 过滤键 / Quote.code）必须同域。
+        wanted_ids = {_identity_key(w, idx_set) for w in wanted}
+        out = _dedupe(q for q in quotes if q.code in wanted_ids)
         with self._lock:
             self._stats["quotes"] = len(out)
         return out
@@ -584,7 +617,8 @@ class SinaSource:
             f"sina 请求失败（{self.retries} 次尝试后）: {type(last_err).__name__}: {last_err}"
         )
 
-    def _fetch_bulk(self, codes: list[str], seq: int) -> list[Quote]:
+    def _fetch_bulk(self, codes: list[str], seq: int,
+                    index_codes: set[str] | None = None) -> list[Quote]:
         """抓一批 wire 符号，并**按保留前缀的完整符号**过滤响应。
 
         `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`：
@@ -599,26 +633,29 @@ class SinaSource:
            旧代码的过滤键恰好是裸码（``_norm_codes`` 剥掉了前缀），
            所以它既发错请求、又拦不住错响应 —— 两道都漏。
 
-        在这一层做过滤是刻意的：只有这里能同时拿到"请求的完整符号"
-        与"响应的原始前缀"。`Quote.code` 仍按全仓约定是**裸码**。
+        `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`：
+        ``index_codes`` 透传给 :func:`parse_response`，让指数 ``Quote.code``
+        保留带前缀的身份（否则会与平安银行共用 ``000001`` 这个 key）。
+        过滤也必须跟着换成**身份键**（指数带前缀、个股裸码），
+        否则会把刚修好的前缀又滤掉。
         """
         url = self._bulk_url(codes)
         text = _as_text(self._request(url))
-        quotes = parse_response(text, seq)
+        quotes = parse_response(text, seq, index_codes=index_codes)
 
-        # 允许的裸码 = 实际在响应里**以被请求的完整符号**出现的那些。
+        # 实际在响应里**以被请求的完整符号**出现过的行。
         want_syms = set(codes)
-        allowed_bare: set[str] = set()
+        allowed_ids: set[str] = set()
         for m in LINE_RE.finditer(text):
             sym = str(m.group(1) or "").strip().lower()
             if sym in want_syms:
-                allowed_bare.add(sym[2:].zfill(6))
+                allowed_ids.add(_identity_key(sym, index_codes))
         # 无前缀请求（纯个股）保持既有宽松语义：裸码相等即收。
         loose_bare = {b for c in codes
                       if not _split_prefix(c)[0]
                       for b in (_split_prefix(c)[1],)}
         return [q for q in quotes
-                if q.code in allowed_bare or q.code in loose_bare]
+                if q.code in allowed_ids or q.code in loose_bare]
 
     def snapshots_detailed(self, codes: list[str], *,
                            route: str = "stocks") -> "SnapshotFetchResult":
@@ -645,10 +682,17 @@ class SinaSource:
                                  normalized_request=(), raw_keys=(),
                                  quotes=(), raw_presence_known=True,
                                  provenance=PROVENANCE_EXACT)
-        # 请求身份轴：账本用**裸码**（与 `outcome._key_of(quote)` 同轴）。
-        # 带前缀的 wire 符号另行传给 parser 做**严格过滤** —— 两者分工明确：
-        # 账本可比，过滤精确。
-        req_axis = [_norm_code(w) for w in wanted]
+        # 调用方拥有的角色（index 路由上 request 的都是指数）。
+        idx_set = {c for c in self.index_codes if _split_prefix(c)[0]}
+        if str(route or "").lower() == "index":
+            idx_set |= {c for c in wanted if _split_prefix(c)[0]}
+        # 请求身份轴 = **业务身份键**（指数带前缀、个股裸码）。
+        #
+        # `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`（云端 WP02）：
+        # 旧代码这里用 `_norm_code` 压成裸码，于是 R/P/Q 三轴虽然自洽，
+        # 却是**对错误身份自洽** —— 请求 sh000001 时 R={000001}，
+        # 与平安银行的 R 无法区分。必须与 `Quote.code` 同域。
+        req_axis = [_identity_key(w, idx_set) for w in wanted]
         seq = self._next_seq()
         batches = [wanted[i:i + self.bulk_chunk]
                    for i in range(0, len(wanted), self.bulk_chunk)]
@@ -656,11 +700,11 @@ class SinaSource:
         errors: list[SourceError] = []
         if len(batches) == 1:
             parts.append(self._fetch_bulk_detailed(batches[0], seq, req_axis,
-                                                   route))
+                                                   route, idx_set))
         else:
             with ThreadPoolExecutor(max_workers=min(self.workers, len(batches))) as ex:
                 futs = {ex.submit(self._fetch_bulk_detailed, b, seq, req_axis,
-                                  route): b for b in batches}
+                                  route, idx_set): b for b in batches}
                 for fut in as_completed(futs):
                     try:
                         parts.append(fut.result())
@@ -674,12 +718,15 @@ class SinaSource:
 
     def _fetch_bulk_detailed(self, codes: list[str], seq: int,
                              requested: list[str],
-                             route: str) -> "SnapshotFetchResult":
+                             route: str,
+                             index_codes: set[str] | None = None,
+                             ) -> "SnapshotFetchResult":
         # codes 已是保留前缀的 wire 符号，不再重猜。
         url = self._bulk_url(codes)
         return parse_response_detailed(self._request(url), seq,
                                        requested=requested, route=route,
-                                       wire_symbols=codes)
+                                       wire_symbols=codes,
+                                       index_codes=index_codes)
 
 
 # --------------------------------------------------------------------------
@@ -775,6 +822,35 @@ def _norm_codes(codes: Iterable[str]) -> list[str]:
     return out
 
 
+def _identity_key(symbol: str, index_codes: set[str] | None = None) -> str:
+    """wire 符号 -> **业务身份键**（`Quote.code` 的取值）。
+
+    这是 `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013` 的
+    **唯一**身份函数：``parse_response`` 与 ``_fetch_bulk`` 的过滤
+    必须都调它，否则"过滤允许的键"与"Quote 实际的键"会不同域。
+
+    规则（与 :func:`parse_response` 内联的判定**必须逐字一致**）：
+
+    1. 调用方在 ``index_codes`` 里显式声明过 -> 指数，保留带前缀符号；
+    2. 否则若符号自带前缀且确实是已知指数（:func:`looks_like_index`，
+       **名称盲**）-> 指数，保留带前缀符号；
+    3. 否则 -> 个股，用裸码。
+
+    ⚠ 名称不参与身份判定：请求侧拿不到名称，一旦某一侧能用名称，
+    两轴就永远不可能对齐（腾讯 `is_index_role` 的两次返工教训）。
+    """
+    sym = str(symbol or "").strip().lower()
+    sp = _split_prefix(sym)
+    if sp is None:
+        return sym
+    _, bare = sp
+    if index_codes and sym in index_codes:
+        return sym
+    if sp[0] and looks_like_index(sym, "", bare):
+        return sym
+    return bare
+
+
 def _wire_symbols(codes: Iterable[str]) -> list[str]:
     """请求代码 -> wire 符号列表（去重，**保留前缀语义**）。
 
@@ -794,6 +870,7 @@ def parse_response_detailed(text: str | bytes, seq: int = 0,
                             requested: Iterable[str] | None = None,
                             route: str = "stocks",
                             wire_symbols: Iterable[str] | None = None,
+                            index_codes: set[str] | None = None,
                             ) -> "SnapshotFetchResult":
     """``parse_response`` 的**精确 raw-presence** 版本（Snapshot Outcome v4）。
 
@@ -842,49 +919,55 @@ def parse_response_detailed(text: str | bytes, seq: int = 0,
     """
     from .outcome import PROVENANCE_EXACT, build_outcome, normalize_request
 
-    # 账本身份轴 R 保持**裸码**（与 `outcome._key_of(quote)` 同轴，
-    # 否则 R 与 Q 不同域，会造出 phantom missing）。
-    req = normalize_request(requested or (), normalize=_norm_code)
+    # ⚠ 身份轴用 `_identity_key`（指数带前缀、个股裸码），
+    # **不是** `_norm_code`（无差别剥前缀）。
+    #
+    # `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`（云端 WP02）：
+    # 旧代码压成裸码，于是 R/P/Q 三轴虽然**互相自洽**，却是对
+    # **错误身份**自洽 —— 请求 sh000001 时 R={000001}，与平安银行
+    # 的 R 逐字节相同，账本无法区分。必须与 `Quote.code` 同域。
+    idx_set = index_codes or set()
+    req = normalize_request(requested or (),
+                            normalize=lambda c: _identity_key(c, idx_set))
     req_set = set(req)
 
-    # ⚠ 但**过滤**必须用带前缀的 wire 符号 —— 这是
-    # `IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012` 的核心：
-    # 请求 `sh000001`（上证指数）时，provider 回的 `sz000001`
-    # （平安银行）裸码也是 `000001`，按裸码过滤**拦不住**它。
-    # `wire` 是本批真正请求的完整符号，只有出现在其中的响应行才算命中。
+    # 严格匹配：本批真正请求的 wire 符号（完整形式）。
+    # 请求 `sh000001`（上证指数）时 provider 回的 `sz000001`（平安银行）
+    # 裸码也是 `000001`，只按裸码过滤拦不住它
+    # （`IT-P1-SINA-INDEX-PREFIX-LOSS-SILENT-WRONG-INSTRUMENT-012`）。
     wire = {str(w).strip().lower() for w in (wire_symbols or ())}
     strict = {w for w in wire if _split_prefix(w)[0]}
-    # 请求里出现过、但只有裸码形式的那部分（纯个股）：保持宽松。
-    loose = {_norm_code(w) for w in wire if not _split_prefix(w)[0]}
-    loose |= {r for r in req_set if not strict}
+    # 无前缀请求（纯个股）：宽松，裸码相等即命中。
+    loose = {_identity_key(w, idx_set) for w in wire
+             if not _split_prefix(w)[0]}
+    loose |= {r for r in req_set if not _split_prefix(r)[0]}
 
     s = _as_text(text)
     raw_keys: list[str] = []
     raw_rows: list[Any] = []
-    matched_bare: set[str] = set()
+    matched_ids: set[str] = set()
     if s.strip():
         for m in LINE_RE.finditer(s):
             sym = str(m.group(1) or "").strip().lower()   # 例 "sh000001"
-            code = sym[2:]
-            if not code.isdigit():
+            bare = sym[2:]
+            if not bare.isdigit():
                 continue
-            bare = code.zfill(6)
+            ident = _identity_key(sym, idx_set)
             # 严格优先：带前缀请求时，只认完整符号命中的行。
             if strict:
                 hit = sym in strict
             else:
-                hit = bare in loose
+                hit = ident in loose
             if not hit:
                 continue
             # **身份在数值质量门之前捕获** —— 本函数存在的全部理由。
-            raw_keys.append(bare)
+            raw_keys.append(ident)
             raw_rows.append(m.group(0))
-            matched_bare.add(bare)
+            matched_ids.add(ident)
 
-    # 只保留**确实匹配请求身份**的行情。旧代码直接塞 `parse_response()`
-    # 的全量结果，于是错误证券的 Quote 也进了结果集。
-    quotes = tuple(q for q in parse_response(text, seq)
-                   if q.code in matched_bare)
+    # 只保留**确实匹配请求身份**的行情，且身份键必须与账本同域。
+    quotes = tuple(q for q in parse_response(text, seq, index_codes=idx_set)
+                   if q.code in matched_ids)
 
     return build_outcome(
         route=route,

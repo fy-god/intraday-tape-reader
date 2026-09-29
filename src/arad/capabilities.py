@@ -549,6 +549,20 @@ class RoundObservationSet:
     admitted_by_route: dict[str, int] = field(default_factory=dict)
     #: WP01：各 route 本轮**原始返回**条数（``route -> n``）。
     returned_by_route: dict[str, int] = field(default_factory=dict)
+    #: WP07 / `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001`：各 route 的
+    #: raw presence 是否来自**精确**出口（``route -> bool``）。
+    #:
+    #: 为什么必须逐 route 分开：个股走 detailed、指数还走 legacy（或反之）
+    #: 是**真实可能**的中间状态。用一个全局布尔会把"一条 route 精确、
+    #: 另一条在投影"抹平成同一句话 —— 正是本仓库 bug 类 (e)
+    #: 「证据子集自称全程」。
+    #:
+    #: ``False`` 的语义是**降级**、不是"没有数据"：它表示
+    #: ``unknown_missing`` / ``rejected_quality`` 这两个桶的分界是从
+    #: Quote 投影**反推**的，下游据此引用账本时必须**如实降级措辞**
+    #: （不能说"provider 没返回"，只能说"没有可用的 Quote"）。
+    raw_presence_known_by_route: dict[str, bool] = field(
+        default_factory=dict)
     #: WP04 / IT-P1-OBS-010：provider ts 被判定"过旧"的**诊断**条数
     #: （``age > STALE_TOLERANCE_SECONDS``），**不是**拒绝计数。
     #:
@@ -929,6 +943,11 @@ class RoundObservationSet:
                 for r, (f, o) in self.reject_by_route.items()},
             "admitted_by_route": dict(self.admitted_by_route),
             "returned_by_route": dict(self.returned_by_route),
+            # --- WP07：raw presence 的**证据等级**，逐 route -------------------
+            # `False` = 这一条 route 的 missing/quality 分界是从 Quote
+            # **投影反推**的（legacy 源），下游不得当成"provider 没返回"。
+            "raw_presence_known_by_route": dict(
+                self.raw_presence_known_by_route),
             # --- WP04 / IT-P1-OBS-010：陈旧诊断与"未来"必须是两条曲线 ---------
             # 上一轮 stale_rejected 被 alias 成 future_rejected，两个互斥的桶
             # 永远同值。现在分别导出，并把陈旧说清是**诊断**不是拒绝。
@@ -944,6 +963,10 @@ class RoundObservationSet:
                     "WP01：拒绝的 route 归属。合计值分不出 "
                     "index-future+stock-ooo 与 index-ooo+stock-future，"
                     "必须读这里"),
+                "raw_presence_known_by_route": (
+                    "WP07：raw presence 是否来自精确出口。false = "
+                    "unknown_missing/rejected_quality 的分界是投影反推的，"
+                    "引用账本时必须降级措辞"),
             },
             "unavailable_capability": self.unavailable_capability,
             # --- WP01 / IT-P1-CAPABILITY-003：逐 signal 可评估性 ---------------

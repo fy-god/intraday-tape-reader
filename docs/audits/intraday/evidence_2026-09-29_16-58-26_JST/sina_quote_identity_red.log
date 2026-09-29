@@ -1,0 +1,15 @@
+# RED：逐颗回滚牙齿，确认**目标测试**真的转红
+# 纪律 D15：必须命中被保护的那条测试；且须区分 structural / behavioral
+# --------------------------------------------------------------------
+tooth                       rc  class                  test
+----------------------------------------------------------------------------------------------------
+RB-WP01-identity             1  behavioral             test_index_quote_code_keeps_exchange_prefix
+RB-WP01-board                1  behavioral             test_index_quote_board_is_index
+RB-WP02-detailed-axis        1  behavioral             test_detailed_rpq_keys_are_canonical_index_identity
+RB-WP03-filter-domain        1  behavioral             test_snapshots_returns_prefixed_index_code
+RB-WP07-wiring               1  behavioral             test_poll_once_calls_detailed_fetch_helpers
+RB-WP07-fetch-indices        1  behavioral             test_fetch_indices_detailed_calls_call_detailed
+RB-WP07-degrade              1  behavioral             test_raw_keys_of_none_when_presence_unknown
+
+牙齿 7 颗：RED 7 （behavioral 7 / structural 0），未转红 0，锚点缺失 0
+MANIFEST: {"teeth": [{"id": "RB-WP01-identity", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_sina_index_quote_identity.py::test_index_quote_code_keeps_exchange_prefix", "desc": "指数 Quote.code 必须带前缀", "restored": true}, {"id": "RB-WP01-board", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_sina_index_quote_identity.py::test_index_quote_board_is_index", "desc": "指数 board 必须是 INDEX", "restored": true}, {"id": "RB-WP02-detailed-axis", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_sina_index_quote_identity.py::test_detailed_rpq_keys_are_canonical_index_identity", "desc": "detailed R 轴必须是指数身份", "restored": true}, {"id": "RB-WP03-filter-domain", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_sina_index_quote_identity.py::test_snapshots_returns_prefixed_index_code", "desc": "_fetch_bulk 过滤键必须与 Quote.code 同域", "restored": true}, {"id": "RB-WP07-wiring", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_snapshot_raw_ledger_wiring.py::test_poll_once_calls_detailed_fetch_helpers", "desc": "poll_once 必须走 detailed 抓取", "restored": true}, {"id": "RB-WP07-fetch-indices", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_snapshot_raw_ledger_wiring.py::test_fetch_indices_detailed_calls_call_detailed", "desc": "指数路由必须走 call_detailed", "restored": true}, {"id": "RB-WP07-degrade", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_snapshot_raw_ledger_wiring.py::test_raw_keys_of_none_when_presence_unknown", "desc": "raw_presence_known=False 必须降级成 None", "restored": true}]}

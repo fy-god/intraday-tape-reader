@@ -1,0 +1,6 @@
+# GREEN 基线（真实产品代码，无回滚）
+# 命令: python -m pytest tests/test_engine_state_index_identity.py -o addopts= -q
+# exit code: 0
+# --------------------------------------------------------------------
+.........                                                                [100%]
+9 passed in 0.07s

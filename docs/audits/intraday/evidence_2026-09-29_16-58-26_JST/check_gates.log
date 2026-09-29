@@ -1,0 +1,11 @@
+# 结构与卫生门禁（详单）
+# 
+--------------------------------------------------------------------
+check_audit_shots.py               rc=0
+check_bom.py                       rc=0
+check_colors.py                    rc=0
+check_config_consumed.py           rc=0
+check_config_wiring.py             rc=0
+check_orphan_config.py             rc=0
+check_readme_tools.py              rc=0
+check_spirit_mapping.py            rc=0

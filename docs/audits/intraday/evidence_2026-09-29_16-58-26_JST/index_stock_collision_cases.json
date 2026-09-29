@@ -1,0 +1,40 @@
+{
+  "note": "修前 5/5 全部 same_key=True（指数被压成裸码）",
+  "cases": [
+    {
+      "index_symbol": "sh000001",
+      "stock_symbol": "sz000001",
+      "index_quote_code": "sh000001",
+      "stock_quote_code": "000001",
+      "same_key": false
+    },
+    {
+      "index_symbol": "sz399001",
+      "stock_symbol": "sz399001",
+      "index_quote_code": "sz399001",
+      "stock_quote_code": "sz399001",
+      "same_key": true
+    },
+    {
+      "index_symbol": "sz399006",
+      "stock_symbol": "sz399006",
+      "index_quote_code": "sz399006",
+      "stock_quote_code": "sz399006",
+      "same_key": true
+    },
+    {
+      "index_symbol": "sh000300",
+      "stock_symbol": "sz000300",
+      "index_quote_code": "sh000300",
+      "stock_quote_code": "000300",
+      "same_key": false
+    },
+    {
+      "index_symbol": "sh000688",
+      "stock_symbol": "sz000688",
+      "index_quote_code": "sh000688",
+      "stock_quote_code": "000688",
+      "same_key": false
+    }
+  ]
+}

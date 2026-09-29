@@ -1050,7 +1050,36 @@ class Engine:
             if sym not in seen:
                 seen.add(sym)
                 out.append(sym)
+        self._publish_index_role(out)
         return out
+
+    def _iter_sources(self):
+        """遍历 failover 链里的每个源（含主源与备用源）。"""
+        mgr = self.sources
+        chain = getattr(mgr, "sources", None)
+        if chain is None:
+            return [mgr]
+        return list(chain)
+
+    def _publish_index_role(self, index_codes: list[str]) -> None:
+        """把**调用方拥有的指数角色**推给各数据源。
+
+        `IT-P1-SINA-INDEX-QUOTE-ID-COLLIDES-WITH-STOCK-013`：身份判定
+        不能靠名称猜 —— 请求侧没有名称，一旦某一侧能用名称，两轴就
+        永远不可能对齐（腾讯 `is_index_role` 的两次返工教训）。
+
+        引擎是唯一知道"这批代码是指数"的地方（``poll.index_codes`` +
+        路由语义），所以由它把角色交给源。源只做搬运，不重猜。
+        没有 ``index_codes`` 属性的源（第三方/测试桩）静默跳过。
+        """
+        want = {c for c in (index_codes or ()) if c}
+        for src in self._iter_sources():
+            if hasattr(src, "index_codes"):
+                try:
+                    src.index_codes = set(want)
+                except (AttributeError, TypeError):  # 只读属性/不可赋值 -> 跳过
+                    log.debug("源 %s 不接受 index_codes 角色注入",
+                              getattr(src, "name", "?"))
 
     def _fetch_indices(self) -> list[Quote]:
         """抓指数行情。失败只记日志，绝不影响个股主链路。
@@ -1058,16 +1087,43 @@ class Engine:
         只有**真的有规则要指数**时才发请求：``spirit_index`` 默认关闭，
         若不管规则就无脑抓，等于每轮白白多发 5 个代码的流量。
         """
+        return self._fetch_indices_detailed()[0]
+
+    def _fetch_indices_detailed(self):
+        """指数路由的 **detailed** 抓取：返回 ``(quotes, outcome|None)``。
+
+        `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001`（WP07）：
+        生产路径必须消费**精确 raw presence**，而不是从 Quote 投影反推。
+        旧路径只调 legacy ``snapshots()`` —— 于是"provider 返回了这一行、
+        只是数值不可用"与"provider 根本没返回"在引擎侧不可区分，
+        failover（腾讯->新浪）还会改变同一 raw fact 的账本语义。
+
+        ``outcome`` 为 ``None`` 表示这一轮没走 detailed（源不支持 /
+        没请求），调用方据此记 ``raw_presence_known=False``，**不得**
+        伪装成 exact。
+        """
         if not self.index_codes or not self._wants_indices:
-            return []
+            return [], None
         try:
-            # route 必须与个股请求分开：指数只有几只、几乎不会失败，若共用计数器
-            # 就会每轮把个股链路的失败计数清零（IT-P1-007）。
-            return self.sources.call("snapshots", list(self.index_codes),
-                                     route=ROUTE_INDEX)
+            res = self.sources.call_detailed(list(self.index_codes),
+                                             route=ROUTE_INDEX)
+            return list(res.quotes), res
         except Exception as exc:  # noqa: BLE001 - 指数是加分项，不能拖垮主循环
             self.log.warning("指数行情抓取失败（不影响个股）: %s", exc)
-            return []
+            return [], None
+
+    def _fetch_stocks_detailed(self, codes: list[str]):
+        """个股路由的 **detailed** 抓取：返回 ``(quotes, outcome|None)``。
+
+        与 :meth:`_fetch_indices_detailed` 同一合同。
+        """
+        try:
+            res = self.sources.call_detailed(list(codes), route=ROUTE_STOCKS)
+            return list(res.quotes), res
+        except Exception as exc:  # noqa: BLE001
+            self._errors += 1
+            self.log.warning("行情抓取失败: %s", exc)
+            return None, None
 
     def _load_focus(self) -> list[str]:
         try:
@@ -1378,6 +1434,29 @@ class Engine:
         idx_dispatched = bool(self.index_codes) and self._wants_indices
         index_requested = len(self.index_codes) if idx_dispatched else 0
         return stock_requested, index_requested, stock_requested + index_requested
+
+    @staticmethod
+    def _raw_keys_of(outcome) -> set[str] | None:
+        """从 detailed outcome 取出**精确 raw 键**（provider 真的返回过的行）。
+
+        `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001`（WP07）。
+
+        ``None`` = **拿不到精确证据**（``outcome`` 为 ``None``，或源是 legacy
+        的 quote-投影出口 ``raw_presence_known=False``）。调用方必须据此
+        **显式降级**，不得把它当成"没有行返回" —— 那是本仓库反复出现的
+        假绿出口（"默认分支 = 假绿"）。
+
+        有精确证据时返回 ``raw_returned_requested_keys``：provider 返回过、
+        且在被请求集合内的那些行（**含**数值不可用的）。
+        """
+        if outcome is None:
+            return None
+        if not bool(getattr(outcome, "raw_presence_known", False)):
+            return None
+        keys = getattr(outcome, "raw_returned_requested_keys", None)
+        if keys is None:
+            return None
+        return {str(k) for k in keys}
 
     @staticmethod
     def _route_ledger(*, stk_returned: int, stk_admitted: int,
@@ -1701,13 +1780,15 @@ class Engine:
         self._maybe_refresh_universe()
 
         quotes: list[Quote] = []
+        stk_outcome = None
         if self._codes:
-            try:
-                quotes = self.sources.call("snapshots", list(self._codes),
-                                           route=ROUTE_STOCKS)
-            except Exception as exc:  # noqa: BLE001
-                self._errors += 1
-                self.log.warning("行情抓取失败: %s", exc)
+            # WP07：production 走 **detailed** 出口，消费精确 raw presence。
+            # `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001`：legacy 路径只能从
+            # Quote 投影反推，"provider 返回了但数值不可用"与"根本没返回"
+            # 不可区分；旧代码 `call_detailed` 的生产调用点是 **0**
+            # （bug 类 c：数据算了、判决层零读者）。
+            quotes, stk_outcome = self._fetch_stocks_detailed(self._codes)
+            if quotes is None:
                 self.store.set_poll_stats(
                     poll_ms=int((time.perf_counter() - t0) * 1000),
                     count=self._poll_count, health=self.sources.health(), now=now)
@@ -1718,7 +1799,7 @@ class Engine:
             return []
 
         # 指数单独抓（同一轮、同一个源）。放在个股之后：指数抓不到时个股照常跑。
-        idx_quotes = self._fetch_indices()
+        idx_quotes, idx_outcome = self._fetch_indices_detailed()
 
         if not quotes and not idx_quotes:
             # IT-P1-OBS-EMPTY-ROUND-001：**空轮也必须落一份账**。
@@ -1786,6 +1867,12 @@ class Engine:
                             stk_returned=0, stk_admitted=0,
                             idx_returned=0, idx_admitted=0,
                             stk_reject=(0, 0), idx_reject=(0, 0)),
+                        # WP07：空轮的 raw presence **必然是精确的** ——
+                        # 本轮确实一条都没拿到（provider 返回空且不抛异常）。
+                        # 两条 route 都记 True，与正常路径同域，否则下游
+                        # 读这个 map 时会遇到"空轮没有键"这种第三种状态。
+                        raw_presence_known_by_route={
+                            ROUTE_STOCKS: True, ROUTE_INDEX: True},
                     ))
             except Exception:  # noqa: BLE001
                 # 可观测性不打断主链路，但**必须留痕** —— 静默吞掉正是
@@ -1901,6 +1988,22 @@ class Engine:
         req_stocks, index_requested, _req_total = self._request_arithmetic()
         raw_stock = list(quotes)
         raw_idx = list(idx_quotes)
+        # WP07 / `IT-P1-SNAPSHOT-RAW-LEDGER-COLLAPSE-001`：
+        # **精确 raw presence** 由 detailed 出口直接给出，不再从 Quote 反推。
+        #
+        # 旧写法 `{q.code for q in raw_stock if q.price > 0}` 只能表达
+        # "有个可用的 Quote" —— 它把两件**不同**的事塌成一个桶：
+        #   (a) provider 根本没返回这一行（真 missing）；
+        #   (b) provider 返回了、只是 price<=0（quality）。
+        # 分不清就无法给研究/模型打质量标签，而且一次 failover
+        # （腾讯->新浪）会改变同一 raw fact 落的桶。
+        #
+        # `raw_presence_known=False`（legacy 源/未走 detailed）时**必须**
+        # 显式降级，不得伪装成 exact —— 那是本仓库反复出现的假绿出口。
+        stk_raw_exact = self._raw_keys_of(stk_outcome)
+        idx_raw_exact = self._raw_keys_of(idx_outcome)
+        exact_stock = stk_raw_exact is not None
+        exact_index = idx_raw_exact is not None
         # WP01：**route-local** 事实由产生方直接给出，不再用全局差值反推。
         future_rej = stk_res.rejected_future + idx_res.rejected_future
         ooo_rej = (stk_res.rejected_out_of_order
@@ -1944,8 +2047,21 @@ class Engine:
         # 而 ``unknown_missing=()`` —— 指数码在整个账本里出现 **0 次**，
         # 指数丢失完全不可观测（个股丢失有 missing 兜底，指数没有）。
         # 现在 requested 里的每个码都必须能被某个桶解释。
-        raw_codes = {q.code for q in raw_stock if q.price > 0}
-        idx_raw_ok = {q.code for q in raw_idx if q.price > 0}
+        #
+        # WP07：优先用 detailed 出口给的 **exact** raw 键；只有拿不到
+        # （legacy 源 / 未走 detailed）才退回旧的"可用 Quote"投影，
+        # 且此时 `raw_presence_known=False` 会让下游如实降级措辞。
+        if exact_stock:
+            # exact 集合里价格可用的那部分，才是"真返回且可用"
+            raw_codes = {q.code for q in raw_stock if q.price > 0
+                         and q.code in stk_raw_exact}
+        else:
+            raw_codes = {q.code for q in raw_stock if q.price > 0}
+        if exact_index:
+            idx_raw_ok = {q.code for q in raw_idx if q.price > 0
+                          and q.code in idx_raw_exact}
+        else:
+            idx_raw_ok = {q.code for q in raw_idx if q.price > 0}
         time_rejected_codes = {
             q.code for q in raw_stock
             if q.price > 0 and q.code not in admitted
@@ -1985,6 +2101,9 @@ class Engine:
             provider_stale_diagnosed=max(stale_diag, 0),
             provider_stale_diagnosed_codes=_stale_codes,
             provider_stale_by_route=stale_diag_by_route,
+            # WP07：**证据等级**逐 route 如实登记（见 `_raw_keys_of`）。
+            raw_presence_known_by_route={
+                ROUTE_STOCKS: exact_stock, ROUTE_INDEX: exact_index},
         )
 
         ctx = RuleContext(
