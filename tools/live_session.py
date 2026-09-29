@@ -2809,6 +2809,112 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         add("delivery_accounting", True,
             "无交付账本字段，无法判定（跳过不算失败）", level="ok")
 
+    # --- `IT-P1-SOAK-RAW-PRESENCE-GRADE-GATE-002` ------------------------
+    # WP08 把 `raw_presence_known_by_route` 读成了三态证据等级，
+    # 但只**呈现**、不**判定** —— 那又是"算了但判决层零读者"（bug 类 c）。
+    # 本项目已因这个类栽过两次，这里不留同样的话柄。
+    #
+    # ⚠ **关键区分（我第一版写错过，被既有 21 个测试当场抓住）**：
+    # "没有 grade 字段"有**两种**，性质完全相反，不能合并：
+    #
+    #   (i) **本会话压根没有观测账本**（`rounds_with_observation == 0`）
+    #       -> 本项**不适用**。判 ok 但**跳过**，与既有
+    #          `delivery_accounting` / `universe` 的
+    #          "无字段 -> 无法判定（跳过不算失败）"一致。
+    #          legacy 夹具（不传 observation）走这条。
+    #   (ii) **有账本、但等级字段整个缺失** -> 也已核实是**旧版采集**
+    #        的常态（`finalize_metrics` 才产出该字段；手工构造的
+    #        metrics 没有）。全仓 16 个既有 check 在缺字段时**一律**
+    #        判 "跳过不算失败" —— 我实测确认过（`universe_truth` 的
+    #        手工夹具 30 轮观测、无 grade 字段时，其余 16 项全 ok）。
+    #        我若单独对 (ii) 判 fail，就是把"版本差异"误判成"事故"，
+    #        并把一个**新增**检查变成对全部旧报告的破坏性变更。
+    #        -> 判 **warn**（可见、可追踪、但不阻断），
+    #           且**绝不**默认成精确。
+    #   (iii) **有账本、等级算出来了但为 not_measured / partial**
+    #        -> **fail**。这才是真正的"我不知道"与
+    #        "证据子集自称全程"，是假绿出口。
+    #
+    # 为什么不是简单判 ok：判 ok 会让"不知道"静默通过 ——
+    # 那正是本项目反复出现的假绿出口。warn 让它**可见**。
+    #
+    # 三档判定（依据是"知道 vs 不知道"）：
+    #   * `not_measured`（轮样本里没有证据等级字段） -> **warn**
+    #       注意 `state="not_measured"` 的**定义**就是"轮样本里没有
+    #       证据等级字段（旧版本），口径不明"（见 `_semantics`）。
+    #       它描述的是**采集/版本**属性，不是数据完整性事故。
+    #       全仓有若干**只测别的维度**的夹具（如
+    #       `test_live_session_observation._obs_round`）确实不建这个键。
+    #       把它们一律判 fail，等于让一个**新增**检查变成对既有
+    #       全部会话的破坏性变更。
+    #       -> warn：**可见、可追踪、绝不默认成精确**，但不阻断。
+    #   * `partial`（某 route **产出了数据却没登记证据**） -> **fail**
+    #       这才是真事故：bug 类 (e)「证据子集自称全程」的**本体** ——
+    #       其余 route 全绿会把它伪装成"全部精确"。
+    #   * `projected`（**明确知道**是投影反推） -> **warn**
+    #       调用方知道自己在用投影，且 `unknown_missing` 已降为**上界**。
+    #       知道边界在哪就不是事故；判 fail 会惩罚"用 legacy 源跑 soak"
+    #       这种**合法**用法。
+    _has_obs = _safe_int(metrics.get("rounds_with_observation")) > 0
+    _grade = metrics.get("raw_presence_grade")
+    if not _has_obs:
+        add("raw_presence_evidence", True,
+            "本会话无观测账本（未采集 observation），"
+            "证据等级**不适用**（跳过不算失败）", level="ok")
+    elif not isinstance(_grade, dict):
+        add("raw_presence_evidence", True,
+            "无 `raw_presence_grade` 字段（旧版采集）——"
+            "**不得**默认成精确；能算等级的会话必须给出等级",
+            level="warn")
+    else:
+        _g_state = str(_grade.get("state") or "")
+        _g_partial = _safe_int(_grade.get("rounds_partial"))
+        _g_proj = _safe_int(_grade.get("projected_rounds"))
+        _g_notm = _safe_int(_grade.get("rounds_not_measured"))
+        _g_rounds = _safe_int(_grade.get("rounds_seen_by_route"))
+        _g_proj_routes = list(_grade.get("projected_routes") or [])
+        _g_ungr = list(_grade.get("ungraded_routes") or [])
+        if _g_partial:
+            # **唯一判 fail 的分支** —— 真事故
+            #
+            # ⚠ 我自己的测试当场抓出一个弱点：第一版消息写
+            # `未登记 route: {_g_ungr or '未知'}`，而 `_g_ungr`
+            # 来自 `ungraded_routes`，此路径下为空 -> 报"未知"。
+            # 但答案**是可推导的**：本会话真实出现过的 route
+            # （`by_route` 键 ∪ `rounds_seen_by_route` 键）
+            # 减去已登记的精确/投影 route，差集就是未登记者。
+            # 报"未知"等于把可行动信息丢掉 —— 那正是本仓库
+            # 反复出现的"数据算了但没呈现"。这里补上推导。
+            _seen_routes = set((_grade.get("by_route") or {}).keys())
+            _seen_routes |= set(
+                (_grade.get("rounds_seen_by_route") or {}).keys())
+            _reg = set(_g_proj_routes) | set(_grade.get("exact_routes") or [])
+            _ungraded = sorted(_seen_routes - _reg) or _g_ungr
+            add("raw_presence_evidence", False,
+                f"**证据子集自称全程**：{_g_partial} 轮里某条 route"
+                f"**产出了数据却未登记证据**"
+                f"（未登记 route: {_ungraded or '未知'}）——"
+                f"其余 route 全绿会伪装成'全部精确'，必须判失败",
+                level="fail")
+        elif _g_state in ("not_measured", ""):
+            add("raw_presence_evidence", True,
+                f"证据等级**未测**（{_g_notm} 轮轮样本无等级字段，"
+                f"state={_g_state or 'missing'}）——"
+                f"口径不明，**不得**默认成精确；"
+                f"能算等级的采集必须给出等级",
+                level="warn")
+        elif _g_proj:
+            add("raw_presence_evidence", True,
+                f"证据等级为**投影**（{_g_proj}/{_g_rounds} 轮，"
+                f"投影 route: {_g_proj_routes}）—— 已知降级，"
+                f"missing/quality 已降为**上界**；"
+                f"非事故，但结论措辞不得含'精确'",
+                level="warn")
+        else:
+            add("raw_presence_evidence", True,
+                f"证据等级为**精确**（{_g_rounds} 轮全 route 有"
+                f" provider raw presence 出品证据）", level="ok")
+
     healthy = all(c["ok"] for c in checks)
     if rounds < min_rounds:
         # 一轮都没跑完 = harness 级失败，与"跑起来了但有问题"要能区分开

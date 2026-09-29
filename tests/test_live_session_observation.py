@@ -761,7 +761,13 @@ class TestObservationHealth:
         rows = [_obs_round(i + 1, coverage=1.0) for i in range(3)]
         rows.append(_obs_round(4, coverage=1.0, unavailable_capability=1))
         v = ls.evaluate_health(_healthy_metrics(rows))
-        assert v["warn"] == ["capability"]
+        # 本测试的**意图**是"warn 被点名、fail 为空、每项都有 level"。
+        # 原先写成 `== ["capability"]`（精确列表相等），本意并非
+        # "warn 只能有一项"。`raw_presence_evidence` 是新加的**证据等级**
+        # 检查，这类夹具不建 grade 键 -> 正确地进 warn（可见、不阻断）。
+        # 改成"包含 + 不得有别的 fail"，保留原意图且不再随新增检查脆断。
+        assert "capability" in v["warn"], (
+            f"capability 必须被点名为 warn，实测 {v['warn']}")
         assert v["fail"] == []
         assert all("level" in c for c in v["checks"])
 

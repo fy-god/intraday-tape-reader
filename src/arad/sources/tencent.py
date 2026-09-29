@@ -766,6 +766,47 @@ class TencentSource:
             )
         return quotes
 
+    #: 调用方声明的**带前缀**指数符号集合（caller-owned role）。
+    #:
+    #: `IT-P2-TENCENT-IDX-SET-FROM-PREFIX-INFERENCE-002`：
+    #: 以前 `snapshots()` / `snapshots_detailed()` 各自用
+    #: ``idx_set = {sym for sym, explicit in norm if explicit}`` ——
+    #: 把"调用方**写了**前缀"当成"它**是指数**"。``sh600000``（浦发银行）
+    #: 带前缀，于是进了 `idx_set`，只靠 `looks_like_index` 兜住。
+    #:
+    #: 那是"同一语义在两个轴上各推一次"（bug 类 g）的温床：
+    #: 判定结果依赖于**调用方碰巧怎么拼字符串**，而不是它**声明了什么**。
+    #: 引擎现在通过本属性显式交付角色（`Engine._publish_index_role`），
+    #: 与新浪同调。属性为空时退回名称盲判据（既有语义不变）。
+    index_codes: set[str] = set()
+
+    def _role_set(self, norm) -> set[str]:
+        """算出本批的**指数角色集合**（caller-owned role 优先）。
+
+        `IT-P2-TENCENT-IDX-SET-FROM-PREFIX-INFERENCE-002`。
+
+        判定顺序（与新浪 `SinaSource.index_codes` 同调）：
+
+        1. **调用方声明的角色**（:attr:`index_codes`）—— 权威。
+           引擎在指数路由上把 ``engine.index_codes`` 推给链上每个源，
+           所以这条路径不依赖"调用方怎么拼字符串"。
+        2. 否则退回**既有语义**：调用方显式写过前缀的符号。
+           裸写 ``000001`` 时用户要的是平安银行，不能因为它在
+           ``INDEX_CODES`` 里就标成上证指数 —— 这条**不能删**。
+
+        ⚠ 两条路径的结果都还要过 `is_index_role` 的
+        `looks_like_index` 复合判据（名称盲），所以 ``sh600000``
+        即使被第 2 条收进来也会被判回个股。
+        """
+        declared = {c for c in (self.index_codes or ()) if c}
+        out = set()
+        for sym, explicit in norm:
+            if sym in declared:
+                out.add(sym)          # 调用方声明 -> 权威
+            elif explicit:
+                out.add(sym)          # 既有语义：写了前缀（名称盲判据兜底）
+        return out
+
     def snapshots(self, codes: list[str]) -> list[Quote]:
         """指定 6 位代码列表的最新快照（内部转 ``sh600000`` 形式并按 chunk 并发）。
 
@@ -775,9 +816,7 @@ class TencentSource:
         if not norm:
             return []
         prefixed = [sym for sym, _ in norm]
-        # 只有调用方**显式**写过前缀的符号才可能是指数：自选股里裸写 000001
-        # 时用户要的是平安银行，不能因为它在 INDEX_CODES 里就标成上证指数。
-        idx_set = {sym for sym, explicit in norm if explicit}
+        idx_set = self._role_set(norm)
         size = self.chunk
         assert 0 < size <= MAX_CHUNK, f"bulk_chunk 越界: {size}"
         chunks = [prefixed[i:i + size] for i in range(0, len(prefixed), size)]
@@ -886,7 +925,7 @@ class TencentSource:
                                  quotes=(), raw_presence_known=True,
                                  provenance=PROVENANCE_EXACT)
         prefixed = [sym for sym, _ in norm]
-        idx_set = {sym for sym, explicit in norm if explicit}
+        idx_set = self._role_set(norm)
         size = self.chunk
         assert 0 < size <= MAX_CHUNK, f"bulk_chunk 越界: {size}"
         chunks = [prefixed[i:i + size] for i in range(0, len(prefixed), size)]
