@@ -780,6 +780,55 @@ class SourceManager:
         self._fails[route] = self._fails.get(route, 0) + 1
         return self._fails[route]
 
+    def _serve(self, route: str, fetch):
+        """**唯一一份** failover + 失败记账实现（仓库缺陷类 (b)）。
+
+        修前 ``call`` 与 ``call_detailed`` 各自手写了一份逐字相同的记账
+        循环（热备累计 / 达阈值晋升 / 全失败异常出口）。两份实现会飘移，
+        于是把它们收敛到这里：
+
+        * ``fetch(src)`` 负责「获取这一个源的结果」。它抛出的任何异常
+          都算 **source failure**，继续尝试后备源。
+        * 返回值统一符号化为 ``(ok, value)``：``(True, out)`` = 本次有源供数、
+          ``(False, None)`` = 全部失败。``ok`` **不报告**「从哪个错误路径出来」：
+          它不区分「真的取到值」与「源合法返回 ``None``」 —— 这正是 ``call``
+          保留的旧行为（它可能返回 ``None``），不得被升级为异常。
+        * 全部失败时的出口也在这里：``last_exc`` 原样重抛（**同一个异常对象**），
+          ``threshold`` 晋升与 ``_switch`` 兜底同样只有这一份。
+        * 记账键 ``route`` 由调用方传入：``call`` 默认按方法名，
+          ``call_detailed`` 必须用 caller 的 route。
+        """
+        order = [self.idx] + [i for i in range(len(self.sources))
+                              if i != self.idx]
+        last_exc: Exception | None = None
+        for i in order:
+            src = self.sources[i]
+            try:
+                out = fetch(src)
+            except Exception as exc:  # noqa: BLE001 - 逐个后备源尝试
+                last_exc = exc
+                continue
+            self._serving[route] = i
+            if i == self.idx:
+                self._fails[route] = 0
+            else:
+                n = self._bump(route)
+                log.info("路由 %s 已由备用源 %s 提供服务（连续 %d/%d）",
+                         route, getattr(src, "name", "?"), n, self.threshold)
+                if n >= self.threshold:
+                    self.idx = i
+                    self._fails.clear()
+                    log.warning("数据源已正式切换 -> %s",
+                                getattr(src, "name", "?"))
+            return True, out
+
+        n = self._bump(route)
+        if n >= self.threshold:
+            self._switch()
+        if last_exc:
+            raise last_exc
+        return False, None
+
     def call(self, method: str, *args, route: str | None = None):
         """调用当前源；失败则按顺序尝试备用源。
 
@@ -792,37 +841,18 @@ class SourceManager:
         ``route`` 把不同用途的调用分开记账（缺省按方法名）。个股请求与指数请求
         必须传不同的 route，否则小额指数请求的成功会把个股链路的失败计数清零，
         正式切换永远不会发生（IT-P1-007）。
-        """
-        route = route or method
-        order = [self.idx] + [i for i in range(len(self.sources)) if i != self.idx]
-        last_exc: Exception | None = None
-        for i in order:
-            src = self.sources[i]
-            try:
-                out = getattr(src, method)(*args)
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                log.warning("数据源 %s.%s 失败: %s", getattr(src, "name", "?"), method, exc)
-                continue
-            self._serving[route] = i
-            if i == self.idx:
-                self._fails[route] = 0
-            else:
-                n = self._bump(route)
-                log.info("路由 %s 已由备用源 %s 提供服务（连续 %d/%d）",
-                         route, getattr(src, "name", "?"), n, self.threshold)
-                if n >= self.threshold:
-                    self.idx = i
-                    self._fails.clear()
-                    log.warning("数据源已正式切换 -> %s", getattr(src, "name", "?"))
-            return out
 
-        n = self._bump(route)
-        if n >= self.threshold:
-            self._switch()
-        if last_exc:
-            raise last_exc
-        return None
+        这里**不做**任何返回值合同校验：本方法调任意
+        ``method`` 并原样返回它的结果（与 ``call_detailed`` 刻意保持区别）。
+
+        失败记账 / 热备 / 晋升 / 全失败异常出口全部委托给
+        :meth:`_serve` —— 与 ``call_detailed`` 共用**同一份**实现。
+        """
+        ok, out = self._serve(route or method,
+                              lambda src: getattr(src, method)(*args))
+        if not ok:
+            return None
+        return out
 
     def call_detailed(self, codes: list[str], *, route: str) -> Any:
         """WP02：调 ``snapshots_detailed`` 并把结果**原子绑定**到实际服务源。
@@ -845,7 +875,8 @@ class SourceManager:
         * legacy 源（没有该方法，例如测试里的 ``FakeSource``/第三方源）
           退化为"调 ``snapshots`` 再包成 ``raw_presence_known=False`` 的
           quote_projection outcome" —— **不得**伪装成 exact；
-        * failover 顺序与 ``call`` 完全一致（主源优先，逐个后备）；
+        * failover 顺序与 ``call`` 完全一致（主源优先，逐个后备）——
+          两者共用 :meth:`_serve` 这**一份**记账实现；
         * 全部失败时抛最后一个异常（与 ``call`` 同语义）。
 
         :param codes: 请求的代码（个股裸码 / 指数带前缀，与各源约定一致）
@@ -855,12 +886,7 @@ class SourceManager:
         """
         from .sources.outcome import SnapshotFetchResult, build_outcome
 
-        order = [self.idx] + [i for i in range(len(self.sources))
-                              if i != self.idx]
-        last_exc: Exception | None = None
-        for i in order:
-            src = self.sources[i]
-            name = str(getattr(src, "name", "?"))
+        def detail_fetch(src):
             # ⚠ **合同校验必须整体放在 `try` 内**（任务书 §WP03）。
             #
             # 修前只有 `detailed(...)` 一行在 try 里，`_replace` 在外面 ——
@@ -874,6 +900,12 @@ class SourceManager:
             #   1. 获取结果；2. 类型/合同验证；
             #   3. actual source 绑定；4. caller route 绑定/验证。
             # 任何一步不满足 -> 当 **source failure** 处理，继续 failover。
+            #
+            # ⚠ 本函数体**必须**整体在 `try` 内，不能拆成
+            # "取数 + 事后校验"：接住它的是 ``_serve`` 的
+            # ``except Exception``（与修前同一个接法），拆开就等于把
+            # WP03 的修复退回去。
+            name = str(getattr(src, "name", "?"))
             try:
                 detailed = getattr(src, "snapshots_detailed", None)
                 if callable(detailed):
@@ -908,28 +940,14 @@ class SourceManager:
                 if out.source != name or out.route != route:
                     out = out._replace(source=name, route=route)
             except Exception as exc:  # noqa: BLE001 - 逐个后备源尝试
-                last_exc = exc
                 log.warning("数据源 %s.snapshots_detailed 失败: %s", name, exc)
-                continue
-            self._serving[route] = i
-            if i == self.idx:
-                self._fails[route] = 0
-            else:
-                n = self._bump(route)
-                log.info("路由 %s detailed 已由备用源 %s 提供服务（连续 %d/%d）",
-                         route, name, n, self.threshold)
-                if n >= self.threshold:
-                    self.idx = i
-                    self._fails.clear()
-                    log.warning("数据源已正式切换 -> %s", name)
+                raise
             return out
 
-        n = self._bump(route)
-        if n >= self.threshold:
-            self._switch()
-        if last_exc:
-            raise last_exc
-        return None
+        ok, out = self._serve(route, detail_fetch)
+        if not ok:
+            return None
+        return out
 
     def health(self) -> list[dict]:
         out = []
