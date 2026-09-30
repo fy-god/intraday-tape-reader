@@ -1,0 +1,20 @@
+﻿修后 sha256:
+  tencent.py   00853331d6b9fa838ce8334eb521c5bb
+  engine.py    7a05430b8a30ab0d125bda924c559b5d
+
+基线 tests/test_tencent_caller_owned_index_role.py rc=0
+
+tooth                             rc  class        result
+--------------------------------------------------------------------------------------------
+RB-R15-no-attribute                1  behavioral   RED
+RB-R15-role-set-no-declaration     1  behavioral   RED
+RB-R15-publish-first-only          1  behavioral   RED
+RB-R15-everything-is-index         1  behavioral   RED
+
+牙齿 4 颗：RED 4（behavioral 4 / structural 0），未转红 0，锚点缺失 0
+字节级还原: True
+  tencent.py   00853331d6b9fa838ce8334eb521c5bb
+  engine.py    7a05430b8a30ab0d125bda924c559b5d
+还原后基线复跑 rc=0
+
+MANIFEST: {"sha_before": {"tencent.py": "00853331d6b9fa838ce8334eb521c5bb052ac94c4165c58526f6d02ffcff46be", "engine.py": "7a05430b8a30ab0d125bda924c559b5d8ba313dbebaaf770233ef6465db4e58d"}, "sha_after": {"tencent.py": "00853331d6b9fa838ce8334eb521c5bb052ac94c4165c58526f6d02ffcff46be", "engine.py": "7a05430b8a30ab0d125bda924c559b5d8ba313dbebaaf770233ef6465db4e58d"}, "restored_identical": true, "baseline_rc": 0, "post_restore_rc": 0, "teeth": [{"id": "RB-R15-no-attribute", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_tencent_caller_owned_index_role.py::TestCallerOwnedRolePlumbing::test_source_exposes_index_codes_attribute", "desc": "删掉 `index_codes` 类属性 -> 接口缺失", "restored": true}, {"id": "RB-R15-role-set-no-declaration", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_tencent_caller_owned_index_role.py::TestCallerOwnedRolePlumbing::test_role_set_reads_declaration_not_only_prefix", "desc": "删掉 `_role_set` 的声明分支 -> 结构对齐失效", "restored": true}, {"id": "RB-R15-publish-first-only", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_tencent_caller_owned_index_role.py::TestCallerOwnedRolePlumbing::test_engine_publishes_role_to_every_source_in_chain", "desc": "`_publish_index_role` 只推链上第一个源 -> 交付链断", "restored": true}, {"id": "RB-R15-everything-is-index", "status": "RED", "rc": 1, "class": "behavioral", "target": "tests/test_tencent_caller_owned_index_role.py::TestBehaviorInvariants::test_prefixed_stock_is_not_index", "desc": "反向假数据：`looks_like_index` 恒 True -> 个股被误判指数", "restored": true}]}

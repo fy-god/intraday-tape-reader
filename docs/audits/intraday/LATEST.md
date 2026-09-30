@@ -21,24 +21,67 @@
 
 证据边界：原报告的 `12 passed in 0.06s` 仅为隔离候选测试；`2060 passed` 属于历史产品归档，未在上述 SHA 复验。本次仅补传 Markdown，没有产品修复、部署、训练、真实行情轮询或通知，也未启动用户本地 agent。报告第 10 节的发布失败记录保留为历史。实际报告提交 SHA 由 Git 提交历史提供，不预填未知值。
 
-最新本地独立审计仍为 [2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)。以下完整保留补传前索引；其中“最新”“本轮”等词均为历史记录。
+最新本地独立审计现为 [2026-09-29_22-45-00_JST.md](./2026-09-29_22-45-00_JST.md)。以下完整保留补传前索引；其中“最新”“本轮”等词均为历史记录。
 
 ---
 
-## 补传前索引原文（完整保留）
-
-# 最新审计
-
-**最新本地独立审计**：[2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)  
-**上一版本地独立审计**：[2026-09-29_17-00-00_JST.md](./2026-09-29_17-00-00_JST.md)  
-**最新云端独立审计**：[2026-09-24_20-08-07_JST.md](./2026-09-24_20-08-07_JST.md)  
-**最新云端 Agent 任务书**：[2026-09-24_20-08-07_JST_AGENT_TASK.md](./2026-09-24_20-08-07_JST_AGENT_TASK.md)  
-**reviewed_source_sha / 本轮固定产品代码**：`4e702b68066ac5187b1b298a52c132873672ee6d`  
-**audit_start_head / 本轮开始 main**：`4e702b68066ac5187b1b298a52c132873672ee6d`  
+**最新本地独立审计**：[2026-09-29_22-45-00_JST.md](./2026-09-29_22-45-00_JST.md)  
+**上一版本地独立审计**：[2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)  
+**最新云端独立审计**：[2026-09-30_04-13-31_JST.md](./2026-09-30_04-13-31_JST.md)（补传，见顶部；上一份 [2026-09-24_20-08-07_JST.md](./2026-09-24_20-08-07_JST.md)）  
+**最新云端 Agent 任务书**：[2026-09-30_04-13-31_JST_AGENT_TASK.md](./2026-09-30_04-13-31_JST_AGENT_TASK.md)  
+**reviewed_source_sha / 本轮固定产品代码**：`fd5821d02881250b6a19a29d6967ef86985cc9e6`  
+**audit_start_head / 本轮开始 main**：`fd5821d02881250b6a19a29d6967ef86985cc9e6`  
 **上一版完整 LATEST 历史索引（不可变快照）**：  
-https://github.com/fy-god/intraday-tape-reader/blob/4e702b68066ac5187b1b298a52c132873672ee6d/docs/audits/intraday/LATEST.md
+https://github.com/fy-god/intraday-tape-reader/blob/fd5821d02881250b6a19a29d6967ef86985cc9e6/docs/audits/intraday/LATEST.md
 
-> 版本纪律：本轮 `git fetch` 后 `origin/main == 4e702b6`，**无新云端报告**；最新云端审计仍是 09-24 20:08。本轮做的是既有任务书尾巴（WP08/未决项），修改了产品代码，故 reviewed_source_sha 指修改前的 HEAD。
+> 版本纪律：本轮**开始**时 `git fetch` 后 `origin/main == fd5821d`，当时**无新云端报告**，
+> 故本轮做的是既有任务书的**未决项**（`test_full_day_simulation.py` 从未编写、
+> bug 类 b 的两份手写 failover、腾讯 v1 根因、证据等级零读者），并修改了产品代码，
+> 因此 reviewed_source_sha 指修改前的 HEAD。
+>
+> ⚠ **更正（推送时发现）**：本轮**收尾推送时**云端补传了
+> `2026-09-30_04-13-31_JST.md`，其 reviewed_source_sha = `55dcce8`
+> —— 即**我这一轮的第二个提交**。也就是说该云端报告审计的是
+> **我本轮的中间产物**，其开放 ID（`IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`、
+> `IT-P2-SOAK-RAW-PRESENCE-ROUND-DENOMINATOR-043`）
+> **尚未被本轮处理**，已列为下一轮最高优先级。
+> 本行以上"无新云端报告"的描述仅对**本轮开始时点**成立。
+
+## 2026-09-29 22:45:00 JST（本地）
+
+**本轮完成 4 项 + 1 项诚实降级：**
+
+1. ✅ `tests/test_full_day_simulation.py` —— **挂了 10+ 轮的未决项已交付**
+   （**33 条**）。首次把**一整天**盯盘流程（时段序列含午休/收盘竞价、
+   告警冷却 fire→suppress→refire、盘中 failover、确定性）钉成可回归测试。
+2. ✅ `SourceManager` failover/记账**两份手写 → 单点 `_serve`**（bug 类 b）。
+   **AST 独立核实**：记账语句只在 `_serve` 里存在一份，
+   `call`/`call_detailed` 各 **0** 条，纯委派。
+3. ✅ `IT-P1-SOAK-RAW-PRESENCE-GRADE-GATE-002` —— 证据等级**算了但判决层零读者**
+   （bug 类 c，**我上一轮自己犯的**）。已接入 `evaluate_health`。
+4. ✅ `IT-P2-CALENDAR-BARE-CONSTRUCT-SILENT-EMPTY-HOLIDAYS-003` ——
+   **裸构造 `TradingCalendar()` 静默得到空假期表**，把国庆当交易日。
+   **潜在陷阱非生产缺陷**（生产全用 `load()`）。已钉住 + AST 门禁。
+5. ⬇️ **腾讯指数角色修复诚实降级为"结构对齐，非行为修复"** ——
+   回滚牙齿有 **2 颗没转红**，证明 `idx_set` 只是预过滤、成员仍须过
+   `looks_like_index`。我把结论写进测试文件头，并加测试防后人误以为
+   它修好了 `sh000922` 那一类符号。
+
+**⚠ 本轮最重要的事件**：我**拦下了一次自己人的回归** ——
+一个子 agent 把 `session.py` 的 `LUNCH`/`CLOSE_AUCTION` 两个时段**删掉了**
+（会让已修的 `IT-P0-001` 重新打开）。我立即中断并要求还原，
+**独立核实**还原后字节等于 HEAD，并用隔离验证证明
+那些 session 失败来自**另一个** agent 在写的 `engine.py`，不是它。
+
+- 全量测试 **2002 → 2164 passed**（+162），零回归
+- 回滚牙齿：腾讯 **4/4 behavioral**；failover **3 形状 structural + 3 定向变异 behavioral**；
+  全日仿真 **2/2 behavioral**；全部字节级还原
+- 门禁：`check_*.py` 8 ok / 0 fail；`selftest` exit 0；`dash_render_check` exit 0
+- 证据目录：`evidence_2026-09-29_22-44-52_JST/`
+- **模型真正增量提升 = 0**；真实 Precision/Recall/漏事件率/收益仍 `unavailable`
+- **诚实标记**：`stale_hard_rejected` 生产恒 0；
+  **收盘竞价静默靠规则层无引擎级兜底**（`engine.py:1910` vs `tick_surge.py:101`
+  同一事实两个判据）；`spirit_index` 仍默认关闭，真实 soak 未运行
 
 ## 2026-09-29 22:00:00 JST（本地）
 

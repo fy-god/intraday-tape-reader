@@ -1,0 +1,60 @@
+{
+  "product_code": true,
+  "note": "回滚牙齿证明 `idx_set` 只是预过滤，成员仍须过 `looks_like_index` -> `index_codes` 是**结构对齐**，非行为修复。诚实降级。",
+  "rows": [
+    {
+      "symbol": "sh000001",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sz399001",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sz399006",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sh000300",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sh000688",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sh000905",
+      "looks_like_index": true,
+      "in_idx_set_then_index_role": true,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sh600000",
+      "looks_like_index": false,
+      "in_idx_set_then_index_role": false,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sz000001",
+      "looks_like_index": false,
+      "in_idx_set_then_index_role": false,
+      "index_role_true": true
+    },
+    {
+      "symbol": "sh000922",
+      "looks_like_index": false,
+      "in_idx_set_then_index_role": false,
+      "index_role_true": true
+    }
+  ]
+}

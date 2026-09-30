@@ -1,0 +1,13 @@
+﻿# 结构与卫生门禁
+# 
+------------------------------------------------------------------
+check_audit_shots.py               rc=0  OK
+check_bom.py                       rc=0  OK
+check_colors.py                    rc=0  OK
+check_config_consumed.py           rc=0  OK
+check_config_wiring.py             rc=0  OK
+check_orphan_config.py             rc=0  OK
+check_readme_tools.py              rc=0  OK
+check_spirit_mapping.py            rc=0  OK
+
+合计: 8 ok / 0 fail
