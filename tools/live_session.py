@@ -1130,11 +1130,29 @@ def summarize_rounds(rounds: Sequence[dict], *,
         # ⚠ 顺序：必须**先**把本轮真正出数的 route 也纳入 ``rp_known_routes``，
         # 否则"上轮登记过、本轮却缺席"的 route 会静默少一轮，三格之和
         # 就对不上带账本轮数 —— 而那正是"证据子集自称全程"能藏身的地方。
+        # `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044` 的**放大器**
+        # （云端 2026-09-30_04-13-31 §3）：
+        #
+        # route-ledger 为 schema 稳定，**每轮都保留** stocks/index 键，
+        # 即使 index 根本没请求，键也存在、只是值为 **0**。
+        # 旧写法只 union map **keys**，于是 `index: 0` 仍被当成
+        # "这条 route 本轮出过数"—— 一个**没 dispatch** 的 route
+        # 因此进入 `_seen_here`，进而
+        #   (a) 计入 `rp_rounds_by_route`（伪造 route 活动），
+        #   (b) 触发 `_seen_here - set(_rp_here)` -> **假 partial**。
+        #
+        # 修法：**键存在 != 有活动**。只有 returned/admitted/reject
+        # **任一为正**才算"本轮真的出过数"。
+        # 注意**不能**删除 route-ledger 的零键（那是 schema 稳定性要求），
+        # 只在消费端区分"键存在"与"值 > 0"。
         _seen_here: set[str] = set()
         for _k in ("returned_by_route", "admitted_by_route", "reject_by_route"):
             _m = r.get(_k)
-            if isinstance(_m, dict):
-                _seen_here |= {str(x) for x in _m}
+            if not isinstance(_m, dict):
+                continue
+            for _rk, _rv in _m.items():
+                if _positive_activity(_rv):
+                    _seen_here.add(str(_rk))
         rp_known_routes |= _seen_here
         for _r in set(_rp_here) | rp_known_routes:
             cell = rp_route_state.setdefault(
@@ -2871,7 +2889,21 @@ def evaluate_health(metrics: dict, *, tolerances: dict | None = None) -> dict:
         _g_partial = _safe_int(_grade.get("rounds_partial"))
         _g_proj = _safe_int(_grade.get("projected_rounds"))
         _g_notm = _safe_int(_grade.get("rounds_not_measured"))
-        _g_rounds = _safe_int(_grade.get("rounds_seen_by_route"))
+        # `IT-P2-SOAK-RAW-PRESENCE-ROUND-DENOMINATOR-043`
+        # （云端 2026-09-30_04-13-31 §4）：
+        # `rounds_seen_by_route` 是 **dict**（`{route: round_count}`），
+        # 直接 `_safe_int(dict)` 恒得 **0** —— 于是人类可读文案出现
+        # "投影 1/0 轮"、"精确 0 轮"这种**荒谬分母**。
+        # 判决级别没变（所以 043 是 P2），但**证据文本在说谎**。
+        # 正确口径：分子的"轮"是**单轮**计数，分母应取
+        # **任一 route 的最大轮数**（各 route 轮数可能不同，
+        # 取最大 = "至少覆盖了这么多轮"，不会把分母压低）。
+        _gsr = _grade.get("rounds_seen_by_route")
+        if isinstance(_gsr, dict):
+            _g_rounds = max((_safe_int(v) for v in _gsr.values()),
+                            default=0)
+        else:
+            _g_rounds = _safe_int(_gsr)
         _g_proj_routes = list(_grade.get("projected_routes") or [])
         _g_ungr = list(_grade.get("ungraded_routes") or [])
         if _g_partial:
@@ -3031,6 +3063,38 @@ def _safe_int(v: Any) -> int:
         return int(float(v))
     except (TypeError, ValueError):
         return 0
+
+
+def _positive_activity(v: Any) -> bool:
+    """route-ledger 的一个值是否代表**本轮真的出过数**。
+
+    `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`（云端
+    2026-09-30_04-13-31 §3）。
+
+    route-ledger 为 schema 稳定**每轮都保留** stocks/index 键，
+    没 dispatch 的 route 键存在但值为 ``0``。
+    因此**键存在 != 有活动** —— 必须看值。
+
+    接受三种形状：
+
+    * ``int``/``float`` —— 直接判 ``> 0``；
+    * ``dict``（如 ``reject_by_route`` 的 ``{"future":0,"out_of_order":1}``）
+      —— 任一子值 ``> 0`` 即算有活动；
+    * ``tuple``/``list``（旧形状 ``(future, ooo)``）—— 同上。
+
+    脏值（``None``/字符串垃圾）**一律算无活动**（fail-closed：
+    宁可少算一条 route 的产出，也不要把没 dispatch 的 route 算成"出过数"
+    从而伪造 partial 事故）。
+    """
+    if isinstance(v, bool) or v is None:
+        return False
+    if isinstance(v, (int, float)):
+        return v > 0
+    if isinstance(v, dict):
+        return any(_positive_activity(x) for x in v.values())
+    if isinstance(v, (tuple, list, set, frozenset)):
+        return any(_positive_activity(x) for x in v)
+    return False
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:

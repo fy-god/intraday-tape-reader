@@ -1595,6 +1595,54 @@ class Engine:
         return {str(k) for k in keys}
 
     @staticmethod
+    def _route_raw_presence(*, stocks_requested: bool, index_requested: bool,
+                            stk_outcome, idx_outcome) -> dict[str, bool]:
+        """route 证据等级的 **唯一事实来源**（合同 v1）。
+
+        `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`
+        （云端 2026-09-30_04-13-31 §1/§5.1）。正常路径与空轮分支
+        **必须共用本函数**，禁止再手写两套（bug 类 b）。
+
+        ## 为什么必须有它：一个 bool 曾同时承担**四种**状态
+
+        ```text
+        True  = 有 outcome 且 raw evidence exact
+        False = 有 outcome 但 legacy/projected
+        ?     = route 根本没请求                <- 曾压成 False
+        ?     = route 请求了但 fetch 失败/无 outcome <- 曾压成 False
+        ```
+
+        把后两种压成 ``False`` 是 **false downgrade**：一个**根本没
+        dispatch** 的 route 反过来给 soak 制造黄色证据等级；
+        而空轮分支更把 ``None`` 压成 ``True``（**false upgrade**，
+        镜像错误，最危险）。两个方向都不诚实。
+
+        ## 冻结合同
+
+        ```text
+        outcome present + raw_presence_known=True  -> True  (exact)
+        outcome present + raw_presence_known=False -> False (projected/legacy)
+        route 未请求                                -> **省略键**
+        route 请求了但 outcome=None（失败/无证据）  -> **省略键**
+        ```
+
+        省略键的语义是"**本 route 不适用 / 没测到**"，
+        由下游 ``live_session`` 判成 ``not_measured``，
+        **绝不**冒充 projected(False) 或 exact(True)。
+        """
+        out: dict[str, bool] = {}
+        if stocks_requested:
+            if stk_outcome is not None:
+                out[ROUTE_STOCKS] = bool(
+                    getattr(stk_outcome, "raw_presence_known", False))
+            # else: 请求了但没 outcome -> 省略键（下游 not_measured）
+        if index_requested:
+            if idx_outcome is not None:
+                out[ROUTE_INDEX] = bool(
+                    getattr(idx_outcome, "raw_presence_known", False))
+        return out
+
+    @staticmethod
     def _route_ledger(*, stk_returned: int, stk_admitted: int,
                       idx_returned: int, idx_admitted: int,
                       stk_reject: tuple[int, int],
@@ -2003,12 +2051,22 @@ class Engine:
                             stk_returned=0, stk_admitted=0,
                             idx_returned=0, idx_admitted=0,
                             stk_reject=(0, 0), idx_reject=(0, 0)),
-                        # WP07：空轮的 raw presence **必然是精确的** ——
-                        # 本轮确实一条都没拿到（provider 返回空且不抛异常）。
-                        # 两条 route 都记 True，与正常路径同域，否则下游
-                        # 读这个 map 时会遇到"空轮没有键"这种第三种状态。
-                        raw_presence_known_by_route={
-                            ROUTE_STOCKS: True, ROUTE_INDEX: True},
+                        # WP07 / `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`：
+                        # 空轮的证据等级**也走唯一事实来源**。
+                        #
+                        # ⚠ 旧写法硬编码 `{stocks: True, index: True}`，
+                        # **完全不看** `stk_outcome/idx_outcome` —— 这是
+                        # **false upgrade**（镜像错误，云端 §2.3 认定最危险）：
+                        # 指数请求**失败**（`idx_outcome is None`）时，
+                        # 空轮会把它写成 `exact=True`，即
+                        # "没测到"被粉饰成"测到了且精确"。
+                        # 现在与正常路径**同源**：未请求/无 outcome -> 省略键，
+                        # 由下游判成 `not_measured`。
+                        raw_presence_known_by_route=self._route_raw_presence(
+                            stocks_requested=_st_req > 0,
+                            index_requested=_idx_req > 0,
+                            stk_outcome=stk_outcome,
+                            idx_outcome=idx_outcome),
                     ))
             except Exception:  # noqa: BLE001
                 # 可观测性不打断主链路，但**必须留痕** —— 静默吞掉正是
@@ -2241,9 +2299,18 @@ class Engine:
             provider_stale_diagnosed=max(stale_diag, 0),
             provider_stale_diagnosed_codes=_stale_codes,
             provider_stale_by_route=stale_diag_by_route,
-            # WP07：**证据等级**逐 route 如实登记（见 `_raw_keys_of`）。
-            raw_presence_known_by_route={
-                ROUTE_STOCKS: exact_stock, ROUTE_INDEX: exact_index},
+            # WP07 / `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`：
+            # **证据等级**逐 route 如实登记，且只给**实际请求**的 route 写键。
+            #
+            # 旧写法无条件导出 `{stocks: exact_stock, index: exact_index}`，
+            # 把"route 没请求"/"请求了但失败"两种状态压成 `False`
+            # （false downgrade：没 dispatch 的 route 给 soak 制造黄色等级）。
+            # 现在走**唯一事实来源** `_route_raw_presence`，与空轮分支同源。
+            raw_presence_known_by_route=self._route_raw_presence(
+                stocks_requested=req_stocks > 0,
+                index_requested=index_requested > 0,
+                stk_outcome=stk_outcome,
+                idx_outcome=idx_outcome),
         )
 
         ctx = RuleContext(

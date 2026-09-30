@@ -966,9 +966,17 @@ def test_failover_observation_ledger_records_backup_as_source():
     assert healthy["admitted"] == 2
     assert healthy["coverage"] == 1.0
     assert healthy["unknown_missing"] == []
-    assert healthy["raw_presence_known_by_route"] == {
-        ROUTE_STOCKS: False, ROUTE_INDEX: False}, (
-        "legacy 假源没有 raw 证据，必须如实记 False，不得伪装 exact")
+    # `IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`：
+    # 本仿真**没有配 index_codes**，index route 根本没 dispatch，
+    # 因此键必须**被省略**（"不适用"），而不是记成 `False`（"投影"）。
+    # 旧断言写死 `{stocks: False, index: False}`，正是 044 要消灭的
+    # false downgrade —— 没 dispatch 的 route 不该有等级。
+    _rp = healthy["raw_presence_known_by_route"]
+    assert _rp == {ROUTE_STOCKS: False}, (
+        f"legacy 假源没有 raw 证据，stocks 必须如实记 False；"
+        f"而 index 未 dispatch，键必须省略。实测 {_rp}")
+    assert ROUTE_INDEX not in _rp, (
+        "未请求的 route **不得**出现在证据等级里（那是 false downgrade）")
 
     # --- 故障段：备用源顶上，账本必须改记 backup，且准入数不掉 ---
     failed = None
