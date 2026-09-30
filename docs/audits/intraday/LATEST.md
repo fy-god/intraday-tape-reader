@@ -1,5 +1,34 @@
 # 最新审计
 
+## 最新云端审计：2026-09-30 04:13:31 JST（本次为补传）
+
+**完整报告**：[2026-09-30_04-13-31_JST.md](./2026-09-30_04-13-31_JST.md)  
+**Agent 任务书**：[2026-09-30_04-13-31_JST_AGENT_TASK.md](./2026-09-30_04-13-31_JST_AGENT_TASK.md)  
+**原审计时间**：`2026-09-30T04:13:31+09:00`  
+**补传登记时间**：`2026-09-30T11:38:58+09:00`  
+**reviewed_source_sha**：`55dcce889411af22acee906d4aac8ce08bd8a31b`  
+**补传前 main HEAD**：`55dcce889411af22acee906d4aac8ce08bd8a31b`  
+**candidate_diff_hash**：`efe165db969c04224aef162e7ae991c5b357707ced0b9971ee48d9f557c29cdb`  
+**主实验**：`EXP-IT-RAW-PRESENCE-ROUTE-SCOPE-043`
+
+范围：Engine 正常/空轮 raw-presence、route 请求范围、live_session/soak 证据等级及分母、相关测试和默认/live 配置。本文所称已读、运行及问题状态均属于原报告时点；补传不构成新的源码审计。
+
+开放 ID：`IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044`、`IT-P2-SOAK-RAW-PRESENCE-ROUND-DENOMINATOR-043`；原报告另保留 041/042/039/038/037 开放队列，未因本次文档提交而关闭。
+
+优先顺序：`044+043 -> 041 -> 042 -> current-HEAD full pytest / rollback -> 039 -> corrected 038/037 -> source/current/SSE -> research`。
+
+下一轮需核验：044/043 RED-GREEN-ROLLBACK 日志、`044_route_scope_cases.json`、`raw_presence_reconcile.json`、定向与全量 pytest/selftest 日志、候选 diff/hash、`RUN_MANIFEST.json`、`NEXT_STEPS.md`。
+
+证据边界：原报告的 `12 passed in 0.06s` 仅为隔离候选测试；`2060 passed` 属于历史产品归档，未在上述 SHA 复验。本次仅补传 Markdown，没有产品修复、部署、训练、真实行情轮询或通知，也未启动用户本地 agent。报告第 10 节的发布失败记录保留为历史。实际报告提交 SHA 由 Git 提交历史提供，不预填未知值。
+
+最新本地独立审计仍为 [2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)。以下完整保留补传前索引；其中“最新”“本轮”等词均为历史记录。
+
+---
+
+## 补传前索引原文（完整保留）
+
+# 最新审计
+
 **最新本地独立审计**：[2026-09-29_22-00-00_JST.md](./2026-09-29_22-00-00_JST.md)  
 **上一版本地独立审计**：[2026-09-29_17-00-00_JST.md](./2026-09-29_17-00-00_JST.md)  
 **最新云端独立审计**：[2026-09-24_20-08-07_JST.md](./2026-09-24_20-08-07_JST.md)  
