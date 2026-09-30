@@ -120,23 +120,36 @@ def cmd_once(args: argparse.Namespace) -> int:
     nots = build_notifiers(st)
     eng = Engine(source=None, settings=st, rules=rules, notifiers=nots,
                  watchlist=load_watchlist(), calendar=cal)
-    codes = eng._codes or load_watchlist()
-    if not codes:
-        _say("[✗] 无可扫描的代码（自选为空且股票池抓取失败）")
-        return 2
 
-    _say(f"扫描 {len(codes)} 只…")
-    try:
-        quotes = eng.sources.call("snapshots", list(codes))
-    except Exception as exc:  # noqa: BLE001
-        _say(f"[✗] 行情抓取失败: {exc}")
-        return 2
-    if not quotes:
+    # `IT-P2-ONCE-SCOPE-MISREPORT-048`：这里以前是
+    # ``codes = eng._codes or load_watchlist()`` 然后拿它抓一次行情 ——
+    # 但此刻 ``_universe_src`` 还是 None、``_codes`` 尚空，于是**总是**
+    # 落到 10 只自选股；而紧接着的 ``poll_once(force=True)`` 内部会懒刷新
+    # 股票池，**实际扫的是全市场 5571 只**。
+    #
+    # 实测（2026-09-30）：`eng._codes` 为空 -> codes=10 只 ->
+    # `poll_once` 后 `quotes=5571`。也就是说 `once` 的**覆盖面本来是对的**
+    # （走 poll_once 的全市场口径），错的只有**显示**：
+    #   * 用户看到"扫描 10 只 / 取到 10 只行情"，会以为只盯了自选股；
+    #   * 那 10 只的行情还白抓了一次（多一次无用网络请求）。
+    #
+    # 修法：不再自己抓一遍，直接让 ``poll_once`` 走完整链路（它就是
+    # `serve` 用的同一条路径），再从**观测账本**读真实口径来报告。
+    # 为什么不在 :123 之前调 `refresh_universe()`：那会**无条件**联网拉全
+    # 市场（实测 ~18s），让 `once` 从"快速单次扫描"变成"慢启动"；
+    # 而 `poll_once` 自己按新鲜度决定要不要刷新，语义更准。
+    alerts = eng.poll_once(force=True)
+
+    # 报告**真实**口径：从观测账本读，不从"我们抓了什么"倒推。
+    obs = getattr(eng.store, "observation", None)
+    obs = obs if isinstance(obs, dict) else {}
+    scanned = int(obs.get("requested") or 0) or len(eng.state.quotes)
+    returned = int(obs.get("returned") or 0) or len(eng.state.quotes)
+    if scanned <= 0:
         _say("[!] 未取到任何行情")
         return 1
+    _say(f"扫描 {scanned} 只，取到 {returned} 只，运行 {len(rules)} 个规则…")
 
-    _say(f"[✓] 取到 {len(quotes)} 只行情，运行 {len(rules)} 个规则…")
-    alerts = eng.poll_once(force=True)
     _rule("结果")
     if not alerts:
         _say("本轮无告警（这是正常的：急拉急跌不常有）")
@@ -144,6 +157,18 @@ def cmd_once(args: argparse.Namespace) -> int:
         for a in alerts:
             _say(f"  {a.one_line()}")
     _say(f"\n共 {len(alerts)} 条告警")
+    # 覆盖面**必须**显式说明，否则用户无法判断"这轮没告警"是"真没有"
+    # 还是"只盯了几只自选股"。这是本仓库反复出现的"证据子集自称全程"。
+    #
+    # ⚠ `watchlist_only` **不是** `RoundObservationSet` 的字段（我第一版
+    # 就是这么写的 —— 读一个永远不存在的键，恒得 False，那种"假绿"
+    # 正是本仓库 bug 类 (c)）。真实可用的判据是**扫描池规模**对比
+    # **自选股数量**：远小于后者说明确实降级了。
+    _wl = len(load_watchlist())
+    if _wl and scanned <= _wl:
+        _say(f"[!] 注意：本轮只扫了 {scanned} 只（≈自选股 {_wl} 只）——"
+             f"全市场股票池未取到，本轮的『无告警』**不能**解释为"
+             f"全市场无异常。")
     return 0
 
 
