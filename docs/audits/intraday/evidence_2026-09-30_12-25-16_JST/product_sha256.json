@@ -1,0 +1,7 @@
+{
+  "src/arad/engine.py": "917646762ebf37aba4e3ecfcb83e09f7591e1300521366cf9de024312120a34f",
+  "tools/live_session.py": "e48b30b55cc3b066ccf8aa14ad2c67f4cc4ae0172c6abdd37d15078c931249fc",
+  "src/arad/session.py": "880e3aeb22098da55fee3198588a5b1c1cc7240112fec8818c016bb130a341c0",
+  "tests/test_raw_presence_route_scope.py": "83c0fa368aa8405a1868aea0dff8a511e0cc2949677624698073157b6fdff845",
+  "tests/test_full_day_simulation.py": "c60e4a1f3d0f2c0ef04d22cc031f1d8ba266c6cf1c5880fa27f3c7b45295736e"
+}

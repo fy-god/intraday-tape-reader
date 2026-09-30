@@ -1,0 +1,24 @@
+﻿==========================================================================
+端到端：真实 Engine 的四态证据等级
+==========================================================================
+
+  合同（云端 §5.1）：
+    outcome + known=True   -> True   (exact)
+    outcome + known=False  -> False  (projected/legacy)
+    未请求                  -> 省略键
+    请求了但 outcome=None   -> 省略键 (not_measured)
+
+  OK  两只都请求、都有精确证据                       -> {'stocks': True, 'index': True}
+  OK  两只都请求、都是 legacy                    -> {'stocks': False, 'index': False}
+  OK  只请求 stocks【反例1】                    -> {'stocks': True}
+  OK  请求两只但 index 失败【反例2】                -> {'stocks': True}
+  OK  空轮+index 失败【反例3】                   -> {}
+  OK  只请求 index                          -> {'index': True}
+
+==========================================================================
+失败后的诚实语义（下游 not_measured）
+==========================================================================
+  index 请求失败 -> 键省略 -> live_session 判 not_measured，
+  即『本轮不知道』，而**不是**『投影反推』(False) 或『精确』(True)。
+
+  全部四态合同成立: True

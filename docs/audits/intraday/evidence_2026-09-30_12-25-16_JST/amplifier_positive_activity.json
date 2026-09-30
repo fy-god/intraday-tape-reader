@@ -1,0 +1,54 @@
+{
+  "product_code": true,
+  "note": "键存在 != 有活动；零值 route-ledger 键不得算作本轮出过数",
+  "rows": [
+    {
+      "input": "0",
+      "positive": false
+    },
+    {
+      "input": "1",
+      "positive": true
+    },
+    {
+      "input": "0.0",
+      "positive": false
+    },
+    {
+      "input": "5",
+      "positive": true
+    },
+    {
+      "input": "True",
+      "positive": false
+    },
+    {
+      "input": "None",
+      "positive": false
+    },
+    {
+      "input": "'garbage'",
+      "positive": false
+    },
+    {
+      "input": "(0, 0)",
+      "positive": false
+    },
+    {
+      "input": "(0, 1)",
+      "positive": true
+    },
+    {
+      "input": "(1, 0)",
+      "positive": true
+    },
+    {
+      "input": "{'future': 0, 'out_of_order': 0}",
+      "positive": false
+    },
+    {
+      "input": "{'future': 0, 'out_of_order': 3}",
+      "positive": true
+    }
+  ]
+}

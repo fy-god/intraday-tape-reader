@@ -1,0 +1,101 @@
+{
+  "product_code": true,
+  "contract": {
+    "outcome+known=True": "True (exact)",
+    "outcome+known=False": "False (projected/legacy)",
+    "unrequested": "omit key",
+    "requested but outcome=None": "omit key (downstream not_measured)"
+  },
+  "helper_defs": [
+    1598
+  ],
+  "helper_calls": [
+    2309,
+    2065
+  ],
+  "hardcoded_true_true_dicts_remaining": [],
+  "rows": [
+    {
+      "case": "both_requested_exact",
+      "stocks_requested": true,
+      "index_requested": true,
+      "stk_outcome": true,
+      "idx_outcome": true,
+      "result": {
+        "stocks": true,
+        "index": true
+      },
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "both_requested_legacy",
+      "stocks_requested": true,
+      "index_requested": true,
+      "stk_outcome": false,
+      "idx_outcome": false,
+      "result": {
+        "stocks": false,
+        "index": false
+      },
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "index_unrequested[case1]",
+      "stocks_requested": true,
+      "index_requested": false,
+      "stk_outcome": true,
+      "idx_outcome": null,
+      "result": {
+        "stocks": true
+      },
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "index_fetch_failed[case2]",
+      "stocks_requested": true,
+      "index_requested": true,
+      "stk_outcome": true,
+      "idx_outcome": null,
+      "result": {
+        "stocks": true
+      },
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "empty_round_idx_failed[case3]",
+      "stocks_requested": true,
+      "index_requested": true,
+      "stk_outcome": null,
+      "idx_outcome": null,
+      "result": {},
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "only_index_requested",
+      "stocks_requested": false,
+      "index_requested": true,
+      "stk_outcome": null,
+      "idx_outcome": true,
+      "result": {
+        "index": true
+      },
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    },
+    {
+      "case": "nothing_requested",
+      "stocks_requested": false,
+      "index_requested": false,
+      "stk_outcome": null,
+      "idx_outcome": null,
+      "result": {},
+      "unrequested_key_leaked": false,
+      "none_outcome_key_leaked": false
+    }
+  ]
+}

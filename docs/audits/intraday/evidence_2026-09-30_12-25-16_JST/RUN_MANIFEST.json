@@ -1,0 +1,78 @@
+{
+  "round": "R16",
+  "report": "docs/audits/intraday/2026-09-30_12-30-00_JST.md",
+  "reviewed_source_sha": "c4d6b10d53b256594b6cfae14d683532db20bcf1",
+  "audit_start_head": "c4d6b10d53b256594b6cfae14d683532db20bcf1",
+  "cloud_report_processed": "docs/audits/intraday/2026-09-30_04-13-31_JST.md",
+  "cloud_report_reviewed_sha": "55dcce889411af22acee906d4aac8ce08bd8a31b",
+  "ids_closed": [
+    "IT-P1-RAW-PRESENCE-ROUTE-SCOPE-FALSE-GRADE-044",
+    "IT-P2-SOAK-RAW-PRESENCE-ROUND-DENOMINATOR-043",
+    "IT-P1-RAW-PRESENCE-ZERO-KEY-ROUTE-ACTIVITY-AMPLIFIER-045"
+  ],
+  "ids_partial": [
+    "IT-P1-RAW-PRESENCE-EXPECTED-DISPATCH-DENOMINATOR-046"
+  ],
+  "product_files_changed": [
+    "src/arad/engine.py",
+    "tools/live_session.py"
+  ],
+  "tests_added": [
+    "tests/test_raw_presence_route_scope.py"
+  ],
+  "tests_modified": [
+    "tests/test_full_day_simulation.py"
+  ],
+  "test_counts": {
+    "baseline": 2164,
+    "after": 2183,
+    "failed": 0,
+    "new_tests": 19
+  },
+  "gates": {
+    "check_scripts": "8 ok / 0 fail",
+    "selftest_rc": 0,
+    "dash_render_check_rc": 0
+  },
+  "rollback_teeth": {
+    "total": 5,
+    "behavioral_red": 5,
+    "structural_red": 0,
+    "byte_level_restore_verified": true,
+    "engine_sha256_prefix": "917646762ebf37ab",
+    "live_session_sha256_prefix": "e48b30b55cc3b066"
+  },
+  "invariants": {
+    "session_py_byte_identical_to_head": true,
+    "session_py_blob": "fd74113269abd83e8b630b6da183d1032f163d6e",
+    "no_conflict_markers": true
+  },
+  "honest_flags": {
+    "model_incremental_gain": 0,
+    "real_precision_recall_missed_rate_return": "unavailable",
+    "live_soak_run": false,
+    "spirit_index_enabled": false,
+    "cloud_section_5_2_done": false,
+    "cloud_section_5_3_done": "partial",
+    "cloud_queue_041_042_039_038_037_touched": false
+  },
+  "evidence_files": [
+    "route_scope_cases.json",
+    "amplifier_positive_activity.json",
+    "round_denominator_043.json",
+    "repro_before_fix.log",
+    "four_state_contract.log",
+    "rollback_teeth_red.log",
+    "full_pytest.log",
+    "test_raw_presence_route_scope_green.log",
+    "test_full_day_simulation_green.log",
+    "test_soak_grade_gate_green.log",
+    "test_live_session_raw_presence_grade_green.log",
+    "check_gates.log",
+    "selftest.log",
+    "dash_render_check.log",
+    "product_sha256.json",
+    "not_run/BLOCKED.md",
+    "not_run/NEXT_STEPS.md"
+  ]
+}

@@ -1,0 +1,40 @@
+{
+  "product_code": true,
+  "note": "rounds_seen_by_route 是 dict；_safe_int(dict) 恒得 0，旧文案出现 投影 1/0 轮。现在显式判 dict 后取最大轮数为分母。",
+  "raw_presence_grade": {
+    "state": "projected",
+    "rounds_with_fact": 1,
+    "rounds_not_measured": 0,
+    "rounds_partial": 0,
+    "partial_round_indexes": [],
+    "projected_rounds": 1,
+    "projected_round_indexes": [
+      1
+    ],
+    "by_route": {
+      "stocks": {
+        "exact": 0,
+        "projected": 1,
+        "not_measured": 0
+      }
+    },
+    "rounds_seen_by_route": {
+      "stocks": 1
+    },
+    "projected_routes": [
+      "stocks"
+    ],
+    "exact_routes": [],
+    "exact_all_rounds": false,
+    "projected_missing_upper_bound": 1,
+    "projected_quality_upper_bound": 0,
+    "_semantics": "state=exact 表示所有轮次的 missing/quality 分界都来自精确 provider-raw-presence 出口；projected/mixed 表示至少一条 route 的分界是**从可用 Quote 投影反推**的，此时unknown_missing 与 rejected_quality **不可区分**（'provider 没返回' vs '返回了但 price<=0'），两者的计数只能当**上界**，不得读作硬事实；not_measured 表示轮样本里没有证据等级字段（旧版本），口径不明，同样不得当作精确。"
+  },
+  "health_check": {
+    "name": "raw_presence_evidence",
+    "ok": true,
+    "level": "warn",
+    "detail": "证据等级为**投影**（1/1 轮，投影 route: ['stocks']）—— 已知降级，missing/quality 已降为**上界**；非事故，但结论措辞不得含'精确'"
+  },
+  "contains_1_over_0": false
+}
