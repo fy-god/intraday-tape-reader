@@ -399,6 +399,13 @@ var S = {
   series: {}, seriesAt: {}, live: false,
   spirit: [], spSeen: {}, spGroup: "all", spGroups: []
 };
+/* 服务端按类型的**累计**条数（/api/status 的 by_kind）。
+   它不随 store 的环形缓冲驱逐而减少，所以是"这个类型今天到底有几条"的唯一真值。
+   返回 null 表示服务端没给这个类型 —— 与"确实是 0"必须分开，不能混。 */
+function kindTotalOf(k){
+  if(k === "all") return null;
+  return (S.byKind && S.byKind[k] != null) ? S.byKind[k] : null;
+}
 
 /* ===================== 顶部状态条 ===================== */
 var SESSION_CN = {
@@ -443,7 +450,19 @@ function renderKindCounts(){
     var base = btns[i].dataset.label || (btns[i].dataset.label = btns[i].textContent);
     var n = (k === "all") ? null : (S.byKind ? S.byKind[k] : null);
     btns[i].textContent = (n ? base + " " + n : base);
+    /* 按钮上的 n 是**今天累计**条数；列表里只可能有最近 MAX_ALERTS 条。
+       n 大于窗口容量时就必须把这点说出来，否则用户会以为列表被 bug 吞了。 */
+    if(n && n > MAX_ALERTS){
+      btns[i].title = base + "：今天累计 " + n + " 条，列表仅保留最近 "
+                    + MAX_ALERTS + " 条";
+    } else {
+      btns[i].removeAttribute("title");
+    }
   }
+  /* by_kind 是**异步**到的（/api/status 与 /api/alerts 并发），首屏很可能先
+     渲染告警列表、后拿到累计数。这里补一次元信息刷新，否则"今日累计 N 条"
+     要等到下一次 alerts 变动才出现。 */
+  updateAlertMeta();
 }
 function renderSources(srcs){
   var box = $("stSources");
@@ -543,7 +562,22 @@ function rerenderAlerts(){
     shown++;
   }
   if(!shown){
-    list.innerHTML = '<div class="empty">'+(S.alerts.length ? "当前筛选无告警" : "等待告警…（休市时无推送）")+'</div>';
+    /* 区分两件**完全不同**的事，别都说成"没有"：
+         S.alerts.length === 0            -> 今天真的还没有告警
+         窗口里有告警但都不匹配            -> 要么今天没这类，要么更早的已被挤掉
+       只有服务端的累计条数能分清后两种。 */
+    var empty;
+    if(!S.alerts.length){
+      empty = "等待告警…（休市时无推送）";
+    } else if(S.kind !== "all"){
+      var kt = kindTotalOf(S.kind);
+      empty = (kt ? ("今日累计 " + kt + " 条，均已移出当前列表（只保留最近 "
+                     + MAX_ALERTS + " 条）")
+                  : "今日无此类告警");
+    } else {
+      empty = "当前筛选无告警";
+    }
+    list.innerHTML = '<div class="empty">'+esc(empty)+'</div>';
   }
   updateAlertMeta();
 }
@@ -551,6 +585,17 @@ function updateAlertMeta(){
   var visible = 0;
   for(var i=0;i<S.alerts.length;i++){ if(matchesFilter(S.alerts[i])) visible++; }
   var txt = visible + " / " + S.alerts.length + " 条";
+  /* 筛选态下的诚实性：服务端的**累计**条数可能远大于本地窗口里剩的条数。
+     旧版在这时说"当前筛选无告警"，用户会以为今天没发生过这类异动 ——
+     其实只是更早的那些已经被 MAX_ALERTS 窗口挤掉了。
+     累计条数只由服务端给（by_kind），前端绝不自己估。 */
+  var kt = kindTotalOf(S.kind);
+  if(S.kind !== "all" && kt != null){
+    if(kt > visible){
+      txt += " · 今日累计 " + kt + " 条"
+           + (visible < kt ? "，更早的已移出列表" : "");
+    }
+  }
   if(S.pendingNew) txt += " · 暂停中 " + S.pendingNew + " 新";
   $("alertMeta").textContent = txt;
 }

@@ -252,3 +252,149 @@ def test_tooltip_extra_has_units_and_covers_every_whitelisted_key():
     assert re.search(r"amount:\s*\[\s*\"成交额\",\s*1e-8,\s*\"亿\"", m.group(1)), (
         "amount 应换算成亿（同屏表格用的是「成交额(亿)」），"
         "否则同一个量会同时以元和亿两种单位出现")
+
+
+# ==========================================================================
+# 累计条数 vs 有界窗口：不许把"窗口里没有"说成"今天没有"
+# ==========================================================================
+def _run_dashboard_script(export_body: str):
+    """把 dashboard.html 的 <script> 在 Node + 极小 DOM 替身里跑一遍。
+
+    与 ``tools/dash_render_check.js`` 同一套路（同一份 HTML、同一份替身），
+    但这里由测试自己注入导出钩子，想导出什么就导出什么。
+    返回 Node 打印出来的 JSON。没有 Node 时由模块级 skipif 拦下。
+    """
+    import json
+    import subprocess
+    import textwrap
+
+    html = (ROOT / "src" / "arad" / "server" / "dashboard.html").read_text(encoding="utf-8")
+    harness = (ROOT / "tools" / "dash_render_check.js").read_text(encoding="utf-8")
+    # 复用 dash_render_check.js 里那段极小 DOM 替身（mkEl / REG / doc），
+    # 不在测试里另抄一份（抄一份就会与真实渲染环境漂移）。
+    # 只取到 `const sandbox` 之前：sandbox 由下面按本用例的需要重建。
+    dom_src = harness[harness.index("function mkEl"):harness.index("const sandbox = {")]
+    script = re.search(r"<script[^>]*>([\s\S]*?)</script>", html).group(1)
+
+    node_src = textwrap.dedent("""
+        const fs = require("fs");
+        const vm = require("vm");
+        const html = fs.readFileSync(process.argv[2], "utf8");
+        const m = html.match(/<script[^>]*>([\\s\\S]*?)<\\/script>/);
+        %s
+        const sandbox = {
+          document: doc, window: {}, console,
+          setTimeout, clearTimeout, setInterval, clearInterval,
+          fetch: () => Promise.reject(new Error("no network")),
+          EventSource: function () { this.addEventListener = () => {}; this.close = () => {}; },
+          location: { href: "http://127.0.0.1:8899/", search: "", protocol: "http:" },
+          localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+          navigator: { userAgent: "node" },
+          requestAnimationFrame: (f) => setTimeout(f, 0),
+        };
+        sandbox.window = sandbox; sandbox.globalThis = sandbox; sandbox.self = sandbox;
+        const HOOK = `
+        ;globalThis.__dash = {
+        %s
+        };
+        `;
+        const src = m[1].replace(/\\}\\)\\(\\);\\s*$/, HOOK + "})();");
+        vm.createContext(sandbox);
+        vm.runInContext(src, sandbox, { filename: "dashboard.html:script" });
+        console.log(JSON.stringify((%s)(sandbox.__dash, REG)));
+        process.exit(0);
+    """) % (dom_src, export_body[0], export_body[1])
+
+    import tempfile
+    import os
+    with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False,
+                                     encoding="utf-8") as fh:
+        fh.write(node_src)
+        path = fh.name
+    try:
+        proc = subprocess.run(["node", path, str(ROOT / "src" / "arad" / "server" / "dashboard.html")],
+                              cwd=str(ROOT), capture_output=True, text=True,
+                              timeout=120, encoding="utf-8", errors="replace")
+        assert proc.returncode == 0, f"看板脚本执行失败：\n{proc.stdout}\n{proc.stderr}"
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    finally:
+        os.unlink(path)
+
+
+def test_kind_total_not_confused_with_bounded_window():
+    """**真实用户可见缺陷的回归**：按钮说「急拉 50」，点进去却一条都没有。
+
+    背景（真实数据链路）：
+      * ``AlertStore._alerts`` 是 ``deque(maxlen=web.max_alerts)``，默认 300；
+      * 看板 JS 的 ``MAX_ALERTS`` 也是 300；
+      * ``status()['by_kind']`` 却是**累计**计数，不随驱逐减少（这是对的）。
+
+    于是当今天先来了 50 条急拉、后来又来了 300 条急跌时，急拉已被挤出窗口：
+      按钮显示   "急拉 50"      （来自累计 by_kind，正确）
+      点击后列表 0 条            （窗口里真的没有）
+      空态文案   "当前筛选无告警"（**错误** —— 今天发生过 50 次，只是移出了列表）
+
+    实测（Playwright + 真实 handler，350 条告警）：按钮 "急拉 50" / 可见 0 行 /
+    空态 "当前筛选无告警"。后端 ``/api/alerts?kind=surge`` 明明能正确回答
+    （total=50），看板却从不去问它。
+
+    这条用例钉住的是**呈现层的诚实性**：累计数只由服务端给，窗口耗尽时必须
+    说出来，不许把"窗口里没有"渲染成"今天没有"。
+    """
+    out = _run_dashboard_script((
+        # 导出钩子写成**防御式**：被测代码里还没有 kindTotalOf 时（回滚验证）
+        # 退化成返回 None 的桩，而不是抛 ReferenceError —— 这样 RED 会落在下面
+        # 「空态文案」的真实语义断言上，而不是"函数没定义"这种浅层报错。
+        "kindTotalOf: (typeof kindTotalOf === 'function') ? kindTotalOf "
+        ": function(){ return null; }, "
+        "updateAlertMeta: updateAlertMeta, "
+        "rerenderAlerts: rerenderAlerts, S: S, MAX_ALERTS: MAX_ALERTS",
+        """(d, REG) => {
+          const r = {};
+          /* 场景：服务端累计 surge=50，但本地窗口里只剩 plunge（急拉已被挤掉） */
+          d.S.byKind = {surge: 50, plunge: 300};
+          r.kindTotal = [d.kindTotalOf("surge"), d.kindTotalOf("all"), d.kindTotalOf("nope")];
+          d.S.alerts = [{key:"p1", kind:"plunge", name:"平安银行", code:"000001",
+                         ts:"2026-09-30 14:00:00", price:10, pct:-3, severity:2}];
+          d.S.kind = "surge";
+          d.rerenderAlerts();
+          r.empty = REG.alertList.innerHTML;
+          r.meta = REG.alertMeta.textContent;
+
+          /* 对照：今天真的没有 surge（服务端 by_kind 无该键）-> 才允许说"无此类" */
+          d.S.byKind = {plunge: 300};
+          r.kindTotalUnknown = d.kindTotalOf("surge");
+          d.rerenderAlerts();
+          r.emptyNoSuchKind = REG.alertList.innerHTML;
+
+          /* 对照：窗口里根本还没有任何告警 -> 保持原来的休市文案 */
+          d.S.alerts = []; d.S.kind = "all";
+          d.rerenderAlerts();
+          r.emptyCold = REG.alertList.innerHTML;
+
+          return r;
+        }"""))
+
+    assert out["kindTotal"] == [50, None, None], (
+        f"kindTotalOf 必须区分『服务端说 50』与『服务端没说』：{out['kindTotal']}")
+    assert out["kindTotalUnknown"] is None, (
+        f"服务端没给该类型时必须返回 None（而不是 0）：{out['kindTotalUnknown']!r}")
+
+    # ① 空态不许说"无告警"——它必须说出"累计 50 条、已移出列表"
+    assert "50" in out["empty"], (
+        f"急拉已被 MAX_ALERTS 窗口挤掉时，空态必须带上服务端累计条数 50："
+        f"{out['empty']!r}")
+    assert "当前筛选无告警" not in out["empty"], (
+        f"这条文案是缺陷本身：它把『更早的已被挤出列表』说成了『今天没有』。"
+        f"实际渲染：{out['empty']!r}")
+
+    # ② 元信息也要带上累计数，否则用户只看表头时仍会误判
+    assert "50" in out["meta"], f"alertMeta 应带累计条数：{out['meta']!r}"
+
+    # ③ 对照组：服务端确实没有该类型 -> 允许说"无此类"，但仍不许与冷启动混淆
+    assert "无此类告警" in out["emptyNoSuchKind"], (
+        f"服务端没给该类型时应说『今日无此类告警』：{out['emptyNoSuchKind']!r}")
+
+    # ④ 对照组：一条告警都没有 -> 保持休市文案（这是既有正确行为）
+    assert "等待告警" in out["emptyCold"], (
+        f"冷启动空态文案被改坏了：{out['emptyCold']!r}")
