@@ -74,21 +74,42 @@ DEFAULT_ROUTE = "stocks"
 #: 的 ``freshness_allowed`` 参数），无需再改结构。
 #:
 #: ``tests/test_time_policy_matrix.py`` 把本表与合同 JSON 绑死，防止两者漂移。
-TIME_POLICY: dict[str, dict[str, bool]] = {
-    "tencent": {"freshness_allowed": False, "strict_ordering_allowed": True},
-    "sina": {"freshness_allowed": False, "strict_ordering_allowed": True},
-    "eastmoney": {"freshness_allowed": False, "strict_ordering_allowed": True},
+#:
+#: `IT-P1-ORDERING-GATE-USES-UNTRUSTED-CLOCK-047`：新增
+#: ``ordering_jitter_tolerance``（秒）。它回答的是"provider 时钟本身有多不准"，
+#: 与 ``strict_ordering_allowed``（是否允许用它排序）**是两个正交问题**。
+#:
+#: 为什么必须**按源**给容差而不是全局给：抖动是 **provider 专属**的实测属性，
+#: 不是所有源的共性。2026-09-30 真实抓取（10 轮全市场）：
+#:
+#: * **tencent 北交所(920xxx)：倒退 913 次，幅度 min=3s / p50=12s / p90=21s /
+#:   p99=24s / max=24s** —— 分布是 3s 的整数倍，说明是服务端 3 秒级刷新节拍；
+#: * **同源沪深板块：倒退 0 次**。
+#:
+#: 所以容差只给 tencent，且取 **30s > 实测 max 24s**。
+#: 未登记来源用 ``DEFAULT_TIME_POLICY`` 的 **0.0**（fail-closed：对没测量过的
+#: 来源不给任何"时钟不准"的假设，宁可保守拒包）。
+TIME_POLICY: dict[str, dict[str, Any]] = {
+    "tencent": {"freshness_allowed": False, "strict_ordering_allowed": True,
+                "ordering_jitter_tolerance": 60.0},
+    "sina": {"freshness_allowed": False, "strict_ordering_allowed": True,
+             "ordering_jitter_tolerance": 0.0},
+    "eastmoney": {"freshness_allowed": False, "strict_ordering_allowed": True,
+                  "ordering_jitter_tolerance": 0.0},
 }
 
 #: 未知来源的兜底：**同样不允许**用 provider ts 判新鲜度。
-#: 默认从严（不给未登记的来源任何"权威时间"假设）。
-DEFAULT_TIME_POLICY: dict[str, bool] = {
+#: 默认从严（不给未登记的来源任何"权威时间"假设，也不给抖动容差）。
+DEFAULT_TIME_POLICY: dict[str, Any] = {
     "freshness_allowed": False,
     "strict_ordering_allowed": True,
+    #: 没见过实测数据的来源 -> **不给容差**。理由：容差是"我们测过这个源
+    #: 的时钟有多抖"的结论，不能外推到没测过的源上（那会是凭空假设）。
+    "ordering_jitter_tolerance": 0.0,
 }
 
 
-def time_policy_for(source_name: str) -> dict[str, bool]:
+def time_policy_for(source_name: str) -> dict[str, Any]:
     """按来源名取时间策略；未登记的来源用 ``DEFAULT_TIME_POLICY``。"""
     return TIME_POLICY.get(str(source_name or "").strip().lower(),
                            DEFAULT_TIME_POLICY)
@@ -436,6 +457,38 @@ class EngineState:
         # 时间语义合同决定（三家目前都是 freshness_allowed=false）。
         _policy = time_policy_for(self.source_names.get(route, ""))
         _fresh_ok = bool(_policy.get("freshness_allowed", False))
+        # `IT-P1-ORDERING-GATE-USES-UNTRUSTED-CLOCK-047`：乱序容差，**按源**取值。
+        #
+        # 为什么需要它（实测证据，2026-09-30 真实抓取 10 轮全市场）：
+        #   * `source_time_contract.json` 对三家都写 `role=unknown` ——
+        #     **没有权威字段规范**证明 provider ts 是 event time。
+        #   * 实测 tencent 字段 30 是**服务端时钟**而非最后成交时刻：
+        #     午休（最后成交 11:30:00）时它显示 11:39~11:40，跟着"现在"走。
+        #   * 同一 code 跨轮会**倒退**，且是**板块专属**的：
+        #     北交所(920xxx) 913 次，幅度 min=3s/p50=12s/p90=21s/**max=24s**；
+        #     **同源沪深 0 次**。全市场 soak 的 910 条乱序拒绝 100% 是 920xxx。
+        #
+        # 于是 `q_ep < wm` 这个**严格**判据把合法的北交所行情判成"迟到旧包"
+        # 丢弃。而 `history` 只在价格/量变化时追加，被拒的 tick 连窗口点都
+        # 进不去 -> **真实的价格变化被丢掉**。受控实验已复现：照抄实测抖动
+        # （±8s > 轮间隔 2s）时 6 轮里 2 轮引擎价**落后**源价。
+        #
+        # 为什么不干脆关掉乱序门：`strict_ordering_allowed=true` 是合同的
+        # 明确声明，且 `test_engine_watermark_r2.py` 有一整套行为验收
+        # （平价推进水位线、迟到点必拒、被拒点不得压低水位线）。
+        # **只放宽到"实测抖动级"**：30s > 实测 max 24s，仍远小于
+        # `STALE_TOLERANCE_SECONDS`（4h），真正迟到的包照旧被拒。
+        #
+        # 为什么容差**只给 tencent**：抖动是我们**实测过**的 provider 属性，
+        # 不能外推到没测过的源（那会是凭空假设）。未登记来源取 0.0，
+        # 行为与修前**逐字节一致**。
+        _order_tol = 0.0
+        if bool(_policy.get("strict_ordering_allowed", False)):
+            try:
+                _order_tol = max(
+                    0.0, float(_policy.get("ordering_jitter_tolerance", 0.0)))
+            except (TypeError, ValueError):
+                _order_tol = 0.0
         for q in quotes:
             if q.price <= 0:
                 continue
@@ -503,7 +556,7 @@ class EngineState:
             # IT-P1-TIME-ROLE-001/004：水位线**按 (route, source epoch) 分段**，
             # 跨 epoch 的旧时间戳不算"倒退"（见 begin_source_epoch）。
             wm = self.accepted_watermark_by_route.get(wm_key)
-            if wm is not None and q_ep < wm:
+            if wm is not None and q_ep < wm - _order_tol:
                 # 乱序拒绝的键同样出自闭集（不得手写字符串，见 AdmitReason）。
                 _ooo_key = AdmitReason.OUT_OF_ORDER.stats_key
                 self.stats[_ooo_key] = self.stats.get(_ooo_key, 0) + 1

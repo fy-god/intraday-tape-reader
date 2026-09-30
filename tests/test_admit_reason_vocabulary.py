@@ -50,6 +50,7 @@ from arad.engine import (
     ADMIT_REJECT_STATS_KEYS,
     FUTURE_TOLERANCE_SECONDS,
     STALE_TOLERANCE_SECONDS,
+    TIME_POLICY,
     AdmitReason,
     EngineState,
 )
@@ -261,12 +262,18 @@ def test_stats_dict_never_contains_an_undeclared_reject_key():
     st.update([make_quote(code="600000", price=99.0,
                           ts=NOW + timedelta(
                               seconds=FUTURE_TOLERANCE_SECONDS + 60))], NOW)
-    # 乱序
     st.update([make_quote(code="600001", price=10.0, ts=NOW)], NOW)
     later = NOW + timedelta(seconds=60)
     st.update([make_quote(code="600001", price=10.5, ts=later)], later)
+    # 乱序：倒退量必须**超过该源的抖动容差**，否则会被当成时钟抖动放行。
+    # `IT-P1-ORDERING-GATE-USES-UNTRUSTED-CLOCK-047`：容差来自
+    # `TIME_POLICY[source]["ordering_jitter_tolerance"]`（tencent=60s）。
+    # 这里**从策略取**而不是写死一个秒数 —— 否则容差一改，本用例会
+    # 静默地不再产生 out_of_order，而断言"实测少了一个桶"才报错，
+    # 报错信息指向词汇表，真因却是夹具过期（夹具与实现不同域）。
+    _tol = float(TIME_POLICY["tencent"]["ordering_jitter_tolerance"])
     st.update([make_quote(code="600001", price=8.0,
-                          ts=NOW + timedelta(seconds=10))], later)
+                          ts=later - timedelta(seconds=_tol + 10))], later)
     # 正常
     st.update([make_quote(code="600002", price=10.0, ts=NOW)], NOW)
 

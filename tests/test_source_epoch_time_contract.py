@@ -49,7 +49,7 @@ from datetime import datetime, timedelta
 
 from fakes import make_quote
 
-from arad.engine import Engine, EngineState, SourceManager
+from arad.engine import TIME_POLICY, Engine, EngineState, SourceManager
 from arad.session import SessionPhase, TradingCalendar
 
 # now = 10:31:00。所有 provider ts 都取**已发生**的时间（见模块 docstring 的陷阱）。
@@ -164,7 +164,13 @@ def test_same_source_rebegin_is_idempotent():
     st.begin_source_epoch("tencent")
     st.update([_q("600000", _ago(55))], NOW)
     st.begin_source_epoch("tencent")                          # 同源，幂等
-    admitted = st.update([_q("600000", _ago(59))], NOW)       # epoch 内更旧
+    # `IT-P1-ORDERING-GATE-USES-UNTRUSTED-CLOCK-047`：倒退量必须**超过该源的
+    # 抖动容差**，否则会被当作时钟抖动放行。这里**从策略取**而不是写死
+    # 秒数 —— 否则容差一改，本用例的"更旧包"就落进容差内，
+    # 断言失败信息指向"水位线被清了"，真因却是夹具过期（夹具与实现不同域）。
+    _tol = float(TIME_POLICY["tencent"]["ordering_jitter_tolerance"])
+    admitted = st.update(
+        [_q("600000", _ago(55 + _tol + 10))], NOW)            # epoch 内更旧
     assert "600000" not in admitted, (
         "同一来源重复 begin 把水位线清掉了，epoch 内乱序不再被拒")
     assert st.stats.get("t_reject:out_of_order", 0) == 1
