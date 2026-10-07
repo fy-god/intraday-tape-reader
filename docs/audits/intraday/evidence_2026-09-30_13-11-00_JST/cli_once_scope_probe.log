@@ -1,0 +1,8 @@
+﻿python : C:\Users\30834\miniconda3\python.exe: can't open file 'C:\\Users\\30834\\AppData\\Local\\Temp\\r17_once.py': [
+Errno 2] No such file or directory
+所在位置 行:10 字符: 1
++ python "$env:TEMP\r17_once.py" 2>&1 | Out-File "$ev\cli_once_scope_pr ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\30834\...le or directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

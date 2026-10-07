@@ -1,0 +1,8 @@
+﻿python : C:\Users\30834\miniconda3\python.exe: can't open file 'C:\\Users\\30834\\AppData\\Local\\Temp\\r17_dash_teeth.
+py': [Errno 2] No such file or directory
+所在位置 行:9 字符: 1
++ python "$env:TEMP\r17_dash_teeth.py" 2>&1 | Out-File "$ev\rollback_te ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Users\30834\...le or directory:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 

@@ -1,0 +1,31 @@
+﻿python : 股票池来源 eastmoney 失败: eastmoney 请求失败（3 次尝试后）: RemoteDisconnected: Remote end closed connection without response
+所在位置 行:19 字符: 1
++ python "$env:TEMP\r17_jitter_dist.py" 2>&1 | Out-File "$ev\jitter_dis ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (股票池来源 eastmoney...ithout response:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+池 5571
+轮数 10，倒退样本 1238
+
+  北交所(920xxx) 倒退: 1001 次
+  其他板块      倒退: 237 次
+
+  全部: n=1238  min=3  p50=15  p90=30  p99=60  max=60
+  北交所: n=1001  min=3  p50=15  p90=21  p99=27  max=27
+  其他: n=237  min=30  p50=30  p90=60  p99=60  max=60
+
+  倒退幅度取值分布（秒 -> 次数）TOP 10:
+       12s  x403
+       15s  x272
+       30s  x207
+       18s  x90
+       21s  x84
+       27s  x76
+        6s  x61
+       60s  x30
+        9s  x9
+        3s  x6
+
+  => 容差必须 > 观测到的 max，才能吸收真实抖动。
+     观测 max = 60s

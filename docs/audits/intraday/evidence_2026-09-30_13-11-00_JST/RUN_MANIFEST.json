@@ -1,0 +1,96 @@
+{
+  "round": "R17",
+  "generated_local": "2026-09-30T13:11:00+09:00",
+  "generated_jst": "2026-09-30_13-11-00_JST",
+  "reviewed_source_sha_at_start": "21ed0ac",
+  "head_at_report": "b9206193a1fa946ced9caaef11871c6cfbfb7b6c",
+  "commits_this_round": [
+    {
+      "sha": "6c9ef20",
+      "subject": "fix(engine): 乱序门误用不可信时钟，误杀北交所行情（047）",
+      "files": ["src/arad/engine.py",
+                "tests/test_admit_reason_vocabulary.py",
+                "tests/test_source_epoch_time_contract.py",
+                "tests/test_ordering_jitter_tolerance.py"]
+    },
+    {
+      "sha": "feabf93",
+      "subject": "fix(cli): once 误报扫描口径（说 10 只，实扫 5571 只）（048）",
+      "files": ["src/arad/cli.py", "tests/test_cli_once_scope.py"]
+    },
+    {
+      "sha": "dc54922",
+      "subject": "fix(dashboard): 有界窗口里的\"没有\"被渲染成\"今天没有\"（049）",
+      "files": ["src/arad/server/dashboard.html",
+                "tests/test_dashboard_frontend.py"],
+      "note": "由子 agent 实现，父 agent 独立验牙后收录"
+    },
+    {
+      "sha": "b920619",
+      "subject": "fix(store): 异动榜 speed 按墙钟切窗口，replay 下恒 0（050）",
+      "files": ["src/arad/store.py", "tests/test_quote_speed_clock.py"]
+    }
+  ],
+  "test_numbers": {
+    "R16_end": 2183,
+    "after_047": 2201,
+    "after_048": 2208,
+    "after_049": 2209,
+    "after_050": 2216,
+    "failed": 0
+  },
+  "gates": {
+    "tools/check_*.py": "8 ok / 0 fail",
+    "python -m arad.cli selftest": "rc=0",
+    "node tools/dash_render_check.js": "rc=0",
+    "python tools/check_bom.py": "rc=0"
+  },
+  "session_py_untouched": true,
+  "session_py_blob": "fd74113269abd83e8b630b6da183d1032f163d6e",
+  "rollback_teeth": {
+    "047": {"total": 4, "red": 4, "proof": "rollback_teeth_047_red.log"},
+    "049": {"total": 2, "red": 2, "proof": "rollback_teeth_049_red.log"},
+    "050": {"total": 2, "red": 2, "proof": "rollback_teeth_050_red.log"}
+  },
+  "live_soak": {
+    "command": "python tools/live_session.py --rounds 6 --minutes 3",
+    "verdict": "健康（exit 0）",
+    "rounds": 6,
+    "universe": 5571,
+    "coverage_p05_p50_min": "100.0% / 100.0% / 100.0%",
+    "observation_ledger": {
+      "requested": 33426,
+      "returned": 33426,
+      "admitted": 33426,
+      "reject_out_of_order": 0,
+      "note": "修前同口径为 准入 43658/44568（98.0%），乱序拒绝 910，全部 920xxx"
+    },
+    "raw_presence_grade": "exact",
+    "sse_events": 21,
+    "api_requests": 24,
+    "api_non_200": 0
+  },
+  "honest_downgrades": [
+    "049 修的是**诚实性**（把'窗口里没有'与'今天没有'分开），不是让列表真的显示那 50 条。用户仍看不到被挤掉的明细，只是不再被误导。",
+    "050 是 **replay 专属**缺陷 —— 实盘下 provider 服务端时钟与墙钟近似同步，speed 可用（实测 speed_1m=2.5）。不得声称'实盘异动榜也坏了'。",
+    "047 的受控实验证明'引擎价落后源价'，但那是**照抄实测抖动**驱动的合成实验；盘中真实价格分歧**未测量**（测量窗口全程午休，价格冻结）。",
+    "048 的覆盖面本来是对的（poll_once 已扫全市场），修的是**显示口径**与一次无用请求，不是漏扫。"
+  ],
+  "unresolved": [
+    "IT-P0-001（已修，回归已钉）",
+    "IT-P1-SOURCE-EMPTY-001",
+    "IT-P1-WINDOW-001",
+    "IT-P1-LIMIT-001",
+    "IT-P1-006-R1（Eastmoney max_pages 截断仍标 complete）",
+    "IT-P1-008 / IT-P1-009 / IT-P1-003 / IT-P1-004",
+    "IT-P2-OBS-001",
+    "per-route idx 未分账",
+    "WP03（35 因子 capability mask）",
+    "云端 §5.2（index_requested 进 round samples）未做；§5.3 部分完成",
+    "云端 041/042/039/038/037 未触碰",
+    "reject_by_route 仍是 (future, ooo) 二元组",
+    "真实多日语料 blocked",
+    "spirit_index 仍 enabled=false；未做真实交易时段 soak",
+    "子 agent 提出的疑似项：universe_truth 占 /api/status 83.2% 字节却零读者，且随 2 秒 SSE tick 重发"
+  ]
+}

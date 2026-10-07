@@ -1,0 +1,23 @@
+﻿python : 股票池来源 eastmoney 失败: eastmoney 请求失败（3 次尝试后）: RemoteDisconnected: Remote end closed connection without response
+所在位置 行:20 字符: 1
++ python "$env:TEMP\r17_after.py" 2>&1 | Out-File "$ev\ooo_after_fix.lo ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (股票池来源 eastmoney...ithout response:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+池 5571，其中北交所 348
+
+=== 修复后：12 轮乱序拒绝 ===
+  逐轮: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+  合计: 0
+
+=== 对比：修前实测（同一测量脚本口径）===
+  修前 5 轮逐轮: [0, 122, 164, 249, 106]  合计 641
+  修前 10 轮倒退样本 913，全部是 920xxx
+
+=== 结论 ===
+  ✓ 修复后 12 轮**零**乱序拒绝 —— 北交所抖动已不再被误判。
+
+  注意：这是**午休**时段。价格冻结，所以本测量只能证明
+  '拒绝数下降'，不能证明'盘中不再漏价格变化'。
+  盘中复测是下一轮最高优先级。
