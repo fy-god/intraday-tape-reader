@@ -105,6 +105,37 @@ class AlertStore:
         eng = self._engine
         return getattr(eng, "state", None) if eng is not None else None
 
+    def _now_epoch(self) -> float:
+        """当前时刻（epoch 秒），**优先用引擎的可注入时钟**。
+
+        `IT-P2-QUOTE-SPEED-CLOCK-MISMATCH-050`：``_quote_item`` 原来直接
+        ``time.time()``（墙钟），而 ``EngineState.history`` 的 ``p[0]`` 是
+        **事件 ts**（provider ts，由可注入时钟 clamp）。窗口判据是
+        ``cutoff <= p[0] <= now_epoch`` —— 于是**两个时点来自不同时间轴**。
+
+        真实盘中两者恰好近似同步（provider 服务端时钟跟着"现在"走），
+        所以生产上看不出问题；但 ``serve --replay`` 用 ``SimClock`` 时
+        模拟时刻与墙钟**不同轴**（回放 09:30 时墙钟是下午），
+        窗口永远取不到点 -> ``price_change`` 恒 ``None`` -> 看板
+        ``speed_1m``/``speed_5m`` **恒 0.0**，而 ``speed`` 正是
+        **异动榜的默认排序键** —— 榜单在 replay 下退化成插入序。
+
+        这属于本仓库 bug 类 (b)「同一语义实现两次」：``Engine.now()``
+        已经是"当前时刻"的唯一权威实现，store 却又自己调了一次墙钟。
+
+        为什么**回落到墙钟**而不是硬依赖引擎：``_state()`` 在引擎未
+        attach 时返回 ``None``，而且引擎的 ``now_fn`` 理论上可能抛异常
+        ——此时宁可退回墙钟（与修前行为一致），也不要让看板整页 500。
+        """
+        eng = self._engine
+        fn = getattr(eng, "now", None)
+        if callable(fn):
+            try:
+                return float(fn().timestamp())
+            except Exception:  # noqa: BLE001
+                pass
+        return time.time()
+
     # ------------------------------------------------------------------
     # 写入侧（引擎调用）
     # ------------------------------------------------------------------
@@ -428,7 +459,7 @@ class AlertStore:
     def _quote_item(self, q: Quote, state) -> dict:
         s1 = s5 = 0.0
         if state is not None:
-            now_ep = time.time()
+            now_ep = self._now_epoch()
             try:
                 v1 = state.price_change(q.code, 60, now_ep)
                 v5 = state.price_change(q.code, 300, now_ep)
